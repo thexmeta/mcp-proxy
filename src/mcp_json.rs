@@ -114,6 +114,7 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         outlier_detection: None,
         hedging: None,
         cache: None,
+        working_dir: None,
         default_args: serde_json::Map::new(),
         inject_args: Vec::new(),
         param_overrides: Vec::new(),
@@ -130,8 +131,10 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         canary_of: None,
         weight: 100,
         aliases: Vec::new(),
+        rename_all: Vec::new(),
         mirror_of: None,
         mirror_percent: 100,
+        enabled: true,
     })
 }
 

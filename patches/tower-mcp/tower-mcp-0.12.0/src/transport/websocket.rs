@@ -1,0 +1,1119 @@
+//! WebSocket transport for MCP
+//!
+//! Provides full-duplex communication over WebSocket, ideal for:
+//! - Bidirectional notifications
+//! - Long-lived connections
+//! - Lower latency than HTTP polling
+//! - Server-to-client requests (sampling)
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult};
+//! use tower_mcp::transport::websocket::WebSocketTransport;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(Debug, Deserialize, JsonSchema)]
+//! struct Input { value: String }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), BoxError> {
+//!     let tool = ToolBuilder::new("echo")
+//!         .handler(|i: Input| async move { Ok(CallToolResult::text(i.value)) })
+//!         .build();
+//!
+//!     let router = McpRouter::new()
+//!         .server_info("my-server", "1.0.0")
+//!         .tool(tool);
+//!
+//!     let transport = WebSocketTransport::new(router);
+//!     transport.serve("127.0.0.1:3000").await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Sampling Support
+//!
+//! The WebSocket transport supports server-to-client requests like sampling.
+//! Use [`WebSocketTransport::new`] with [`with_sampling`](WebSocketTransport::with_sampling) to enable:
+//!
+//! ```rust,no_run
+//! use tower_mcp::{BoxError, McpRouter, ToolBuilder, CallToolResult, CreateMessageParams, SamplingMessage};
+//! use tower_mcp::extract::{Context, RawArgs};
+//! use tower_mcp::transport::websocket::WebSocketTransport;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), BoxError> {
+//!     let tool = ToolBuilder::new("ai-tool")
+//!         .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+//!             // Request LLM completion from client
+//!             let params = CreateMessageParams::new(
+//!                 vec![SamplingMessage::user("Summarize this...")],
+//!                 500,
+//!             );
+//!             let result = ctx.sample(params).await?;
+//!             Ok(CallToolResult::text(format!("{:?}", result.content)))
+//!         })
+//!         .build();
+//!
+//!     let router = McpRouter::new()
+//!         .server_info("my-server", "1.0.0")
+//!         .tool(tool);
+//!
+//!     let transport = WebSocketTransport::new(router).with_sampling();
+//!     transport.serve("127.0.0.1:3000").await?;
+//!     Ok(())
+//! }
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    response::Response,
+    routing::get,
+};
+use futures::{SinkExt, StreamExt};
+use tokio::sync::{Mutex, RwLock, watch};
+
+use crate::context::{
+    ChannelClientRequester, ClientRequesterHandle, OutgoingRequest, OutgoingRequestReceiver,
+    OutgoingRequestSender, outgoing_request_channel,
+};
+use crate::error::{Error, JsonRpcError, Result};
+use crate::jsonrpc::JsonRpcService;
+use crate::protocol::{
+    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
+    RequestId,
+};
+use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::service::{
+    CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
+};
+
+/// Session state for WebSocket transport
+struct Session {
+    id: String,
+    router: McpRouter,
+    service_factory: ServiceFactory,
+    /// Sender to signal the active connection to close (zombie prevention).
+    /// Sending `true` tells the current connection to shut down.
+    cancel_tx: Mutex<watch::Sender<bool>>,
+}
+
+impl Session {
+    fn new(router: McpRouter, service_factory: ServiceFactory) -> Self {
+        let (cancel_tx, _) = watch::channel(false);
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            router,
+            service_factory,
+            cancel_tx: Mutex::new(cancel_tx),
+        }
+    }
+
+    /// Create a middleware-wrapped service from this session's router.
+    fn make_service(&self) -> McpBoxService {
+        (self.service_factory)(self.router.clone())
+    }
+
+    /// Get a receiver that will be notified when this connection should close.
+    async fn cancel_receiver(&self) -> watch::Receiver<bool> {
+        self.cancel_tx.lock().await.subscribe()
+    }
+
+    /// Signal the current active connection to close and create a fresh
+    /// cancellation channel for the replacement connection.
+    async fn replace_connection(&self) -> watch::Receiver<bool> {
+        let mut tx = self.cancel_tx.lock().await;
+        // Signal the old connection to shut down
+        let _ = tx.send(true);
+        // Replace with a fresh channel so new subscribers start clean
+        let (new_tx, new_rx) = watch::channel(false);
+        *tx = new_tx;
+        new_rx
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("router", &self.router)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Session store for WebSocket connections
+#[derive(Debug, Default)]
+struct SessionStore {
+    sessions: RwLock<HashMap<String, Arc<Session>>>,
+}
+
+impl SessionStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn create(
+        &self,
+        router: McpRouter,
+        service_factory: ServiceFactory,
+    ) -> (Arc<Session>, watch::Receiver<bool>) {
+        let session = Arc::new(Session::new(router, service_factory));
+        let cancel_rx = session.cancel_receiver().await;
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session.id.clone(), session.clone());
+        tracing::debug!(session_id = %session.id, "Created WebSocket session");
+        (session, cancel_rx)
+    }
+
+    /// Look up an existing session by ID and replace its active connection.
+    ///
+    /// Signals the previous connection to close and returns a new cancellation
+    /// receiver for the replacement connection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn reconnect(&self, id: &str) -> Option<(Arc<Session>, watch::Receiver<bool>)> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(id)?;
+        let cancel_rx = session.replace_connection().await;
+        tracing::info!(session_id = %id, "Replaced active WebSocket connection (zombie prevention)");
+        Some((session.clone(), cancel_rx))
+    }
+
+    async fn remove(&self, id: &str) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let removed = sessions.remove(id).is_some();
+        if removed {
+            tracing::debug!(session_id = %id, "Removed WebSocket session");
+        }
+        removed
+    }
+}
+
+/// Pending request waiting for a response
+struct PendingRequest {
+    response_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+}
+
+/// Shared state for WebSocket transport
+struct AppState {
+    router_template: McpRouter,
+    service_factory: ServiceFactory,
+    sessions: SessionStore,
+    /// Whether sampling is enabled
+    sampling_enabled: bool,
+}
+
+/// WebSocket transport for MCP servers
+///
+/// Provides full-duplex communication over WebSocket.
+pub struct WebSocketTransport {
+    router: McpRouter,
+    sampling_enabled: bool,
+    service_factory: ServiceFactory,
+    #[cfg(feature = "oauth")]
+    oauth_config: Option<crate::oauth::ProtectedResourceMetadata>,
+}
+
+impl WebSocketTransport {
+    /// Create a new WebSocket transport
+    pub fn new(router: McpRouter) -> Self {
+        Self {
+            router,
+            sampling_enabled: false,
+            service_factory: identity_factory(),
+            #[cfg(feature = "oauth")]
+            oauth_config: None,
+        }
+    }
+
+    /// Enable sampling support for this transport.
+    ///
+    /// When sampling is enabled, tool handlers can use `ctx.sample()` to
+    /// request LLM completions from connected clients.
+    pub fn with_sampling(mut self) -> Self {
+        self.sampling_enabled = true;
+        self
+    }
+
+    /// Configure OAuth 2.1 Protected Resource Metadata for this transport.
+    ///
+    /// When set, adds a `GET /.well-known/oauth-protected-resource` endpoint
+    /// that returns the metadata JSON, enabling OAuth client discovery per
+    /// RFC 9728.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tower_mcp::oauth::ProtectedResourceMetadata;
+    /// use tower_mcp::transport::websocket::WebSocketTransport;
+    /// use tower_mcp::McpRouter;
+    ///
+    /// let metadata = ProtectedResourceMetadata::new("https://mcp.example.com")
+    ///     .authorization_server("https://auth.example.com")
+    ///     .scope("mcp:read");
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = WebSocketTransport::new(router).oauth(metadata);
+    /// ```
+    #[cfg(feature = "oauth")]
+    pub fn oauth(mut self, metadata: crate::oauth::ProtectedResourceMetadata) -> Self {
+        self.oauth_config = Some(metadata);
+        self
+    }
+
+    /// Apply a tower middleware layer to MCP request processing.
+    ///
+    /// The layer is applied to the [`McpRouter`] service within each session,
+    /// wrapping the `Service<RouterRequest>` pipeline. This allows middleware
+    /// like timeouts, rate limiting, or custom instrumentation to be applied
+    /// at the MCP request level.
+    ///
+    /// Middleware errors are automatically converted into JSON-RPC error
+    /// responses, so the transport's error handling remains unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use tower::ServiceBuilder;
+    /// use tower::timeout::TimeoutLayer;
+    /// use tower_mcp::McpRouter;
+    /// use tower_mcp::transport::websocket::WebSocketTransport;
+    ///
+    /// let router = McpRouter::new().server_info("my-server", "1.0.0");
+    /// let transport = WebSocketTransport::new(router)
+    ///     .layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(30)))
+    ///             .concurrency_limit(10)
+    ///             .into_inner(),
+    ///     );
+    /// ```
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<McpRouter> + Send + Sync + 'static,
+        L::Service:
+            tower::Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as tower::Service<RouterRequest>>::Error: std::fmt::Display + Send,
+        <L::Service as tower::Service<RouterRequest>>::Future: Send,
+    {
+        self.service_factory = Arc::new(move |router: McpRouter| {
+            let annotations = router.tool_annotations_map();
+            let wrapped = layer.layer(router);
+            tower::util::BoxCloneService::new(InjectAnnotations::new(
+                CatchError::new(wrapped),
+                annotations,
+            ))
+        });
+        self
+    }
+
+    /// Build the axum router for this transport
+    pub fn into_router(self) -> Router {
+        #[cfg(feature = "oauth")]
+        let oauth_config = self.oauth_config;
+
+        let state = Arc::new(AppState {
+            router_template: self.router,
+            service_factory: self.service_factory,
+            sessions: SessionStore::new(),
+            sampling_enabled: self.sampling_enabled,
+        });
+
+        let router = Router::new()
+            .route("/", get(handle_websocket))
+            .with_state(state);
+
+        #[cfg(feature = "oauth")]
+        let router = add_oauth_route(router, "", oauth_config.as_ref());
+
+        router
+    }
+
+    /// Build an axum router mounted at a specific path
+    pub fn into_router_at(self, path: &str) -> Router {
+        #[cfg(feature = "oauth")]
+        let oauth_config = self.oauth_config;
+
+        let state = Arc::new(AppState {
+            router_template: self.router,
+            service_factory: self.service_factory,
+            sessions: SessionStore::new(),
+            sampling_enabled: self.sampling_enabled,
+        });
+
+        let ws_router = Router::new()
+            .route("/", get(handle_websocket))
+            .with_state(state);
+
+        let router = Router::new().nest(path, ws_router);
+
+        #[cfg(feature = "oauth")]
+        let router = add_oauth_route(router, path, oauth_config.as_ref());
+
+        router
+    }
+
+    /// Serve the transport on the given address
+    pub async fn serve(self, addr: &str) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| Error::Transport(format!("Failed to bind to {}: {}", addr, e)))?;
+
+        tracing::info!("MCP WebSocket transport listening on {}", addr);
+
+        let router = self.into_router();
+        axum::serve(listener, router)
+            .await
+            .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
+
+        Ok(())
+    }
+}
+
+/// Add the OAuth Protected Resource Metadata well-known route if configured.
+#[cfg(feature = "oauth")]
+fn add_oauth_route(
+    router: Router,
+    base_path: &str,
+    metadata: Option<&crate::oauth::ProtectedResourceMetadata>,
+) -> Router {
+    if let Some(metadata) = metadata {
+        let metadata = metadata.clone();
+        let well_known_path = if base_path.is_empty() {
+            crate::oauth::ProtectedResourceMetadata::well_known_path().to_string()
+        } else {
+            format!(
+                "{}{}",
+                base_path.trim_end_matches('/'),
+                crate::oauth::ProtectedResourceMetadata::well_known_path()
+            )
+        };
+        router.route(
+            &well_known_path,
+            get(move || {
+                let m = metadata.clone();
+                async move { axum::Json(m) }
+            }),
+        )
+    } else {
+        router
+    }
+}
+
+/// Parsed MCP WebSocket subprotocols from `Sec-WebSocket-Protocol` header.
+///
+/// Per SEP-1288, clients send `mcp.auth.{token}` and `mcp.version.{version}`
+/// as WebSocket subprotocols for authentication and version negotiation.
+#[derive(Debug, Default)]
+struct McpSubprotocols {
+    /// Authentication token extracted from `mcp.auth.{token}` subprotocol.
+    auth_token: Option<String>,
+    /// Protocol version extracted from `mcp.version.{version}` subprotocol.
+    protocol_version: Option<String>,
+    /// All matched subprotocol strings to echo back in the upgrade response.
+    selected: Vec<String>,
+}
+
+/// Parse MCP subprotocols from the `Sec-WebSocket-Protocol` header.
+///
+/// Returns the parsed subprotocols and the negotiated protocol version (if valid).
+fn parse_mcp_subprotocols(headers: &axum::http::HeaderMap) -> McpSubprotocols {
+    use crate::protocol::SUPPORTED_PROTOCOL_VERSIONS;
+
+    let mut result = McpSubprotocols::default();
+
+    let Some(header) = headers.get("sec-websocket-protocol") else {
+        return result;
+    };
+    let Ok(header_str) = header.to_str() else {
+        return result;
+    };
+
+    for protocol in header_str.split(',').map(|s| s.trim()) {
+        if let Some(token) = protocol.strip_prefix("mcp.auth.") {
+            if !token.is_empty() {
+                result.auth_token = Some(token.to_string());
+                result.selected.push(protocol.to_string());
+            }
+        } else if let Some(version) = protocol.strip_prefix("mcp.version.") {
+            if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+                result.protocol_version = Some(version.to_string());
+                result.selected.push(protocol.to_string());
+            } else {
+                tracing::warn!(version = %version, "Unsupported MCP protocol version in subprotocol");
+            }
+        }
+    }
+
+    result
+}
+
+/// Handle WebSocket upgrade.
+///
+/// Uses a raw `Request` extractor and performs the WebSocket upgrade manually
+/// so we can access HTTP request extensions (e.g., `TokenClaims` from OAuth
+/// middleware) and parse MCP subprotocols before upgrading.
+async fn handle_websocket(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::extract::FromRequestParts;
+    use axum::response::IntoResponse;
+
+    let (mut parts, _body) = request.into_parts();
+
+    // Parse MCP subprotocols (mcp.auth.*, mcp.version.*) from Sec-WebSocket-Protocol
+    let subprotocols = parse_mcp_subprotocols(&parts.headers);
+    if let Some(ref version) = subprotocols.protocol_version {
+        tracing::debug!(version = %version, "Client requested MCP protocol version via subprotocol");
+    }
+
+    // Bridge TokenClaims from HTTP extensions to MCP extensions
+    #[allow(unused_mut)]
+    let mut mcp_extensions = crate::router::Extensions::new();
+    #[cfg(feature = "oauth")]
+    {
+        if let Some(claims) = parts.extensions.get::<crate::oauth::token::TokenClaims>() {
+            mcp_extensions.insert(claims.clone());
+        }
+    }
+
+    // Store subprotocol auth token in extensions for downstream use
+    if let Some(ref token) = subprotocols.auth_token {
+        mcp_extensions.insert(WebSocketAuthToken(token.clone()));
+    }
+
+    // Perform the WebSocket upgrade from request parts
+    let ws: WebSocketUpgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws,
+        Err(e) => return e.into_response(),
+    };
+
+    // Echo back the matched subprotocols in the upgrade response
+    let ws = if !subprotocols.selected.is_empty() {
+        ws.protocols(subprotocols.selected)
+    } else {
+        ws
+    };
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, mcp_extensions))
+}
+
+/// Auth token extracted from the `mcp.auth.{token}` WebSocket subprotocol.
+///
+/// This is inserted into the MCP extensions map and can be accessed by
+/// middleware or tool handlers via `Extensions::get::<WebSocketAuthToken>()`.
+#[derive(Debug, Clone)]
+pub struct WebSocketAuthToken(pub String);
+
+/// Handle an individual WebSocket connection
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    mcp_extensions: crate::router::Extensions,
+) {
+    // Use with_fresh_session() to ensure each session has its own state
+    let (session, cancel_rx) = state
+        .sessions
+        .create(
+            state.router_template.with_fresh_session(),
+            state.service_factory.clone(),
+        )
+        .await;
+    let session_id = session.id.clone();
+
+    tracing::info!(session_id = %session_id, "WebSocket connection established");
+
+    if state.sampling_enabled {
+        handle_socket_bidirectional(socket, session, &session_id, mcp_extensions, cancel_rx).await;
+    } else {
+        handle_socket_simple(socket, session, &session_id, mcp_extensions, cancel_rx).await;
+    }
+
+    // Cleanup session
+    state.sessions.remove(&session_id).await;
+    tracing::info!(session_id = %session_id, "WebSocket connection closed");
+}
+
+/// Handle WebSocket connection without sampling (simple mode)
+async fn handle_socket_simple(
+    socket: WebSocket,
+    session: Arc<Session>,
+    session_id: &str,
+    mcp_extensions: crate::router::Extensions,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let mut service = JsonRpcService::new(session.make_service()).with_extensions(mcp_extensions);
+    let (mut sender, mut receiver) = socket.split();
+
+    // Process incoming messages, also watching for cancellation (zombie prevention)
+    loop {
+        let msg = tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(msg) => msg,
+                    None => break,
+                }
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    tracing::info!(session_id = %session_id, "Connection superseded by new connection, closing");
+                    let _ = sender.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1000,
+                        reason: "Connection replaced by newer WebSocket connection".into(),
+                    }))).await;
+                    break;
+                }
+                continue;
+            }
+        };
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "WebSocket receive error");
+                break;
+            }
+        };
+
+        match msg {
+            Message::Text(text) => {
+                match process_message(&mut service, &session.router, &text).await {
+                    Ok(Some(response)) => {
+                        let response_json = match serde_json::to_string(&response) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize response");
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = sender.send(Message::Text(response_json.into())).await {
+                            tracing::error!(error = %e, "Failed to send response");
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // Notification, no response needed
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Error processing message");
+                        let error_response = JsonRpcResponse::error(
+                            None,
+                            JsonRpcError::internal_error(e.to_string()),
+                        );
+                        if let Ok(json) = serde_json::to_string(&error_response) {
+                            let _ = sender.send(Message::Text(json.into())).await;
+                        }
+                    }
+                }
+            }
+            Message::Binary(_) => {
+                // MCP spec (SEP-1288) requires text frames only.
+                // Binary frames MUST result in close code 1003 (Unsupported Data).
+                tracing::warn!(session_id = %session_id, "Received binary frame, closing with 1003");
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1003,
+                        reason: "Binary frames are not supported by MCP".into(),
+                    })))
+                    .await;
+                break;
+            }
+            Message::Ping(data) => {
+                if let Err(e) = sender.send(Message::Pong(data)).await {
+                    tracing::error!(error = %e, "Failed to send pong");
+                    break;
+                }
+            }
+            Message::Pong(_) => {
+                // Ignore pongs
+            }
+            Message::Close(_) => {
+                tracing::info!(session_id = %session_id, "WebSocket close received");
+                break;
+            }
+        }
+    }
+}
+
+/// Handle WebSocket connection with sampling support (bidirectional mode)
+async fn handle_socket_bidirectional(
+    socket: WebSocket,
+    session: Arc<Session>,
+    session_id: &str,
+    _mcp_extensions: crate::router::Extensions,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    // Create channels for outgoing requests
+    let (request_tx, mut request_rx): (OutgoingRequestSender, OutgoingRequestReceiver) =
+        outgoing_request_channel(32);
+
+    // Create client requester for the router
+    let client_requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+
+    // Clone router and configure with client requester
+    let router = session
+        .router
+        .clone()
+        .with_client_requester(client_requester);
+    let mut service = JsonRpcService::new((session.service_factory)(router.clone()))
+        .with_extensions(_mcp_extensions);
+
+    // Track pending outgoing requests
+    let pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let (sender, mut receiver) = socket.split();
+    let sender = Arc::new(Mutex::new(sender));
+
+    let session_id_owned = session_id.to_string();
+
+    loop {
+        tokio::select! {
+            // Handle incoming messages from client
+            msg = receiver.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "WebSocket receive error");
+                        break;
+                    }
+                    None => break,
+                };
+
+                match msg {
+                    Message::Text(text) => {
+                        let result = handle_incoming_message(
+                            &text,
+                            &mut service,
+                            &router,
+                            pending_requests.clone(),
+                            sender.clone(),
+                        ).await;
+                        if let Err(e) = result {
+                            tracing::error!(error = %e, "Error handling incoming message");
+                        }
+                    }
+                    Message::Binary(_) => {
+                        // MCP spec (SEP-1288) requires text frames only.
+                        // Binary frames MUST result in close code 1003 (Unsupported Data).
+                        tracing::warn!(session_id = %session_id_owned, "Received binary frame, closing with 1003");
+                        let mut s = sender.lock().await;
+                        let _ = s.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1003,
+                            reason: "Binary frames are not supported by MCP".into(),
+                        }))).await;
+                        break;
+                    }
+                    Message::Ping(data) => {
+                        let mut sender = sender.lock().await;
+                        if let Err(e) = sender.send(Message::Pong(data)).await {
+                            tracing::error!(error = %e, "Failed to send pong");
+                            break;
+                        }
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => {
+                        tracing::info!(session_id = %session_id_owned, "WebSocket close received");
+                        break;
+                    }
+                }
+            }
+
+            // Handle outgoing requests to send to client
+            Some(outgoing) = request_rx.recv() => {
+                let result = send_outgoing_request(
+                    outgoing,
+                    pending_requests.clone(),
+                    sender.clone(),
+                ).await;
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "Error sending outgoing request");
+                }
+            }
+
+            // Handle cancellation (zombie prevention)
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    tracing::info!(session_id = %session_id_owned, "Connection superseded by new connection, closing");
+                    let mut s = sender.lock().await;
+                    let _ = s.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1000,
+                        reason: "Connection replaced by newer WebSocket connection".into(),
+                    }))).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Handle an incoming WebSocket message (bidirectional mode)
+async fn handle_incoming_message<S>(
+    text: &str,
+    service: &mut JsonRpcService<McpBoxService>,
+    router: &McpRouter,
+    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    sender: Arc<Mutex<S>>,
+) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let parsed: serde_json::Value = serde_json::from_str(text)?;
+
+    // Check if this is a response to one of our pending requests
+    if parsed.get("method").is_none()
+        && (parsed.get("result").is_some() || parsed.get("error").is_some())
+    {
+        return handle_response(&parsed, pending_requests).await;
+    }
+
+    // Check if it's a notification (no id field)
+    if parsed.get("id").is_none() {
+        if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
+            let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+            router.handle_notification(mcp_notification);
+        }
+        return Ok(());
+    }
+
+    // Process as a request
+    let message: JsonRpcMessage = serde_json::from_str(text)?;
+    match service.call_message(message).await {
+        Ok(response) => {
+            let response_json = serde_json::to_string(&response)
+                .map_err(|e| Error::Transport(format!("Failed to serialize response: {}", e)))?;
+            let mut sender = sender.lock().await;
+            sender
+                .send(Message::Text(response_json.into()))
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to send response: {}", e)))?;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Error processing message");
+            let error_response =
+                JsonRpcResponse::error(None, JsonRpcError::internal_error(e.to_string()));
+            if let Ok(json) = serde_json::to_string(&error_response) {
+                let mut sender = sender.lock().await;
+                let _ = sender.send(Message::Text(json.into())).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a response to one of our pending requests
+async fn handle_response(
+    parsed: &serde_json::Value,
+    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+) -> Result<()> {
+    let id = match parsed.get("id") {
+        Some(id) => {
+            if let Some(n) = id.as_i64() {
+                RequestId::Number(n)
+            } else if let Some(s) = id.as_str() {
+                RequestId::String(s.to_string())
+            } else {
+                tracing::warn!("Response has invalid id type");
+                return Ok(());
+            }
+        }
+        None => {
+            tracing::warn!("Response missing id field");
+            return Ok(());
+        }
+    };
+
+    let pending = {
+        let mut pending_requests = pending_requests.lock().await;
+        pending_requests.remove(&id)
+    };
+
+    match pending {
+        Some(pending) => {
+            let result = if let Some(error) = parsed.get("error") {
+                let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                let message = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                Err(Error::Internal(format!(
+                    "Client error ({}): {}",
+                    code, message
+                )))
+            } else if let Some(result) = parsed.get("result") {
+                Ok(result.clone())
+            } else {
+                Err(Error::Internal(
+                    "Response has neither result nor error".to_string(),
+                ))
+            };
+
+            // Send result to waiter (ignore if they've dropped the receiver)
+            let _ = pending.response_tx.send(result);
+        }
+        None => {
+            tracing::warn!(id = ?id, "Received response for unknown request");
+        }
+    }
+
+    Ok(())
+}
+
+/// Send an outgoing request to the client
+async fn send_outgoing_request<S>(
+    outgoing: OutgoingRequest,
+    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    sender: Arc<Mutex<S>>,
+) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    // Build JSON-RPC request
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: outgoing.id.clone(),
+        method: outgoing.method,
+        params: Some(outgoing.params),
+    };
+
+    let request_json = serde_json::to_string(&request)
+        .map_err(|e| Error::Transport(format!("Failed to serialize request: {}", e)))?;
+
+    tracing::debug!(output = %request_json, "Sending request to client");
+
+    // Store pending request
+    {
+        let mut pending = pending_requests.lock().await;
+        pending.insert(
+            outgoing.id,
+            PendingRequest {
+                response_tx: outgoing.response_tx,
+            },
+        );
+    }
+
+    // Send the request
+    let mut sender = sender.lock().await;
+    sender
+        .send(Message::Text(request_json.into()))
+        .await
+        .map_err(|e| Error::Transport(format!("Failed to send request: {}", e)))?;
+
+    Ok(())
+}
+
+/// Process a JSON-RPC message
+async fn process_message(
+    service: &mut JsonRpcService<McpBoxService>,
+    router: &McpRouter,
+    text: &str,
+) -> Result<Option<crate::protocol::JsonRpcResponseMessage>> {
+    // Check if it's a notification (no id field)
+    let parsed: serde_json::Value = serde_json::from_str(text)?;
+    if parsed.get("id").is_none()
+        && let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text)
+    {
+        let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
+        router.handle_notification(mcp_notification);
+        return Ok(None);
+    }
+
+    // Parse and process as a request
+    let message: JsonRpcMessage = serde_json::from_str(text)?;
+    let response = service.call_message(message).await?;
+    Ok(Some(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_router() -> McpRouter {
+        McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    #[tokio::test]
+    async fn test_websocket_transport_builds() {
+        let transport = WebSocketTransport::new(create_test_router());
+        let _router = transport.into_router();
+    }
+
+    #[tokio::test]
+    async fn test_websocket_transport_at_path() {
+        let transport = WebSocketTransport::new(create_test_router());
+        let _router = transport.into_router_at("/mcp");
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_identity() {
+        // Verify that .layer() compiles and produces a working transport
+        let transport = WebSocketTransport::new(create_test_router())
+            .layer(tower::layer::util::Identity::new());
+        let _router = transport.into_router();
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_timeout() {
+        use std::time::Duration;
+        use tower::timeout::TimeoutLayer;
+
+        let transport = WebSocketTransport::new(create_test_router())
+            .layer(TimeoutLayer::new(Duration::from_secs(30)));
+        let _router = transport.into_router();
+    }
+
+    #[tokio::test]
+    async fn test_layer_with_composed_layers() {
+        use std::time::Duration;
+        use tower::ServiceBuilder;
+        use tower::timeout::TimeoutLayer;
+
+        let transport = WebSocketTransport::new(create_test_router()).layer(
+            ServiceBuilder::new()
+                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                .concurrency_limit(100)
+                .into_inner(),
+        );
+        let _router = transport.into_router();
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_empty() {
+        let headers = axum::http::HeaderMap::new();
+        let result = parse_mcp_subprotocols(&headers);
+        assert!(result.auth_token.is_none());
+        assert!(result.protocol_version.is_none());
+        assert!(result.selected.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_auth_and_version() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "mcp.auth.my-secret-token, mcp.version.2025-11-25"
+                .parse()
+                .unwrap(),
+        );
+        let result = parse_mcp_subprotocols(&headers);
+        assert_eq!(result.auth_token.as_deref(), Some("my-secret-token"));
+        assert_eq!(result.protocol_version.as_deref(), Some("2025-11-25"));
+        assert_eq!(result.selected.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_unsupported_version() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "mcp.version.1999-01-01".parse().unwrap(),
+        );
+        let result = parse_mcp_subprotocols(&headers);
+        assert!(result.protocol_version.is_none());
+        assert!(result.selected.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_older_supported_version() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "mcp.version.2025-03-26".parse().unwrap(),
+        );
+        let result = parse_mcp_subprotocols(&headers);
+        assert_eq!(result.protocol_version.as_deref(), Some("2025-03-26"));
+        assert_eq!(result.selected.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_auth_only() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "mcp.auth.bearer-xyz123".parse().unwrap(),
+        );
+        let result = parse_mcp_subprotocols(&headers);
+        assert_eq!(result.auth_token.as_deref(), Some("bearer-xyz123"));
+        assert!(result.protocol_version.is_none());
+    }
+
+    #[test]
+    fn test_parse_mcp_subprotocols_ignores_unknown() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "graphql-ws, mcp.auth.token, mcp.version.2025-11-25, other-protocol"
+                .parse()
+                .unwrap(),
+        );
+        let result = parse_mcp_subprotocols(&headers);
+        assert_eq!(result.auth_token.as_deref(), Some("token"));
+        assert_eq!(result.protocol_version.as_deref(), Some("2025-11-25"));
+        // Only MCP subprotocols are selected
+        assert_eq!(result.selected.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_session_cancel_receiver() {
+        let router = create_test_router();
+        let session = Session::new(router, identity_factory());
+        let mut rx = session.cancel_receiver().await;
+
+        // Should not be cancelled initially
+        assert!(!*rx.borrow());
+
+        // After replace_connection, old receiver should see cancellation
+        let _new_rx = session.replace_connection().await;
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_session_replace_connection_new_rx_starts_clean() {
+        let router = create_test_router();
+        let session = Session::new(router, identity_factory());
+
+        // First connection
+        let _rx1 = session.cancel_receiver().await;
+
+        // Replace: old connection cancelled, new starts clean
+        let rx2 = session.replace_connection().await;
+        assert!(!*rx2.borrow(), "New receiver should start as not-cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_session_store_reconnect() {
+        let router = create_test_router();
+        let store = SessionStore::new();
+
+        let (session, mut rx1) = store
+            .create(router.with_fresh_session(), identity_factory())
+            .await;
+        let session_id = session.id.clone();
+
+        // Reconnect should cancel the first connection
+        let result = store.reconnect(&session_id).await;
+        assert!(result.is_some());
+        let (_session2, rx2) = result.unwrap();
+
+        // Old receiver should see cancellation
+        rx1.changed().await.unwrap();
+        assert!(*rx1.borrow());
+
+        // New receiver should be clean
+        assert!(!*rx2.borrow());
+    }
+}

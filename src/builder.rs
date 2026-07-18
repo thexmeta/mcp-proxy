@@ -62,6 +62,7 @@ impl ProxyBuilder {
                     rate_limit: None,
                     tool_discovery: false,
                     tool_exposure: crate::config::ToolExposure::default(),
+                    watchers: crate::config::default_watchers(),
                 },
                 backends: Vec::new(),
                 auth: None,
@@ -503,6 +504,7 @@ fn default_backend() -> BackendConfig {
         outlier_detection: None,
         hedging: None,
         cache: None,
+        working_dir: None,
         default_args: serde_json::Map::new(),
         inject_args: Vec::new(),
         param_overrides: Vec::new(),
@@ -519,8 +521,10 @@ fn default_backend() -> BackendConfig {
         canary_of: None,
         weight: 100,
         aliases: Vec::new(),
+        rename_all: Vec::new(),
         mirror_of: None,
         mirror_percent: 100,
+        enabled: true,
     }
 }
 

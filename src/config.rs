@@ -336,6 +336,11 @@ pub struct ProxySettings {
     ///   Implies `tool_discovery = true`.
     #[serde(default)]
     pub tool_exposure: ToolExposure,
+
+    /// File watcher configuration for hot reload. Tried in order until one works.
+    /// Default: [Inotify, Mtime { interval_seconds: 30 }, Signal]
+    #[serde(default = "default_watchers")]
+    pub watchers: Vec<WatcherConfig>,
 }
 
 /// How backend tools are exposed to MCP clients.
@@ -365,6 +370,49 @@ pub enum ToolExposure {
     Search,
 }
 
+/// Configuration for a config file watcher.
+///
+/// The proxy tries watchers in order until one successfully detects a change.
+/// The default watchers are: inotify (OS-level), mtime polling (30s interval), and SIGHUP signal.
+///
+/// # Examples
+///
+/// ```toml
+/// [proxy]
+/// watchers = [
+///   { type = "inotify" },
+///   { type = "mtime", interval_seconds = 30 },
+///   { type = "signal" }
+/// ]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WatcherConfig {
+    /// OS-level file watcher using inotify (Linux), kqueue (macOS/BSD), or ReadDirectoryChangesW (Windows).
+    /// Most efficient but may not work in all environments (e.g., some containers, network filesystems).
+    Inotify,
+    /// Lightweight polling watcher that checks file modification time at a fixed interval.
+    /// Works everywhere but uses more CPU and has latency up to the interval.
+    Mtime {
+        /// Polling interval in seconds (default: 30).
+        #[serde(default = "default_mtime_interval")]
+        interval_seconds: u64,
+    },
+    /// Signal-based watcher that triggers reload on SIGHUP.
+    /// Useful for manual reloads or integration with external watchers (e.g., systemd, Docker).
+    Signal,
+}
+
+/// Default polling interval for Mtime watcher (30 seconds).
+fn default_mtime_interval() -> u64 {
+    30
+}
+
+/// Default value for backend enabled field (true for backward compatibility).
+fn default_enabled() -> bool {
+    true
+}
+
 /// Global rate limit configuration applied across all backends.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GlobalRateLimitConfig {
@@ -391,6 +439,11 @@ pub struct ListenConfig {
 pub struct BackendConfig {
     /// Unique backend name, used as the namespace prefix for its tools/resources.
     pub name: String,
+    /// Whether this backend is enabled.
+    /// Disabled backends are skipped during startup and hot reload.
+    /// Default: true (for backward compatibility).
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Transport protocol to use when connecting to this backend.
     pub transport: TransportType,
     /// Command for stdio backends
@@ -403,6 +456,10 @@ pub struct BackendConfig {
     /// Environment variables for subprocess backends
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Working directory for stdio backends.
+    /// If not set, the proxy's current working directory is used.
+    #[serde(default)]
+    pub working_dir: Option<std::path::PathBuf>,
     /// Per-backend timeout
     pub timeout: Option<TimeoutConfig>,
     /// Per-backend circuit breaker
@@ -435,6 +492,10 @@ pub struct BackendConfig {
     /// Tool aliases: rename tools exposed by this backend
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
+    /// Pattern-based bulk tool renaming rules.
+    /// Each rule matches multiple tools by pattern and renames them via template.
+    #[serde(default)]
+    pub rename_all: Vec<RenameAllConfig>,
     /// Default arguments injected into all tool calls for this backend.
     /// Merged into tool call arguments (does not overwrite existing keys).
     #[serde(default)]
@@ -610,6 +671,7 @@ pub struct InjectArgsConfig {
 /// hide = ["path"]
 /// defaults = { path = "/home/docs" }
 /// rename = { recursive = "deep_search" }
+/// instructions = "Execute SQL queries safely. Use read-only mode for SELECT."
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ParamOverrideConfig {
@@ -629,6 +691,10 @@ pub struct ParamOverrideConfig {
     /// mapped back to the original before forwarding to the backend.
     #[serde(default)]
     pub rename: HashMap<String, String>,
+    /// Override the tool's description (instructions) shown to clients.
+    /// If set, this replaces the tool's `description` field in ListTools responses.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// Request hedging configuration.
@@ -808,6 +874,45 @@ pub struct AliasConfig {
     /// Original tool name (backend-local, without namespace prefix)
     pub from: String,
     /// New tool name to expose (will be namespaced as backend/to)
+    pub to: String,
+}
+
+/// Pattern-based bulk tool renaming rule.
+///
+/// Matches multiple tool names using glob or regex patterns and renames them
+/// according to a replacement template. Supports capture group references
+/// (`$1`, `$2`, etc.) for regex patterns.
+///
+/// # Examples
+///
+/// Strip a prefix from all tools:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "tavily_*"
+/// to = ""
+/// ```
+///
+/// Add a prefix to all tools:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "*"
+/// to = "search_$0"
+/// ```
+///
+/// Regex with capture groups:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "re:^tavily_(.+)$"
+/// to = "search_$1"
+/// ```
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RenameAllConfig {
+    /// Pattern to match backend-local tool names.
+    /// Supports glob patterns (`*`, `?`) and regex patterns (prefix with `re:`).
+    pub from: String,
+    /// Replacement template for matched tool names.
+    /// For regex patterns, `$1`, `$2`, etc. refer to capture groups.
+    /// For glob patterns, `$0` refers to the entire matched string.
     pub to: String,
 }
 
@@ -1050,6 +1155,16 @@ fn default_service_name() -> String {
     "mcp-proxy".to_string()
 }
 
+pub fn default_watchers() -> Vec<WatcherConfig> {
+    vec![
+        WatcherConfig::Inotify,
+        WatcherConfig::Mtime {
+            interval_seconds: 30,
+        },
+        WatcherConfig::Signal,
+    ]
+}
+
 /// Resolved filter rules for a backend's capabilities.
 #[derive(Debug, Clone)]
 pub struct BackendFilter {
@@ -1082,7 +1197,7 @@ pub enum CompiledPattern {
 impl CompiledPattern {
     /// Compile a pattern string. Patterns prefixed with `re:` are treated as
     /// regular expressions; all others are treated as glob patterns.
-    fn compile(pattern: &str) -> Result<Self> {
+    pub fn compile(pattern: &str) -> Result<Self> {
         if let Some(re_pat) = pattern.strip_prefix("re:") {
             let re = regex::Regex::new(re_pat)
                 .with_context(|| format!("invalid regex in filter pattern: {pattern}"))?;
@@ -1093,7 +1208,7 @@ impl CompiledPattern {
     }
 
     /// Check if this pattern matches the given name.
-    fn matches(&self, name: &str) -> bool {
+    pub fn matches(&self, name: &str) -> bool {
         match self {
             Self::Glob(pat) => glob_match::glob_match(pat, name),
             Self::Regex(re) => re.is_match(name),
@@ -1350,6 +1465,7 @@ impl ProxyConfig {
                 rate_limit: None,
                 tool_discovery: false,
                 tool_exposure: ToolExposure::default(),
+                watchers: default_watchers(),
             },
             backends,
             auth: None,

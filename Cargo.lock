@@ -1810,7 +1810,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-proxy"
-version = "0.4.0"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3687,8 +3687,6 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 [[package]]
 name = "tower-mcp"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96dd7df8b3c0f729ce9f294059f501fd8b1c53760bf61079c1433380fe66d76b"
 dependencies = [
  "async-trait",
  "axum",

@@ -541,6 +541,189 @@ struct UpdateBackendRequest {
     bearer_token: Option<String>,
 }
 
+/// Handler for enabling a backend.
+async fn handle_enable_backend(
+    Extension(config_path): Extension<Option<std::path::PathBuf>>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    handle_toggle_backend(config_path, name, true).await
+}
+
+/// Handler for disabling a backend.
+async fn handle_disable_backend(
+    Extension(config_path): Extension<Option<std::path::PathBuf>>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    handle_toggle_backend(config_path, name, false).await
+}
+
+/// Toggle a backend's enabled state by updating the config file.
+async fn handle_toggle_backend(
+    config_path: Option<std::path::PathBuf>,
+    name: String,
+    enabled: bool,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    let Some(path) = config_path else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(BackendOpResponse {
+                ok: false,
+                message: "No config file path available (running in --from-mcp-json mode?)"
+                    .to_string(),
+            }),
+        );
+    };
+
+    // Read current config
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to read config: {e}"),
+                }),
+            );
+        }
+    };
+
+    // Parse config
+    let mut config: crate::config::ProxyConfig = match crate::config::ProxyConfig::parse(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to parse config: {e}"),
+                }),
+            );
+        }
+    };
+
+    // Find and update the backend
+    let backend = match config
+        .backends
+        .iter_mut()
+        .find(|b| b.name == name)
+    {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Backend '{}' not found", name),
+                }),
+            );
+        }
+    };
+
+    // Check if already in desired state
+    if backend.enabled == enabled {
+        return (
+            StatusCode::OK,
+            Json(BackendOpResponse {
+                ok: true,
+                message: format!(
+                    "Backend '{}' already {}",
+                    name,
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            }),
+        );
+    }
+
+    // Update enabled state
+    backend.enabled = enabled;
+
+    // Write updated config back to file
+    let updated_content = match toml::to_string_pretty(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to serialize config: {e}"),
+                }),
+            );
+        }
+    };
+
+    if let Err(e) = std::fs::write(&path, updated_content) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackendOpResponse {
+                ok: false,
+                message: format!("Failed to write config: {e}"),
+            }),
+        );
+    }
+
+    // Hot reload will pick up the file change and apply it
+    (
+        StatusCode::OK,
+        Json(BackendOpResponse {
+            ok: true,
+            message: format!(
+                "Backend '{}' {} (hot reload will apply changes)",
+                name,
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        }),
+    )
+}
+
+/// Toggle a backend's enabled state by updating the config file.
+/// This is a public helper that can be used by both HTTP handlers and MCP tools.
+pub async fn toggle_backend_in_config(
+    config_path: &std::path::Path,
+    name: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    // Read current config
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config: {e}"))?;
+
+    // Parse config
+    let mut config: crate::config::ProxyConfig = crate::config::ProxyConfig::parse(&content)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    // Find and update the backend
+    let backend = config
+        .backends
+        .iter_mut()
+        .find(|b| b.name == name)
+        .ok_or_else(|| format!("Backend '{}' not found", name))?;
+
+    // Check if already in desired state
+    if backend.enabled == enabled {
+        return Ok(format!(
+            "Backend '{}' already {}",
+            name,
+            if enabled { "enabled" } else { "disabled" }
+        ));
+    }
+
+    // Update enabled state
+    backend.enabled = enabled;
+
+    // Write updated config back to file
+    let updated_content = toml::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+
+    std::fs::write(config_path, updated_content)
+        .map_err(|e| format!("Failed to write config: {e}"))?;
+
+    Ok(format!(
+        "Backend '{}' {} (hot reload will apply changes)",
+        name,
+        if enabled { "enabled" } else { "disabled" }
+    ))
+}
+
 async fn handle_single_backend_health(
     Extension(state): Extension<AdminState>,
     Path(name): Path<String>,
@@ -792,6 +975,14 @@ pub fn admin_router(
         .route(
             "/backends/{name}",
             delete(handle_remove_backend).put(handle_update_backend),
+        )
+        .route(
+            "/backends/{name}/enable",
+            post(handle_enable_backend),
+        )
+        .route(
+            "/backends/{name}/disable",
+            post(handle_disable_backend),
         )
         .layer(Extension(state))
         .layer(Extension(session_handle))

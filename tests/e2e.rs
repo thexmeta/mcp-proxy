@@ -369,14 +369,17 @@ async fn e2e_filter_allowlist_only_permits_listed_tools() {
 #[tokio::test]
 async fn e2e_alias_renames_in_list_and_call() {
     let proxy = build_proxy().await;
-    let aliases = AliasMap::new(vec![
-        ("math/".to_string(), "add".to_string(), "sum".to_string()),
-        (
-            "text/".to_string(),
-            "upper".to_string(),
-            "uppercase".to_string(),
-        ),
-    ])
+    let aliases = AliasMap::new(
+        vec![
+            ("math/".to_string(), "add".to_string(), "sum".to_string()),
+            (
+                "text/".to_string(),
+                "upper".to_string(),
+                "uppercase".to_string(),
+            ),
+        ],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(proxy, aliases);
 
@@ -530,11 +533,10 @@ async fn e2e_full_stack_filter_alias_inject_validate() {
     let filtered = CapabilityFilterService::new(injected, filters);
 
     // Alias math/add -> math/sum
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
     let aliased = AliasService::new(filtered, aliases);
 
@@ -1323,11 +1325,14 @@ async fn e2e_alias_then_filter_uses_original_names_for_filter() {
     let filtered = CapabilityFilterService::new(proxy, filters);
 
     // Alias text/upper -> text/shout (filter is inner, alias is outer)
-    let aliases = AliasMap::new(vec![(
-        "text/".to_string(),
-        "upper".to_string(),
-        "shout".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![(
+            "text/".to_string(),
+            "upper".to_string(),
+            "shout".to_string(),
+        )],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(filtered, aliases);
 

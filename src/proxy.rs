@@ -165,11 +165,16 @@ impl Proxy {
     ///
     /// New backends added to the config file will be connected dynamically
     /// without restarting the proxy.
-    pub fn enable_hot_reload(&self, config_path: std::path::PathBuf) {
+    pub fn enable_hot_reload(
+        &self,
+        config_path: std::path::PathBuf,
+        watchers: Vec<crate::config::WatcherConfig>,
+    ) {
         tracing::info!("Hot reload enabled, watching config file for changes");
         crate::reload::spawn_config_watcher(
             config_path,
             self.inner.clone(),
+            watchers,
             #[cfg(feature = "discovery")]
             self.discovery_index
                 .as_ref()
@@ -246,6 +251,12 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
     };
 
     for backend in &config.backends {
+        // Skip disabled backends
+        if !backend.enabled {
+            tracing::info!(name = %backend.name, "Skipping disabled backend");
+            continue;
+        }
+
         tracing::info!(name = %backend.name, transport = ?backend.transport, "Adding backend");
 
         match backend.transport {
@@ -258,6 +269,10 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
 
                 for (key, value) in &backend.env {
                     cmd.env(key, value);
+                }
+
+                if let Some(ref working_dir) = backend.working_dir {
+                    cmd.current_dir(working_dir);
                 }
 
                 let transport = StdioClientTransport::spawn_command(&mut cmd)
@@ -707,8 +722,19 @@ fn build_middleware_stack(
         })
         .collect();
 
-    if let Some(alias_map) = alias::AliasMap::new(alias_mappings) {
-        let count = alias_map.forward.len();
+    let rename_all_mappings: Vec<_> = config
+        .backends
+        .iter()
+        .flat_map(|b| {
+            let ns = format!("{}{}", b.name, config.proxy.separator);
+            b.rename_all
+                .iter()
+                .map(move |r| (ns.clone(), r.from.clone(), r.to.clone()))
+        })
+        .collect();
+
+    if let Some(alias_map) = alias::AliasMap::new(alias_mappings, rename_all_mappings) {
+        let count = alias_map.forward.len() + alias_map.forward_rules.len();
         tracing::info!(aliases = count, "Applying tool aliases");
         service = BoxCloneService::new(alias::AliasService::new(service, alias_map));
     }

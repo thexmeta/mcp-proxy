@@ -1,0 +1,32 @@
+[Unit]
+Description=mcp-proxy - MCP Reverse Proxy
+Documentation=https://github.com/joshrotenberg/mcp-proxy
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=mxadm
+Group=mxadm
+ExecStartPre=/usr/local/bin/mcp-proxy-load-secrets.sh
+ExecStart=/usr/bin/mcp-proxy --config /home/mxadm/.mcp-proxy/config.toml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-proxy
+
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/mxadm/.Xauthority
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mcp-proxy /var/log/mcp-proxy /home/mxadm/.mcp-proxy /usr/local/bin /home/mxadm/.cortex-scout
+ProtectHome=read-only
+BindReadOnlyPaths=/run/user/1000/app/org.keepassxc.KeePassXC
+BindReadOnlyPaths=/run/dbus/system_bus_socket
+
+[Install]
+WantedBy=multi-user.target

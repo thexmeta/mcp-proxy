@@ -21,6 +21,7 @@ struct AdminToolState {
     admin_state: AdminState,
     session_handle: SessionHandle,
     config_snapshot: Arc<String>,
+    config_path: Option<std::path::PathBuf>,
     proxy: McpProxy,
 }
 
@@ -75,6 +76,7 @@ pub async fn register_admin_tools(
         admin_state,
         session_handle,
         config_snapshot: Arc::new(config_toml),
+        config_path: config.source_path.clone(),
         proxy: proxy.clone(),
     };
 
@@ -214,12 +216,61 @@ fn build_admin_router(
         })
         .build();
 
+    // Enable/disable backend tools
+    let state_for_enable = state.clone();
+    let enable_backend = ToolBuilder::new("enable_backend")
+        .description("Enable a disabled backend by name")
+        .handler(move |input: EnableDisableBackendInput| {
+            let s = state_for_enable.clone();
+            async move {
+                if let Some(config_path) = &s.config_path {
+                    match crate::admin::toggle_backend_in_config(config_path, &input.name, true).await {
+                        Ok(msg) => Ok(CallToolResult::text(msg)),
+                        Err(e) => Ok(CallToolResult::text(format!(
+                            "Failed to enable backend '{}': {e}",
+                            input.name
+                        ))),
+                    }
+                } else {
+                    Ok(CallToolResult::text(
+                        "Config path not available (hot reload not enabled)"
+                    ))
+                }
+            }
+        })
+        .build();
+
+    let state_for_disable = state.clone();
+    let disable_backend = ToolBuilder::new("disable_backend")
+        .description("Disable an enabled backend by name")
+        .handler(move |input: EnableDisableBackendInput| {
+            let s = state_for_disable.clone();
+            async move {
+                if let Some(config_path) = &s.config_path {
+                    match crate::admin::toggle_backend_in_config(config_path, &input.name, false).await {
+                        Ok(msg) => Ok(CallToolResult::text(msg)),
+                        Err(e) => Ok(CallToolResult::text(format!(
+                            "Failed to disable backend '{}': {e}",
+                            input.name
+                        ))),
+                    }
+                } else {
+                    Ok(CallToolResult::text(
+                        "Config path not available (hot reload not enabled)"
+                    ))
+                }
+            }
+        })
+        .build();
+
     let mut router = McpRouter::new()
         .server_info("mcp-proxy-admin", "0.1.0")
         .tool(list_backends)
         .tool(health_check)
         .tool(session_count)
         .tool(add_backend)
+        .tool(enable_backend)
+        .tool(disable_backend)
         .tool(config_tool);
 
     if search_mode {
@@ -301,6 +352,13 @@ struct AddBackendInput {
     url: String,
 }
 
+/// Input for the `proxy/enable_backend` and `proxy/disable_backend` tools.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EnableDisableBackendInput {
+    /// Name of the backend to enable/disable
+    name: String,
+}
+
 /// Input for the `proxy/call_tool` meta-tool (search mode only).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CallToolInput {
@@ -380,6 +438,7 @@ mod tests {
             admin_state: make_admin_state(),
             session_handle: make_session_handle(),
             config_snapshot: Arc::new("# empty config".to_string()),
+            config_path: None,
             proxy: proxy.clone(),
         };
 
@@ -410,6 +469,7 @@ mod tests {
             admin_state: make_admin_state(),
             session_handle: make_session_handle(),
             config_snapshot: Arc::new(String::new()),
+            config_path: None,
             proxy: proxy.clone(),
         };
 
@@ -437,6 +497,7 @@ mod tests {
             admin_state: make_admin_state(),
             session_handle: make_session_handle(),
             config_snapshot: Arc::new(String::new()),
+            config_path: None,
             proxy: proxy.clone(),
         };
 
@@ -472,6 +533,7 @@ mod tests {
             admin_state: make_admin_state(),
             session_handle: make_session_handle(),
             config_snapshot: Arc::new(config_text.clone()),
+            config_path: None,
             proxy: proxy.clone(),
         };
 

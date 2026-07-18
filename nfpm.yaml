@@ -1,0 +1,60 @@
+name: 'mcp-proxy'
+version: '0.4.3'
+release: '1'
+epoch: '0'
+arch: 'amd64'
+section: 'utils'
+priority: 'optional'
+maintainer: 'Josh Rotenberg <josh@rotenberg.io>'
+description: 'Standalone MCP proxy -- config-driven reverse proxy with auth, rate limiting, and observability'
+homepage: 'https://github.com/joshrotenberg/mcp-proxy'
+license: 'MIT OR Apache-2.0'
+vendor: 'Josh Rotenberg'
+provides:
+  - mcp-proxy
+conflicts:
+  - mcp-proxy
+replaces:
+  - mcp-proxy
+depends:
+  - 'libc6 (>= 2.31)'
+recommends:
+  - 'ca-certificates'
+suggests:
+  - 'jq'
+contents:
+  - src: 'target/release/mcp-proxy'
+    dst: '/usr/bin/mcp-proxy'
+    type: ''
+    file_info:
+      mode: 0755
+  - src: 'LICENSE-MIT'
+    dst: '/usr/share/licenses/mcp-proxy/LICENSE-MIT'
+    type: ''
+    file_info:
+      mode: 0644
+  - src: 'LICENSE-APACHE'
+    dst: '/usr/share/licenses/mcp-proxy/LICENSE-APACHE'
+    type: ''
+    file_info:
+      mode: 0644
+  - src: 'README.md'
+    dst: '/usr/share/doc/mcp-proxy/README.md'
+    type: ''
+    file_info:
+      mode: 0644
+  - src: 'config.example.toml'
+    dst: '/home/mxadm/.mcp-proxy/config.example.toml'
+    type: ''
+    file_info:
+      mode: 0644
+  - src: 'scripts/deb/mcp-proxy.service'
+    dst: '/lib/systemd/system/mcp-proxy.service'
+    type: ''
+    file_info:
+      mode: 0644
+scripts:
+  preinstall: 'scripts/deb/preinstall.sh'
+  postinstall: 'scripts/deb/postinstall.sh'
+  preremove: 'scripts/deb/prermove.sh'
+  postremove: 'scripts/deb/postremove.sh'

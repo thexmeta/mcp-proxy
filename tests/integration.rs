@@ -214,11 +214,10 @@ async fn test_proxy_with_filter_denies_call() {
 #[tokio::test]
 async fn test_proxy_with_alias_renames_tools() {
     let proxy = build_proxy().await;
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(proxy, aliases);
 
@@ -906,11 +905,10 @@ async fn test_full_middleware_stack() {
         read_only_only: false,
     }];
 
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
 
     let validation = ValidationConfig {
