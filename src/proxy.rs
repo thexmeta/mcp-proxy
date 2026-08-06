@@ -6,12 +6,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use tokio::process::Command;
+use tower::Service;
 use tower::timeout::TimeoutLayer;
 use tower::util::BoxCloneService;
 use tower_mcp::SessionHandle;
 use tower_mcp::auth::{AuthLayer, StaticBearerValidator};
-use tower_mcp::client::StdioClientTransport;
 use tower_mcp::proxy::McpProxy;
 use tower_mcp::{RouterRequest, RouterResponse};
 
@@ -19,11 +23,16 @@ use crate::admin::BackendMeta;
 use crate::alias;
 use crate::cache;
 use crate::coalesce;
-use crate::config::{AuthConfig, ProxyConfig, TransportType};
+use crate::config::{AuthConfig, ProxyConfig};
+use crate::endpoint_router;
 use crate::filter::CapabilityFilterService;
 #[cfg(feature = "oauth")]
 use crate::rbac::{RbacConfig, RbacService};
+use crate::tool_group;
 use crate::validation::{ValidationConfig, ValidationService};
+
+/// Circuit breaker handle type alias.
+pub type CbHandle = tower_resilience::circuitbreaker::CircuitBreakerHandle;
 
 /// A fully constructed MCP proxy ready to serve or embed.
 pub struct Proxy {
@@ -31,218 +40,31 @@ pub struct Proxy {
     session_handle: SessionHandle,
     inner: McpProxy,
     config: ProxyConfig,
+    endpoint_group_registry: crate::endpoint_router::EndpointGroupRegistry,
     #[cfg(feature = "discovery")]
     discovery_index: Option<crate::discovery::SharedDiscoveryIndex>,
 }
 
-impl Proxy {
-    /// Build a proxy from a [`ProxyConfig`].
-    ///
-    /// Connects to all backends, builds the middleware stack, and prepares
-    /// the axum router. Call [`serve()`](Self::serve) to run standalone or
-    /// [`into_router()`](Self::into_router) to embed in an existing app.
-    pub async fn from_config(config: ProxyConfig) -> Result<Self> {
-        let (mcp_proxy, cb_handles) = build_mcp_proxy(&config).await?;
-        let proxy_for_admin = mcp_proxy.clone();
-        let mut proxy_for_caller = mcp_proxy.clone();
-        let proxy_for_management = mcp_proxy.clone();
-
-        // Install Prometheus metrics recorder (must happen before middleware)
-        #[cfg(feature = "metrics")]
-        let metrics_handle = if config.observability.metrics.enabled {
-            tracing::info!("Prometheus metrics enabled at /admin/metrics");
-            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-            let handle = builder
-                .install_recorder()
-                .context("installing Prometheus metrics recorder")?;
-            Some(handle)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "metrics"))]
-        let metrics_handle = None;
-
-        let (service, cache_handle) = build_middleware_stack(&config, mcp_proxy)?;
-
-        let (router, session_handle) =
-            tower_mcp::transport::http::HttpTransport::from_service(service)
-                .into_router_with_handle();
-
-        // Inbound authentication (axum-level middleware)
-        let router = apply_auth(&config, router).await?;
-
-        // Collect backend metadata for the health checker
-        let backend_meta: std::collections::HashMap<String, BackendMeta> = config
-            .backends
-            .iter()
-            .map(|b| {
-                (
-                    b.name.clone(),
-                    BackendMeta {
-                        transport: format!("{:?}", b.transport).to_lowercase(),
-                    },
-                )
-            })
-            .collect();
-
-        // Admin API
-        let admin_state = crate::admin::spawn_health_checker(
-            proxy_for_admin,
-            config.proxy.name.clone(),
-            config.proxy.version.clone(),
-            config.backends.len(),
-            backend_meta,
-        );
-        let router = router.nest(
-            "/admin",
-            crate::admin::admin_router(
-                admin_state.clone(),
-                metrics_handle,
-                session_handle.clone(),
-                cache_handle,
-                proxy_for_management,
-                &config,
-                config.source_path.clone(),
-                cb_handles,
-            ),
-        );
-        tracing::info!("Admin API enabled at /admin/backends");
-
-        // Build discovery index if enabled (search mode implies discovery)
-        #[cfg(feature = "discovery")]
-        let discovery_enabled = config.proxy.tool_discovery
-            || config.proxy.tool_exposure == crate::config::ToolExposure::Search;
-        #[cfg(feature = "discovery")]
-        let (discovery_index, discovery_tools) = if discovery_enabled {
-            let index =
-                crate::discovery::build_index(&mut proxy_for_caller, &config.proxy.separator).await;
-            let tools = crate::discovery::build_discovery_tools(index.clone());
-            (Some(index), Some(tools))
-        } else {
-            (None, None)
-        };
-        #[cfg(not(feature = "discovery"))]
-        let discovery_tools: Option<Vec<tower_mcp::Tool>> = None;
-
-        // MCP admin tools (proxy/ namespace)
-        if let Err(e) = crate::admin_tools::register_admin_tools(
-            &proxy_for_caller,
-            admin_state,
-            session_handle.clone(),
-            &config,
-            discovery_tools,
-        )
-        .await
-        {
-            tracing::warn!("Failed to register admin tools: {e}");
-        } else {
-            tracing::info!("MCP admin tools registered under proxy/ namespace");
-        }
-
-        Ok(Self {
-            router,
-            session_handle,
-            inner: proxy_for_caller,
-            config,
-            #[cfg(feature = "discovery")]
-            discovery_index,
-        })
-    }
-
-    /// Get a reference to the session handle for monitoring active sessions.
-    pub fn session_handle(&self) -> &SessionHandle {
-        &self.session_handle
-    }
-
-    /// Get a reference to the underlying [`McpProxy`] for dynamic operations.
-    ///
-    /// Use this to add backends dynamically via [`McpProxy::add_backend()`].
-    pub fn mcp_proxy(&self) -> &McpProxy {
-        &self.inner
-    }
-
-    /// Enable hot reload by watching the given config file path.
-    ///
-    /// New backends added to the config file will be connected dynamically
-    /// without restarting the proxy.
-    pub fn enable_hot_reload(
-        &self,
-        config_path: std::path::PathBuf,
-        watchers: Vec<crate::config::WatcherConfig>,
-    ) {
-        tracing::info!("Hot reload enabled, watching config file for changes");
-        crate::reload::spawn_config_watcher(
-            config_path,
-            self.inner.clone(),
-            watchers,
-            #[cfg(feature = "discovery")]
-            self.discovery_index
-                .as_ref()
-                .map(|idx| (idx.clone(), self.config.proxy.separator.clone())),
-        );
-    }
-
-    /// Consume the proxy and return the axum Router and SessionHandle.
-    ///
-    /// Use this to embed the proxy in an existing axum application:
-    ///
-    /// ```rust,ignore
-    /// let (proxy_router, session_handle) = proxy.into_router();
-    ///
-    /// let app = Router::new()
-    ///     .nest("/mcp", proxy_router)
-    ///     .route("/health", get(|| async { "ok" }));
-    /// ```
-    pub fn into_router(self) -> (Router, SessionHandle) {
-        (self.router, self.session_handle)
-    }
-
-    /// Serve the proxy on the configured listen address.
-    ///
-    /// Blocks until a shutdown signal (SIGTERM/SIGINT) is received,
-    /// then drains connections for the configured timeout period.
-    pub async fn serve(self) -> Result<()> {
-        let addr = format!(
-            "{}:{}",
-            self.config.proxy.listen.host, self.config.proxy.listen.port
-        );
-
-        tracing::info!(listen = %addr, "Proxy ready");
-
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("binding to {}", addr))?;
-
-        let shutdown_timeout = Duration::from_secs(self.config.proxy.shutdown_timeout_seconds);
-        axum::serve(listener, self.router)
-            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
-            .await
-            .context("server error")?;
-
-        tracing::info!("Proxy shut down");
-        Ok(())
-    }
-}
-
-/// Circuit breaker handle type alias.
-pub type CbHandle = tower_resilience::circuitbreaker::CircuitBreakerHandle;
-
-/// Build the McpProxy with all backends and per-backend middleware.
+/// Build an McpProxy with a specific set of backends and per-backend middleware.
 /// Returns the proxy and a map of backend name -> circuit breaker handle.
-async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<String, CbHandle>)> {
-    let mut builder = McpProxy::builder(&config.proxy.name, &config.proxy.version)
-        .separator(&config.proxy.separator);
+async fn build_mcp_proxy_for_backends(
+    proxy_name: &str,
+    proxy_version: &str,
+    separator: &str,
+    proxy_instructions: Option<&String>,
+    backends: &[&crate::config::BackendConfig],
+) -> Result<(McpProxy, HashMap<String, CbHandle>)> {
+    let mut builder = McpProxy::builder(proxy_name, proxy_version).separator(separator);
     let mut cb_handles: HashMap<String, CbHandle> = HashMap::new();
 
-    if let Some(instructions) = &config.proxy.instructions {
+    if let Some(instructions) = proxy_instructions {
         builder = builder.instructions(instructions);
     }
 
     // Create shared outlier detector if any backend has outlier_detection configured.
     // Use the max of all max_ejection_percent values.
     let outlier_detector = {
-        let max_pct = config
-            .backends
+        let max_pct = backends
             .iter()
             .filter_map(|b| b.outlier_detection.as_ref())
             .map(|od| od.max_ejection_percent)
@@ -250,7 +72,7 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
         max_pct.map(crate::outlier::OutlierDetector::new)
     };
 
-    for backend in &config.backends {
+    for backend in backends {
         // Skip disabled backends
         if !backend.enabled {
             tracing::info!(name = %backend.name, "Skipping disabled backend");
@@ -260,7 +82,7 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
         tracing::info!(name = %backend.name, transport = ?backend.transport, "Adding backend");
 
         match backend.transport {
-            TransportType::Stdio => {
+            crate::config::TransportType::Stdio => {
                 let command = backend.command.as_deref().unwrap();
                 let args: Vec<&str> = backend.args.iter().map(|s| s.as_str()).collect();
 
@@ -275,13 +97,13 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
                     cmd.current_dir(working_dir);
                 }
 
-                let transport = StdioClientTransport::spawn_command(&mut cmd)
+                let transport = tower_mcp::client::StdioClientTransport::spawn_command(&mut cmd)
                     .await
                     .with_context(|| format!("spawning backend '{}'", backend.name))?;
 
                 builder = builder.backend(&backend.name, transport).await;
             }
-            TransportType::Http => {
+            crate::config::TransportType::Http => {
                 let url = backend.url.as_deref().unwrap();
                 let mut transport = tower_mcp::client::HttpClientTransport::new(url);
                 if let Some(token) = &backend.bearer_token {
@@ -291,7 +113,7 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
                 builder = builder.backend(&backend.name, transport).await;
             }
             #[cfg(feature = "websocket")]
-            TransportType::Websocket => {
+            crate::config::TransportType::Websocket => {
                 let url = backend.url.as_deref().unwrap();
                 tracing::info!(url = %url, "Connecting to WebSocket backend");
                 let transport = if let Some(token) = &backend.bearer_token {
@@ -313,7 +135,7 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
                 builder = builder.backend(&backend.name, transport).await;
             }
             #[cfg(not(feature = "websocket"))]
-            TransportType::Websocket => {
+            crate::config::TransportType::Websocket => {
                 anyhow::bail!(
                     "WebSocket transport requires the 'websocket' feature. \
                      Rebuild with: cargo install mcp-proxy --features websocket"
@@ -450,6 +272,275 @@ async fn build_mcp_proxy(config: &ProxyConfig) -> Result<(McpProxy, HashMap<Stri
     Ok((result.proxy, cb_handles))
 }
 
+/// Build a dynamic router that delegates endpoint group requests to the registry.
+/// This enables hot reload support by looking up the current router at request time.
+fn build_dynamic_endpoint_group_router(
+    router: Router,
+    registry: crate::endpoint_router::EndpointGroupRegistry,
+) -> Router {
+    router.route(
+        "/{group_name}/mcp/*path",
+        get(move |path: axum::extract::Path<String>, req: Request| {
+            let group_name = path.clone();
+            let registry = registry.clone();
+            async move {
+                if let Some(group_router) = registry.get(&group_name) {
+                    // Strip the /{group_name}/mcp prefix and forward to the group's router
+                    let uri = req.uri().clone();
+                    let path_str = uri.path().to_string();
+                    let prefix = format!("/{}/mcp", group_name);
+                    let sub_path = path_str.strip_prefix(&prefix).unwrap_or("/");
+                    let mut new_req = req;
+                    *new_req.uri_mut() = format!("/mcp{}", sub_path).parse().unwrap();
+                    group_router
+                        .router
+                        .clone()
+                        .call(new_req)
+                        .await
+                        .unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "Router error").into_response()
+                        })
+                } else {
+                    (StatusCode::NOT_FOUND, "Endpoint group not found").into_response()
+                }
+            }
+        }),
+    )
+}
+
+impl Proxy {
+    /// Build a proxy from a [`ProxyConfig`].
+    ///
+    /// Connects to all backends, builds the middleware stack, and prepares
+    /// the axum router. Call [`serve()`](Self::serve) to run standalone or
+    /// [`into_router()`](Self::into_router) to embed in an existing app.
+    pub async fn from_config(config: ProxyConfig) -> Result<Self> {
+        // Create endpoint group registry for hot reload support
+        let endpoint_group_registry = crate::endpoint_router::EndpointGroupRegistry::new();
+
+        // Collect all backend names that are assigned to endpoint groups
+        let grouped_backend_names: std::collections::HashSet<String> = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .flat_map(|g| g.backends.iter().cloned())
+            .collect();
+
+        // Build the default proxy with backends NOT in endpoint groups
+        // (or all backends if expose_grouped_in_default is true)
+        let default_backend_refs: Vec<&crate::config::BackendConfig> =
+            if config.proxy.expose_grouped_in_default {
+                config.backends.iter().collect()
+            } else {
+                config
+                    .backends
+                    .iter()
+                    .filter(|b| !grouped_backend_names.contains(&b.name))
+                    .collect()
+            };
+
+        // Build default proxy with filtered backends
+        let (mcp_proxy, cb_handles) = build_mcp_proxy_for_backends(
+            &config.proxy.name,
+            &config.proxy.version,
+            &config.proxy.separator,
+            config.proxy.instructions.as_ref(),
+            &default_backend_refs,
+        )
+        .await?;
+
+        let proxy_for_admin = mcp_proxy.clone();
+        let mut proxy_for_caller = mcp_proxy.clone();
+        let proxy_for_management = mcp_proxy.clone();
+
+        // Build endpoint group routers and populate registry
+        let _endpoint_group_routers =
+            endpoint_router::build_endpoint_group_routers(&config, Some(&endpoint_group_registry))
+                .await?;
+
+        // Install Prometheus metrics recorder (must happen before middleware)
+        #[cfg(feature = "metrics")]
+        let metrics_handle = if config.observability.metrics.enabled {
+            tracing::info!("Prometheus metrics enabled at /admin/metrics");
+            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+            let handle = builder
+                .install_recorder()
+                .context("installing Prometheus metrics recorder")?;
+            Some(handle)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "metrics"))]
+        let metrics_handle = None;
+
+        let (service, cache_handle) = build_middleware_stack(&config, mcp_proxy)?;
+
+        let (router, session_handle) =
+            tower_mcp::transport::http::HttpTransport::from_service(service)
+                .into_router_with_handle();
+
+        // Inbound authentication (axum-level middleware)
+        let router = apply_auth(&config, router).await?;
+
+        // Build dynamic router that delegates to endpoint group registry
+        let router = build_dynamic_endpoint_group_router(router, endpoint_group_registry.clone());
+
+        // Collect backend metadata for the health checker
+        let backend_meta: std::collections::HashMap<String, BackendMeta> = config
+            .backends
+            .iter()
+            .map(|b| {
+                (
+                    b.name.clone(),
+                    BackendMeta {
+                        transport: format!("{:?}", b.transport).to_lowercase(),
+                    },
+                )
+            })
+            .collect();
+
+        // Admin API
+        let admin_state = crate::admin::spawn_health_checker(
+            proxy_for_admin,
+            config.proxy.name.clone(),
+            config.proxy.version.clone(),
+            config.backends.len(),
+            backend_meta,
+        );
+        let router = router.nest(
+            "/admin",
+            crate::admin::admin_router(
+                admin_state.clone(),
+                metrics_handle,
+                session_handle.clone(),
+                cache_handle,
+                proxy_for_management,
+                &config,
+                config.source_path.clone(),
+                cb_handles,
+            ),
+        );
+        tracing::info!("Admin API enabled at /admin/backends");
+
+        // Build discovery index if enabled (search mode implies discovery)
+        #[cfg(feature = "discovery")]
+        let discovery_enabled = config.proxy.tool_discovery
+            || config.proxy.tool_exposure == crate::config::ToolExposure::Search;
+        #[cfg(feature = "discovery")]
+        let (discovery_index, discovery_tools) = if discovery_enabled {
+            let index =
+                crate::discovery::build_index(&mut proxy_for_caller, &config.proxy.separator).await;
+            let tools = crate::discovery::build_discovery_tools(index.clone());
+            (Some(index), Some(tools))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(feature = "discovery"))]
+        let discovery_tools: Option<Vec<tower_mcp::Tool>> = None;
+
+        // MCP admin tools (proxy/ namespace)
+        if let Err(e) = crate::admin_tools::register_admin_tools(
+            &proxy_for_caller,
+            admin_state,
+            session_handle.clone(),
+            &config,
+            discovery_tools,
+        )
+        .await
+        {
+            tracing::warn!("Failed to register admin tools: {e}");
+        } else {
+            tracing::info!("MCP admin tools registered under proxy/ namespace");
+        }
+
+        Ok(Self {
+            router,
+            session_handle,
+            inner: proxy_for_caller,
+            config,
+            endpoint_group_registry,
+            #[cfg(feature = "discovery")]
+            discovery_index,
+        })
+    }
+
+    /// Get a reference to the session handle for monitoring active sessions.
+    pub fn session_handle(&self) -> &SessionHandle {
+        &self.session_handle
+    }
+
+    /// Get a reference to the underlying [`McpProxy`] for dynamic operations.
+    ///
+    /// Use this to add backends dynamically via [`McpProxy::add_backend()`].
+    pub fn mcp_proxy(&self) -> &McpProxy {
+        &self.inner
+    }
+
+    /// Enable hot reload by watching the given config file path.
+    ///
+    /// New backends added to the config file will be connected dynamically
+    /// without restarting the proxy.
+    pub fn enable_hot_reload(
+        &self,
+        config_path: std::path::PathBuf,
+        watchers: Vec<crate::config::WatcherConfig>,
+    ) {
+        tracing::info!("Hot reload enabled, watching config file for changes");
+        crate::reload::spawn_config_watcher(
+            config_path,
+            self.inner.clone(),
+            self.endpoint_group_registry.clone(),
+            watchers,
+            #[cfg(feature = "discovery")]
+            self.discovery_index
+                .as_ref()
+                .map(|idx| (idx.clone(), self.config.proxy.separator.clone())),
+        );
+    }
+
+    /// Consume the proxy and return the axum Router and SessionHandle.
+    ///
+    /// Use this to embed the proxy in an existing axum application:
+    ///
+    /// ```rust,ignore
+    /// let (proxy_router, session_handle) = proxy.into_router();
+    ///
+    /// let app = Router::new()
+    ///     .nest("/mcp", proxy_router)
+    ///     .route("/health", get(|| async { "ok" }));
+    /// ```
+    pub fn into_router(self) -> (Router, SessionHandle) {
+        (self.router, self.session_handle)
+    }
+
+    /// Serve the proxy on the configured listen address.
+    ///
+    /// Blocks until a shutdown signal (SIGTERM/SIGINT) is received,
+    /// then drains connections for the configured timeout period.
+    pub async fn serve(self) -> Result<()> {
+        let addr = format!(
+            "{}:{}",
+            self.config.proxy.listen.host, self.config.proxy.listen.port
+        );
+
+        tracing::info!(listen = %addr, "Proxy ready");
+
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("binding to {}", addr))?;
+
+        let shutdown_timeout = Duration::from_secs(self.config.proxy.shutdown_timeout_seconds);
+        axum::serve(listener, self.router)
+            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+            .await
+            .context("server error")?;
+
+        tracing::info!("Proxy shut down");
+        Ok(())
+    }
+}
+
+/// Circuit breaker handle type alias.
 /// Build a scope-enforcement layer from configured OAuth `required_scopes`.
 ///
 /// Returns `None` when no scopes are required (the layer would be a no-op).
@@ -737,6 +828,20 @@ fn build_middleware_stack(
         let count = alias_map.forward.len() + alias_map.forward_rules.len();
         tracing::info!(aliases = count, "Applying tool aliases");
         service = BoxCloneService::new(alias::AliasService::new(service, alias_map));
+    }
+
+    // Tool grouping (virtual tool namespaces)
+    if !config.proxy.tool_groups.is_empty()
+        && let Some(tool_group_map) =
+            tool_group::ToolGroupMap::new(config.proxy.tool_groups.clone(), &config.proxy.separator)
+    {
+        let count = tool_group_map.all_forward_mappings().len();
+        tracing::info!(
+            tool_groups = config.proxy.tool_groups.len(),
+            mappings = count,
+            "Applying tool groups"
+        );
+        service = BoxCloneService::new(tool_group::ToolGroupService::new(service, tool_group_map));
     }
 
     // Composite tools (fan-out to multiple backend tools)

@@ -296,6 +296,79 @@ pub struct CompositeToolConfig {
     pub strategy: CompositeStrategy,
 }
 
+/// Configuration for an HTTP endpoint group.
+///
+/// Endpoint groups expose a subset of backends at a custom HTTP path prefix.
+/// Each group gets its own MCP endpoint at `{path}/mcp` (e.g., `/search/mcp`).
+///
+/// # Example
+///
+/// ```toml
+/// [[endpoint_groups]]
+/// name = "search"
+/// path = "/search"
+/// backends = ["context7", "deepwiki", "tavily", "exa"]
+/// description = "Unified search across knowledge sources"
+/// tool_discovery = true
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EndpointGroupConfig {
+    /// Unique group name (used internally for references).
+    pub name: String,
+    /// HTTP path prefix for this group (must start with "/").
+    /// The MCP endpoint will be available at `{path}/mcp`.
+    pub path: String,
+    /// Backend names that belong to this group.
+    pub backends: Vec<String>,
+    /// Optional: specific tools to expose from these backends.
+    /// Format: `"backend/tool"` or `"backend/*"` for all tools.
+    /// If empty, all tools from the grouped backends are exposed.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Optional description for documentation/discovery.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Enable BM25-based tool discovery for this endpoint group.
+    /// Adds `proxy/search_tools`, `proxy/similar_tools`, `proxy/tool_categories`
+    /// scoped to this group's tools.
+    #[serde(default)]
+    pub tool_discovery: bool,
+}
+
+/// Configuration for a virtual tool namespace group.
+///
+/// Tool groups organize tools under a common prefix in `ListTools` responses
+/// without creating separate HTTP endpoints. Useful for LLM tool discovery.
+///
+/// # Example
+///
+/// ```toml
+/// [[tool_groups]]
+/// name = "search"
+/// tools = ["context7/*", "deepwiki/*", "tavily/web_search", "exa/web_search_exa"]
+/// description = "All search tools"
+/// mirror_to_original = true
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolGroupConfig {
+    /// Group name (appears as prefix in tool names, e.g., `search/web_search`).
+    pub name: String,
+    /// Tools to include in this group.
+    /// Format: `"backend/tool"` or `"backend/*"` for all tools from a backend.
+    pub tools: Vec<String>,
+    /// Optional description for documentation.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// If true, tools also appear at their original names (backward compatibility).
+    /// If false, tools only appear under the group prefix.
+    #[serde(default = "default_true")]
+    pub mirror_to_original: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Core proxy identity and server settings.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProxySettings {
@@ -336,6 +409,22 @@ pub struct ProxySettings {
     ///   Implies `tool_discovery = true`.
     #[serde(default)]
     pub tool_exposure: ToolExposure,
+
+    /// Whether backends assigned to endpoint_groups are also exposed at the default /mcp endpoint.
+    /// When false, grouped backends are only accessible via their endpoint group paths.
+    /// Default: true (backward compatible).
+    #[serde(default = "default_true")]
+    pub expose_grouped_in_default: bool,
+
+    /// HTTP endpoint groups (path-based routing).
+    /// Each group creates a separate MCP endpoint at `{path}/mcp`.
+    #[serde(default)]
+    pub endpoint_groups: Vec<EndpointGroupConfig>,
+
+    /// Virtual tool namespace groups (for MCP discovery).
+    /// Groups organize tools under a common prefix in ListTools responses.
+    #[serde(default)]
+    pub tool_groups: Vec<ToolGroupConfig>,
 
     /// File watcher configuration for hot reload. Tried in order until one works.
     /// Default: [Inotify, Mtime { interval_seconds: 30 }, Signal]
@@ -548,6 +637,14 @@ pub struct BackendConfig {
     /// Higher values receive proportionally more traffic.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Endpoint groups this backend belongs to (by group name).
+    /// Alternative to declaring backends in EndpointGroupConfig.backends.
+    #[serde(default)]
+    pub endpoint_groups: Vec<String>,
+    /// Tool groups this backend's tools belong to (by group name).
+    /// Alternative to declaring tools in ToolGroupConfig.tools.
+    #[serde(default)]
+    pub tool_groups: Vec<String>,
 }
 
 /// Backend transport protocol.
@@ -1465,6 +1562,9 @@ impl ProxyConfig {
                 rate_limit: None,
                 tool_discovery: false,
                 tool_exposure: ToolExposure::default(),
+                expose_grouped_in_default: true,
+                endpoint_groups: Vec::new(),
+                tool_groups: Vec::new(),
                 watchers: default_watchers(),
             },
             backends,

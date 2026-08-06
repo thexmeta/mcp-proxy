@@ -62,6 +62,9 @@ impl ProxyBuilder {
                     rate_limit: None,
                     tool_discovery: false,
                     tool_exposure: crate::config::ToolExposure::default(),
+                    expose_grouped_in_default: true,
+                    endpoint_groups: Vec::new(),
+                    tool_groups: Vec::new(),
                     watchers: crate::config::default_watchers(),
                 },
                 backends: Vec::new(),
@@ -525,6 +528,8 @@ fn default_backend() -> BackendConfig {
         mirror_of: None,
         mirror_percent: 100,
         enabled: true,
+        endpoint_groups: Vec::new(),
+        tool_groups: Vec::new(),
     }
 }
 

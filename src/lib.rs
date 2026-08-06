@@ -172,6 +172,7 @@ pub mod composite;
 pub mod config;
 #[cfg(feature = "discovery")]
 pub mod discovery;
+pub mod endpoint_router;
 pub mod failover;
 pub mod filter;
 pub mod inject;
@@ -191,6 +192,7 @@ pub mod retry;
 pub mod skills;
 #[cfg(feature = "oauth")]
 pub mod token;
+pub mod tool_group;
 pub mod validation;
 #[cfg(feature = "websocket")]
 pub mod ws_transport;

@@ -163,6 +163,54 @@ struct ProxyInfo {
     active_sessions: usize,
 }
 
+/// Response structure for endpoint group listing.
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct EndpointGroupListResponse {
+    endpoint_groups: Vec<EndpointGroupInfo>,
+}
+
+/// Information about a single endpoint group.
+#[derive(Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct EndpointGroupInfo {
+    /// Group name.
+    pub name: String,
+    /// HTTP path prefix for this group.
+    pub path: String,
+    /// Backend names that belong to this group.
+    pub backends: Vec<String>,
+    /// Optional: specific tools to expose from these backends.
+    pub tools: Vec<String>,
+    /// Optional description for documentation/discovery.
+    pub description: Option<String>,
+    /// Enable BM25-based tool discovery for this endpoint group.
+    pub tool_discovery: bool,
+    /// The full MCP endpoint URL path for this group.
+    pub mcp_endpoint: String,
+}
+
+/// Response structure for tool group listing.
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ToolGroupListResponse {
+    tool_groups: Vec<ToolGroupInfo>,
+}
+
+/// Information about a single tool group.
+#[derive(Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ToolGroupInfo {
+    /// Group name (appears as prefix in tool names, e.g., `search/web_search`).
+    pub name: String,
+    /// Tools to include in this group.
+    pub tools: Vec<String>,
+    /// Optional description for documentation.
+    pub description: Option<String>,
+    /// If true, tools also appear at their original names (backward compatibility).
+    pub mirror_to_original: bool,
+}
+
 /// Per-backend metadata passed in from config at startup.
 #[derive(Clone)]
 pub struct BackendMeta {
@@ -603,11 +651,7 @@ async fn handle_toggle_backend(
     };
 
     // Find and update the backend
-    let backend = match config
-        .backends
-        .iter_mut()
-        .find(|b| b.name == name)
-    {
+    let backend = match config.backends.iter_mut().find(|b| b.name == name) {
         Some(b) => b,
         None => {
             return (
@@ -684,8 +728,8 @@ pub async fn toggle_backend_in_config(
     enabled: bool,
 ) -> Result<String, String> {
     // Read current config
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
+    let content =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
 
     // Parse config
     let mut config: crate::config::ProxyConfig = crate::config::ProxyConfig::parse(&content)
@@ -711,8 +755,8 @@ pub async fn toggle_backend_in_config(
     backend.enabled = enabled;
 
     // Write updated config back to file
-    let updated_content = toml::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    let updated_content =
+        toml::to_string_pretty(&config).map_err(|e| format!("Failed to serialize config: {e}"))?;
 
     std::fs::write(config_path, updated_content)
         .map_err(|e| format!("Failed to write config: {e}"))?;
@@ -899,6 +943,84 @@ async fn handle_circuit_breakers(
     Json(statuses)
 }
 
+/// Handler for listing all endpoint groups.
+async fn handle_endpoint_groups(
+    Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+) -> Json<EndpointGroupListResponse> {
+    let groups = endpoint_groups
+        .iter()
+        .map(|g| EndpointGroupInfo {
+            name: g.name.clone(),
+            path: g.path.clone(),
+            backends: g.backends.clone(),
+            tools: g.tools.clone(),
+            description: g.description.clone(),
+            tool_discovery: g.tool_discovery,
+            mcp_endpoint: format!("{}/mcp", g.path.trim_start_matches('/')),
+        })
+        .collect();
+    Json(EndpointGroupListResponse {
+        endpoint_groups: groups,
+    })
+}
+
+/// Handler for getting a single endpoint group by name.
+async fn handle_endpoint_group(
+    Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+    Path(name): Path<String>,
+) -> Result<Json<EndpointGroupInfo>, StatusCode> {
+    let group = endpoint_groups
+        .iter()
+        .find(|g| g.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(EndpointGroupInfo {
+        name: group.name.clone(),
+        path: group.path.clone(),
+        backends: group.backends.clone(),
+        tools: group.tools.clone(),
+        description: group.description.clone(),
+        tool_discovery: group.tool_discovery,
+        mcp_endpoint: format!("{}/mcp", group.path.trim_start_matches('/')),
+    }))
+}
+
+/// Handler for listing all tool groups.
+async fn handle_tool_groups(
+    Extension(tool_groups): Extension<std::sync::Arc<Vec<crate::config::ToolGroupConfig>>>,
+) -> Json<ToolGroupListResponse> {
+    let groups = tool_groups
+        .iter()
+        .map(|g| ToolGroupInfo {
+            name: g.name.clone(),
+            tools: g.tools.clone(),
+            description: g.description.clone(),
+            mirror_to_original: g.mirror_to_original,
+        })
+        .collect();
+    Json(ToolGroupListResponse {
+        tool_groups: groups,
+    })
+}
+
+/// Handler for getting a single tool group by name.
+async fn handle_tool_group(
+    Extension(tool_groups): Extension<std::sync::Arc<Vec<crate::config::ToolGroupConfig>>>,
+    Path(name): Path<String>,
+) -> Result<Json<ToolGroupInfo>, StatusCode> {
+    let group = tool_groups
+        .iter()
+        .find(|g| g.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ToolGroupInfo {
+        name: group.name.clone(),
+        tools: group.tools.clone(),
+        description: group.description.clone(),
+        mirror_to_original: group.mirror_to_original,
+    }))
+}
+
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct CircuitBreakerStatus {
@@ -927,6 +1049,10 @@ struct CircuitBreakerStatus {
         SessionsResponse,
         AddBackendRequest,
         BackendOpResponse,
+        EndpointGroupListResponse,
+        EndpointGroupInfo,
+        ToolGroupListResponse,
+        ToolGroupInfo,
     ))
 )]
 struct ApiDoc;
@@ -950,6 +1076,10 @@ pub fn admin_router(
 ) -> Router {
     let config_toml = std::sync::Arc::new(toml::to_string_pretty(config).unwrap_or_default());
 
+    // Extract only the data needed for endpoint/tool group handlers
+    let endpoint_groups = std::sync::Arc::new(config.proxy.endpoint_groups.clone());
+    let tool_groups = std::sync::Arc::new(config.proxy.tool_groups.clone());
+
     let router = Router::new()
         // Read-only endpoints
         .route("/backends", get(handle_backends))
@@ -964,6 +1094,12 @@ pub fn admin_router(
         .route("/circuit-breakers", get(handle_circuit_breakers))
         .route("/config", get(handle_get_config).put(handle_update_config))
         .route("/config/validate", post(handle_validate_config))
+        // Endpoint group endpoints
+        .route("/endpoint-groups", get(handle_endpoint_groups))
+        .route("/endpoint-groups/{name}", get(handle_endpoint_group))
+        // Tool group endpoints
+        .route("/tool-groups", get(handle_tool_groups))
+        .route("/tool-groups/{name}", get(handle_tool_group))
         // Per-backend endpoints
         .route("/backends/{name}/health", get(handle_single_backend_health))
         .route(
@@ -976,19 +1112,15 @@ pub fn admin_router(
             "/backends/{name}",
             delete(handle_remove_backend).put(handle_update_backend),
         )
-        .route(
-            "/backends/{name}/enable",
-            post(handle_enable_backend),
-        )
-        .route(
-            "/backends/{name}/disable",
-            post(handle_disable_backend),
-        )
+        .route("/backends/{name}/enable", post(handle_enable_backend))
+        .route("/backends/{name}/disable", post(handle_disable_backend))
         .layer(Extension(state))
         .layer(Extension(session_handle))
         .layer(Extension(cache_handle))
         .layer(Extension(proxy))
         .layer(Extension(config_toml))
+        .layer(Extension(endpoint_groups))
+        .layer(Extension(tool_groups))
         .layer(Extension(config_path))
         .layer(Extension(Arc::new(cb_handles)));
 

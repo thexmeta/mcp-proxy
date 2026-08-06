@@ -224,7 +224,9 @@ fn build_admin_router(
             let s = state_for_enable.clone();
             async move {
                 if let Some(config_path) = &s.config_path {
-                    match crate::admin::toggle_backend_in_config(config_path, &input.name, true).await {
+                    match crate::admin::toggle_backend_in_config(config_path, &input.name, true)
+                        .await
+                    {
                         Ok(msg) => Ok(CallToolResult::text(msg)),
                         Err(e) => Ok(CallToolResult::text(format!(
                             "Failed to enable backend '{}': {e}",
@@ -233,7 +235,7 @@ fn build_admin_router(
                     }
                 } else {
                     Ok(CallToolResult::text(
-                        "Config path not available (hot reload not enabled)"
+                        "Config path not available (hot reload not enabled)",
                     ))
                 }
             }
@@ -247,7 +249,9 @@ fn build_admin_router(
             let s = state_for_disable.clone();
             async move {
                 if let Some(config_path) = &s.config_path {
-                    match crate::admin::toggle_backend_in_config(config_path, &input.name, false).await {
+                    match crate::admin::toggle_backend_in_config(config_path, &input.name, false)
+                        .await
+                    {
                         Ok(msg) => Ok(CallToolResult::text(msg)),
                         Err(e) => Ok(CallToolResult::text(format!(
                             "Failed to disable backend '{}': {e}",
@@ -256,7 +260,7 @@ fn build_admin_router(
                     }
                 } else {
                     Ok(CallToolResult::text(
-                        "Config path not available (hot reload not enabled)"
+                        "Config path not available (hot reload not enabled)",
                     ))
                 }
             }

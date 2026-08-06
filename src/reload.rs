@@ -17,6 +17,7 @@ use tower::util::BoxCloneService;
 use tower_mcp::proxy::{BackendService, McpProxy};
 
 use crate::config::{BackendConfig, ProxyConfig, TransportType, WatcherConfig};
+use crate::endpoint_router::EndpointGroupRegistry;
 
 /// Trait for config file watchers.
 #[async_trait::async_trait]
@@ -145,6 +146,7 @@ fn build_watcher(config: &WatcherConfig) -> Box<dyn ConfigWatcher> {
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     proxy: McpProxy,
+    endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
@@ -155,6 +157,7 @@ pub fn spawn_config_watcher(
         watch_loop(
             config_path,
             proxy,
+            endpoint_group_registry,
             watchers,
             #[cfg(feature = "discovery")]
             discovery_index,
@@ -166,6 +169,7 @@ pub fn spawn_config_watcher(
 async fn watch_loop(
     config_path: PathBuf,
     proxy: McpProxy,
+    endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
@@ -208,6 +212,20 @@ async fn watch_loop(
         }
     };
 
+    // Track known endpoint groups and their config fingerprints for change detection
+    let mut endpoint_group_fingerprints: HashMap<String, String> = {
+        if let Ok(config) = ProxyConfig::load(&config_path) {
+            config
+                .proxy
+                .endpoint_groups
+                .iter()
+                .map(|eg| (eg.name.clone(), config_fingerprint_endpoint_group(eg)))
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    };
+
     loop {
         // Wait for file change event
         if receiver.recv().await.is_none() {
@@ -215,7 +233,7 @@ async fn watch_loop(
             break;
         }
 
-        tracing::info!("Config file changed, reloading backends");
+        tracing::info!("Config file changed, reloading backends and endpoint groups");
 
         let mut new_config = match ProxyConfig::load(&config_path) {
             Ok(c) => c,
@@ -290,8 +308,78 @@ async fn watch_loop(
             }
         }
 
+        // Handle endpoint group changes
+        let new_eg_fingerprints: HashMap<String, String> = new_config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .map(|eg| (eg.name.clone(), config_fingerprint_endpoint_group(eg)))
+            .collect();
+
+        let old_eg_names: HashSet<&String> = endpoint_group_fingerprints.keys().collect();
+        let new_eg_names: HashSet<&String> = new_eg_fingerprints.keys().collect();
+
+        // Remove endpoint groups that are no longer in config
+        for removed in old_eg_names.difference(&new_eg_names) {
+            tracing::info!(endpoint_group = %removed, "Removing endpoint group via hot reload");
+            endpoint_group_registry.remove(removed);
+        }
+
+        // Add or update endpoint groups
+        for endpoint_group in &new_config.proxy.endpoint_groups {
+            if endpoint_group_fingerprints.contains_key(&endpoint_group.name) {
+                // Existing endpoint group -- check for modification
+                let old_fp = &endpoint_group_fingerprints[&endpoint_group.name];
+                let new_fp = &new_eg_fingerprints[&endpoint_group.name];
+
+                if old_fp != new_fp {
+                    tracing::info!(
+                        endpoint_group = %endpoint_group.name,
+                        "Endpoint group config changed, replacing via hot reload"
+                    );
+
+                    // Rebuild the endpoint group
+                    if let Err(e) = rebuild_endpoint_group(
+                        &endpoint_group_registry,
+                        &new_config,
+                        endpoint_group,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            endpoint_group = %endpoint_group.name,
+                            error = %e,
+                            "Failed to replace endpoint group via hot reload"
+                        );
+                    } else {
+                        tracing::info!(endpoint_group = %endpoint_group.name, "Endpoint group replaced");
+                    }
+                }
+                continue;
+            }
+
+            tracing::info!(
+                name = %endpoint_group.name,
+                path = %endpoint_group.path,
+                "Adding new endpoint group via hot reload"
+            );
+
+            if let Err(e) =
+                build_endpoint_group(&endpoint_group_registry, &new_config, endpoint_group).await
+            {
+                tracing::error!(
+                    endpoint_group = %endpoint_group.name,
+                    error = %e,
+                    "Failed to add endpoint group via hot reload"
+                );
+            } else {
+                tracing::info!(endpoint_group = %endpoint_group.name, "Endpoint group added via hot reload");
+            }
+        }
+
         // Update fingerprints to reflect current state
         backend_fingerprints = new_fingerprints;
+        endpoint_group_fingerprints = new_eg_fingerprints;
 
         // Re-index discovery if enabled
         #[cfg(feature = "discovery")]
@@ -306,6 +394,41 @@ async fn watch_loop(
 /// Uses TOML serialization for a stable, content-based comparison.
 fn config_fingerprint(backend: &BackendConfig) -> String {
     toml::to_string(backend).unwrap_or_default()
+}
+
+/// Generate a fingerprint for an endpoint group config to detect changes.
+/// Uses TOML serialization for a stable, content-based comparison.
+fn config_fingerprint_endpoint_group(eg: &crate::config::EndpointGroupConfig) -> String {
+    toml::to_string(eg).unwrap_or_default()
+}
+
+/// Build and register an endpoint group MCP proxy and router.
+async fn build_endpoint_group(
+    registry: &EndpointGroupRegistry,
+    config: &ProxyConfig,
+    endpoint_group: &crate::config::EndpointGroupConfig,
+) -> anyhow::Result<()> {
+    // Use the existing build_single_endpoint_group function which handles everything
+    let group_router =
+        crate::endpoint_router::build_single_endpoint_group(config, endpoint_group).await?;
+
+    // Register the endpoint group
+    registry.insert(group_router);
+
+    Ok(())
+}
+
+/// Rebuild an existing endpoint group (replace with new config).
+async fn rebuild_endpoint_group(
+    registry: &EndpointGroupRegistry,
+    config: &ProxyConfig,
+    endpoint_group: &crate::config::EndpointGroupConfig,
+) -> anyhow::Result<()> {
+    // Remove the old endpoint group first
+    registry.remove(&endpoint_group.name);
+
+    // Build and register the new one
+    build_endpoint_group(registry, config, endpoint_group).await
 }
 
 /// Connect and add a single backend to the proxy, including per-backend middleware.

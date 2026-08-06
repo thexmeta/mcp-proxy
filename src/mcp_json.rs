@@ -135,6 +135,8 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         mirror_of: None,
         mirror_percent: 100,
         enabled: true,
+        endpoint_groups: Vec::new(),
+        tool_groups: Vec::new(),
     })
 }
 
