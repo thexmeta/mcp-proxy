@@ -21,6 +21,7 @@ mkdir -p "${PROJECT_ROOT}/scripts/deb"
 # Build the project in release mode
 echo "=== Building Rust project in release mode ==="
 cd "${PROJECT_ROOT}"
+cargo generate-lockfile
 cargo build --release --locked --features sqlite-cache
 
 # Verify binary exists
