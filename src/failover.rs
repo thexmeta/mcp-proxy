@@ -129,6 +129,8 @@ fn rewrite_request(req: &McpRequest, primary_prefix: &str, failover_prefix: &str
                     arguments: params.arguments.clone(),
                     meta: params.meta.clone(),
                     task: params.task.clone(),
+                    input_responses: params.input_responses.clone(),
+                    request_state: params.request_state.clone(),
                 })
             } else {
                 req.clone()
@@ -139,6 +141,8 @@ fn rewrite_request(req: &McpRequest, primary_prefix: &str, failover_prefix: &str
                 McpRequest::ReadResource(ReadResourceParams {
                     uri: format!("{failover_prefix}{local}"),
                     meta: params.meta.clone(),
+                    input_responses: params.input_responses.clone(),
+                    request_state: params.request_state.clone(),
                 })
             } else {
                 req.clone()
@@ -150,6 +154,8 @@ fn rewrite_request(req: &McpRequest, primary_prefix: &str, failover_prefix: &str
                     name: format!("{failover_prefix}{local}"),
                     arguments: params.arguments.clone(),
                     meta: params.meta.clone(),
+                    input_responses: params.input_responses.clone(),
+                    request_state: params.request_state.clone(),
                 })
             } else {
                 req.clone()
@@ -278,6 +284,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -342,6 +350,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -420,6 +430,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -484,6 +496,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

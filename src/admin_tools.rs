@@ -298,6 +298,8 @@ fn build_admin_router(
                             arguments: input.arguments.unwrap_or_default().into(),
                             meta: None,
                             task: None,
+                            input_responses: None,
+                            request_state: None,
                         }),
                         extensions: Extensions::new(),
                     };
@@ -558,6 +560,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: Extensions::new(),
         };

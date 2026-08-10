@@ -122,6 +122,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

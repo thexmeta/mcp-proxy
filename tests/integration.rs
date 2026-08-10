@@ -119,6 +119,8 @@ fn tool_call(name: &str, args: serde_json::Value) -> McpRequest {
         arguments: args,
         meta: None,
         task: None,
+        input_responses: None,
+        request_state: None,
     })
 }
 

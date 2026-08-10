@@ -163,6 +163,8 @@ where
             let arguments = params.arguments.clone();
             let meta = params.meta.clone();
             let task = params.task.clone();
+            let input_responses = params.input_responses.clone();
+            let request_state = params.request_state.clone();
             let inner = self.inner.clone();
 
             return Box::pin(async move {
@@ -177,6 +179,8 @@ where
                             arguments: arguments.clone(),
                             meta: meta.clone(),
                             task: task.clone(),
+                            input_responses: input_responses.clone(),
+                            request_state: request_state.clone(),
                         }),
                         extensions: extensions.clone(),
                     };
@@ -331,6 +335,8 @@ mod tests {
                 arguments: serde_json::json!({"q": "test"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -363,6 +369,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -388,6 +396,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

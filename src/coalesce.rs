@@ -155,6 +155,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -183,6 +185,8 @@ mod tests {
                 arguments: serde_json::json!({"a": 1}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }));
         let key2 =
             super::coalesce_key(&McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
@@ -190,6 +194,8 @@ mod tests {
                 arguments: serde_json::json!({"a": 2}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }));
         assert_ne!(key1, key2, "different args should have different keys");
     }
@@ -202,6 +208,8 @@ mod tests {
                 arguments: serde_json::json!({"a": 1}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }));
         let key2 =
             super::coalesce_key(&McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
@@ -209,6 +217,8 @@ mod tests {
                 arguments: serde_json::json!({"a": 1}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }));
         assert_eq!(key1, key2, "same tool+args should have the same key");
     }
@@ -219,6 +229,8 @@ mod tests {
             tower_mcp::protocol::ReadResourceParams {
                 uri: "file:///tmp/test.txt".to_string(),
                 meta: None,
+                input_responses: None,
+                request_state: None,
             },
         ));
         assert_eq!(key, Some("res:file:///tmp/test.txt".to_string()));
@@ -298,6 +310,8 @@ mod tests {
                     arguments: serde_json::json!({"x": 42}),
                     meta: None,
                     task: None,
+                    input_responses: None,
+                    request_state: None,
                 }),
                 extensions: tower_mcp::router::Extensions::new(),
             };
@@ -336,6 +350,8 @@ mod tests {
                 arguments: serde_json::json!({"x": 1}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: tower_mcp::router::Extensions::new(),
         };
@@ -348,6 +364,8 @@ mod tests {
                 arguments: serde_json::json!({"x": 2}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: tower_mcp::router::Extensions::new(),
         };
@@ -376,6 +394,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

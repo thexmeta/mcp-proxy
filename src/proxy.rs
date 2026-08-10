@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tokio::process::Command;
+use tower::Layer;
 use tower::Service;
 use tower::timeout::TimeoutLayer;
 use tower::util::BoxCloneService;
@@ -24,8 +25,10 @@ use crate::alias;
 use crate::cache;
 use crate::coalesce;
 use crate::config::{AuthConfig, ProxyConfig};
+use crate::discover;
 use crate::endpoint_router;
 use crate::filter::CapabilityFilterService;
+use crate::meta_validation;
 #[cfg(feature = "oauth")]
 use crate::rbac::{RbacConfig, RbacService};
 use crate::tool_group;
@@ -118,7 +121,7 @@ async fn build_mcp_proxy_for_backends(
                 tracing::info!(url = %url, "Connecting to WebSocket backend");
                 let transport = if let Some(token) = &backend.bearer_token {
                     crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(
-                        url, token,
+                        url, token, None,
                     )
                     .await
                     .with_context(|| {
@@ -375,9 +378,23 @@ impl Proxy {
 
         let (service, cache_handle) = build_middleware_stack(&config, mcp_proxy)?;
 
-        let (router, session_handle) =
-            tower_mcp::transport::http::HttpTransport::from_service(service)
-                .into_router_with_handle();
+        // Configure protocol version support for the HTTP transport
+        let protocol_support = {
+            let versions = &config.proxy.protocol_support.versions;
+            if versions.is_empty() {
+                // Default to both 2026-07-28 and 2025-11-25 for backward compatibility
+                tower_mcp::ProtocolSupport::try_new(["2026-07-28", "2025-11-25"])
+                    .expect("default protocol versions are valid")
+            } else {
+                tower_mcp::ProtocolSupport::try_new(versions.iter().map(|s| s.as_str()))
+                    .context("invalid protocol versions")?
+            }
+        };
+
+        let transport = tower_mcp::transport::http::HttpTransport::from_service(service)
+            .protocol_support(protocol_support);
+
+        let (router, session_handle) = transport.into_router_with_handle();
 
         // Inbound authentication (axum-level middleware)
         let router = apply_auth(&config, router).await?;
@@ -570,6 +587,15 @@ fn build_middleware_stack(
 )> {
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
+
+    // Discover middleware (innermost - handles server/discover RPC for all transports)
+    tracing::info!("Applying Discover middleware");
+    service = BoxCloneService::new(discover::DiscoverLayer::new(config).layer(service));
+
+    // Meta validation middleware (validates per-request _meta for 2026-07-28)
+    tracing::info!("Applying MetaValidation middleware");
+    service = BoxCloneService::new(meta_validation::MetaValidationLayer::new().layer(service));
+
     let mut cache_handle: Option<cache::CacheHandle> = None;
 
     // Argument injection (innermost -- merges default/per-tool args into CallTool requests)
@@ -1220,6 +1246,8 @@ mod scope_enforcement_tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions,
         }

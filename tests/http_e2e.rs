@@ -509,3 +509,43 @@ async fn test_admin_correct_token_allowed() {
 
     handle.abort();
 }
+
+/// Test if the subscriptions/listen endpoint exists (via POST with method subscriptions/listen per tower-mcp implementation)
+#[tokio::test]
+async fn test_subscriptions_listen_endpoint() {
+    let (addr, handle) = spawn_proxy_server().await;
+    let url = format!("http://{}", addr);
+
+    let client = reqwest::Client::new();
+
+    // tower-mcp implements subscriptions/listen as a POST to / with method "subscriptions/listen" in JSON-RPC body
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "subscriptions/listen",
+        "params": {
+            "notifications": []
+        },
+        "id": 1
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Accept", "text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .expect("POST / with subscriptions/listen method");
+
+    println!("Status: {}", resp.status());
+    println!("Headers: {:?}", resp.headers());
+
+    // Just check if the endpoint exists (doesn't return 404)
+    assert_ne!(
+        resp.status(),
+        404,
+        "subscriptions/listen endpoint should exist"
+    );
+
+    handle.abort();
+}

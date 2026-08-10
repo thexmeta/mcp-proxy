@@ -430,6 +430,11 @@ pub struct ProxySettings {
     /// Default: [Inotify, Mtime { interval_seconds: 30 }, Signal]
     #[serde(default = "default_watchers")]
     pub watchers: Vec<WatcherConfig>,
+
+    /// Protocol version support configuration.
+    /// Controls which MCP protocol versions the HTTP server accepts.
+    #[serde(default)]
+    pub protocol_support: ProtocolSupportConfig,
 }
 
 /// How backend tools are exposed to MCP clients.
@@ -457,6 +462,26 @@ pub enum ToolExposure {
     /// Only `proxy/` namespace meta-tools appear. Backend tools are hidden
     /// from listings but remain invokable via `proxy/call_tool`.
     Search,
+}
+
+/// Protocol version support configuration.
+///
+/// Controls which MCP protocol versions the HTTP server accepts.
+/// By default, only the latest compiled version (2026-07-28) is enabled.
+/// Specify versions to enable multiple versions simultaneously (e.g., for backward compatibility).
+///
+/// # Examples
+///
+/// ```toml
+/// [proxy.protocol_support]
+/// versions = ["2026-07-28", "2025-11-25"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ProtocolSupportConfig {
+    /// List of protocol versions to enable.
+    /// Valid values: "2026-07-28", "2025-11-25"
+    #[serde(default)]
+    pub versions: Vec<String>,
 }
 
 /// Configuration for a config file watcher.
@@ -1566,6 +1591,7 @@ impl ProxyConfig {
                 endpoint_groups: Vec::new(),
                 tool_groups: Vec::new(),
                 watchers: default_watchers(),
+                protocol_support: ProtocolSupportConfig::default(),
             },
             backends,
             auth: None,

@@ -57,6 +57,8 @@ fn tool_call() -> McpRequest {
         name: "bench/echo".to_string(),
         arguments: serde_json::json!({"message": "hello"}),
         meta: None,
+        input_responses: None,
+        request_state: None,
         task: None,
     })
 }

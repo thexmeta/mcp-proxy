@@ -2,9 +2,14 @@
 
 ## Overview
 
-mcp-proxy is a config-driven MCP (Model Context Protocol) reverse proxy built in Rust. It aggregates multiple MCP backends behind a single HTTP endpoint with per-backend middleware, authentication, and observability. Built on tower-mcp and the tower middleware ecosystem.
+mcp-proxy is a config-driven MCP (Model Context Protocol) reverse proxy built in Rust. It aggregates multiple MCP backends behind a single HTTP endpoint with per-backend middleware, authentication, and observability. Built on tower-mcp 0.20+ and the tower middleware ecosystem.
 
 Package name: `mcp-proxy`. Binary name: `mcp-proxy`. Library name: `mcp_proxy`.
+
+**MCP Protocol Support:**
+- **2026-07-28** (stateless, no session handshake, per-request `_meta`, `server/discover`, `subscriptions/listen`)
+- **2025-11-25** (session-based with `initialize` handshake, `Mcp-Session-Id`, SSE)
+- **2025-03-26** (legacy)
 
 ## Project structure
 
@@ -165,9 +170,11 @@ cargo test --doc --all-features          # catches stale doc examples
 
 ## Conventions
 
-- Rust 2024 edition, MSRV 1.90
+- Rust 2024 edition, MSRV 1.97
 - `anyhow` for application errors, `thiserror` for library errors
 - Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`
 - All public APIs have doc comments
 - Metrics use `mcp_proxy_` prefix
 - Admin tools live under `proxy/` namespace
+- MCP protocol: supports 2026-07-28 (stateless) and 2025-11-25 (session-based)
+- tower-mcp: 0.20+ with `protocol-2026-07-28` feature

@@ -171,6 +171,7 @@ pub mod coalesce;
 pub mod composite;
 pub mod config;
 #[cfg(feature = "discovery")]
+pub mod discover;
 pub mod discovery;
 pub mod endpoint_router;
 pub mod failover;
@@ -179,6 +180,7 @@ pub mod inject;
 #[cfg(feature = "oauth")]
 pub mod introspection;
 pub mod mcp_json;
+pub mod meta_validation;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mirror;

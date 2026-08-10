@@ -66,6 +66,7 @@ impl ProxyBuilder {
                     endpoint_groups: Vec::new(),
                     tool_groups: Vec::new(),
                     watchers: crate::config::default_watchers(),
+                    protocol_support: crate::config::ProtocolSupportConfig::default(),
                 },
                 backends: Vec::new(),
                 auth: None,

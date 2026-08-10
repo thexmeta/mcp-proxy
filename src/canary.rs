@@ -150,6 +150,8 @@ fn rewrite_to_canary(req: RouterRequest, mapping: &CanaryMapping) -> RouterReque
                 arguments: params.arguments,
                 meta: params.meta,
                 task: params.task,
+                input_responses: params.input_responses,
+                request_state: params.request_state,
             })
         }
         McpRequest::ReadResource(params) if params.uri.starts_with(&mapping.primary_prefix) => {
@@ -157,6 +159,8 @@ fn rewrite_to_canary(req: RouterRequest, mapping: &CanaryMapping) -> RouterReque
             McpRequest::ReadResource(ReadResourceParams {
                 uri: format!("{}{suffix}", mapping.canary_prefix),
                 meta: params.meta,
+                input_responses: params.input_responses,
+                request_state: params.request_state,
             })
         }
         McpRequest::GetPrompt(params) if params.name.starts_with(&mapping.primary_prefix) => {
@@ -165,6 +169,8 @@ fn rewrite_to_canary(req: RouterRequest, mapping: &CanaryMapping) -> RouterReque
                 name: format!("{}{suffix}", mapping.canary_prefix),
                 arguments: params.arguments,
                 meta: params.meta,
+                input_responses: params.input_responses,
+                request_state: params.request_state,
             })
         }
         other => other,
@@ -309,6 +315,8 @@ mod tests {
                 arguments: serde_json::json!({"q": "test"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: Extensions::new(),
         };
@@ -338,6 +346,8 @@ mod tests {
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "api/docs/readme".to_string(),
                 meta: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: Extensions::new(),
         };
@@ -385,6 +395,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -408,6 +420,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -428,6 +442,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

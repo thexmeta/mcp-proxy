@@ -583,6 +583,8 @@ mod tests {
             arguments: serde_json::json!({"key": "value"}),
             meta: None,
             task: None,
+            input_responses: None,
+            request_state: None,
         })
     }
 

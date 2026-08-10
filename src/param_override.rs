@@ -358,6 +358,8 @@ mod tests {
                 arguments: serde_json::json!({"recursive": true}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -430,6 +432,8 @@ mod tests {
                 arguments: serde_json::json!({"path": "/tmp", "deep_search": true}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -631,6 +635,8 @@ mod tests {
                 arguments: serde_json::json!({"path": "/custom"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: tower_mcp::router::Extensions::new(),
         };

@@ -169,6 +169,8 @@ mod tests {
                 arguments: serde_json::json!({"key": "small"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -191,6 +193,8 @@ mod tests {
                 arguments: serde_json::json!({"key": "this string is definitely longer than 10 bytes"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -230,6 +234,8 @@ mod tests {
                 arguments: serde_json::json!({"key": "any size is fine"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

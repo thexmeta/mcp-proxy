@@ -140,12 +140,16 @@ fn clone_for_mirror(
                 arguments: params.arguments.clone(),
                 meta: params.meta.clone(),
                 task: params.task.clone(),
+                input_responses: params.input_responses.clone(),
+                request_state: params.request_state.clone(),
             })
         }
         McpRequest::ReadResource(params) if params.uri.starts_with(source_prefix) => {
             McpRequest::ReadResource(ReadResourceParams {
                 uri: rewrite_name(&params.uri, source_prefix, mirror_prefix),
                 meta: params.meta.clone(),
+                input_responses: params.input_responses.clone(),
+                request_state: params.request_state.clone(),
             })
         }
         McpRequest::GetPrompt(params) if params.name.starts_with(source_prefix) => {
@@ -153,6 +157,8 @@ fn clone_for_mirror(
                 name: rewrite_name(&params.name, source_prefix, mirror_prefix),
                 arguments: params.arguments.clone(),
                 meta: params.meta.clone(),
+                input_responses: params.input_responses.clone(),
+                request_state: params.request_state.clone(),
             })
         }
         // List requests and other types aren't mirrored
@@ -317,6 +323,8 @@ mod tests {
                 arguments: serde_json::json!({"q": "test"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: Extensions::new(),
         };
@@ -338,6 +346,8 @@ mod tests {
             inner: McpRequest::ReadResource(ReadResourceParams {
                 uri: "api/docs/readme".to_string(),
                 meta: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: Extensions::new(),
         };
@@ -374,6 +384,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -395,6 +407,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

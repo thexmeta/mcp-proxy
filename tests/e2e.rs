@@ -21,10 +21,13 @@ use mcp_proxy::alias::{AliasMap, AliasService};
 use mcp_proxy::cache::CacheService;
 use mcp_proxy::config::{
     BackendCacheConfig, BackendFilter, CacheBackendConfig, InjectArgsConfig, NameFilter,
+    PerformanceConfig, ProtocolSupportConfig, ProxyConfig, SecurityConfig,
 };
+use mcp_proxy::discover::DiscoverLayer;
 use mcp_proxy::filter::CapabilityFilterService;
 use mcp_proxy::inject::{InjectArgsService, InjectionRules};
 use mcp_proxy::validation::{ValidationConfig, ValidationService};
+use tower::Layer;
 
 // ---------------------------------------------------------------------------
 // Test backend routers
@@ -120,7 +123,9 @@ fn slow_router() -> McpRouter {
 // Test helpers
 // ---------------------------------------------------------------------------
 
-async fn build_proxy() -> McpProxy {
+/// Build a bare test proxy without Discover middleware.
+/// Use this for tests that need to call add_backend() dynamically.
+async fn build_bare_proxy() -> McpProxy {
     McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
@@ -132,8 +137,61 @@ async fn build_proxy() -> McpProxy {
         .expect("proxy should build")
 }
 
-async fn build_proxy_with_error_backend() -> McpProxy {
-    McpProxy::builder("test-proxy", "1.0.0")
+/// Build a test proxy with the Discover middleware wrapped around it.
+/// This simulates the full middleware stack used in production.
+async fn build_proxy() -> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    // Wrap with Discover middleware (same as production middleware stack)
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            protocol_support,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
+
+    service
+}
+
+async fn build_proxy_with_error_backend()
+-> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
         .await
@@ -141,11 +199,49 @@ async fn build_proxy_with_error_backend() -> McpProxy {
         .await
         .build_strict()
         .await
-        .expect("proxy should build")
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            protocol_support,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
+
+    service
 }
 
-async fn build_proxy_with_slow_backend() -> McpProxy {
-    McpProxy::builder("test-proxy", "1.0.0")
+async fn build_proxy_with_slow_backend()
+-> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
         .await
@@ -153,7 +249,44 @@ async fn build_proxy_with_slow_backend() -> McpProxy {
         .await
         .build_strict()
         .await
-        .expect("proxy should build")
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            protocol_support,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
+
+    service
 }
 
 async fn call<S>(svc: &mut S, request: McpRequest) -> RouterResponse
@@ -174,6 +307,8 @@ fn tool_call(name: &str, args: serde_json::Value) -> McpRequest {
         arguments: args,
         meta: None,
         task: None,
+        input_responses: None,
+        request_state: None,
     })
 }
 
@@ -248,6 +383,39 @@ async fn e2e_ping_succeeds() {
     match resp.inner.unwrap() {
         McpResponse::Pong(_) => {}
         other => panic!("expected Pong, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn e2e_discover_returns_capabilities() {
+    let mut proxy = build_proxy().await;
+    let resp = call(
+        &mut proxy,
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+    )
+    .await;
+    eprintln!("Discover response: {:?}", resp);
+    assert!(resp.inner.is_ok());
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            // Verify supported_versions includes 2026-07-28
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "should support 2026-07-28, got: {:?}",
+                result.supported_versions
+            );
+            // Verify capabilities are present
+            assert!(
+                result.capabilities.tools.is_some(),
+                "should have tools capability"
+            );
+            // Verify instructions are present (optional but good to check)
+            assert!(
+                result.instructions.is_some() || result.instructions.is_none(),
+                "instructions field exists"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
     }
 }
 
@@ -728,7 +896,7 @@ async fn e2e_cache_uncached_namespace_is_not_cached() {
 
 #[tokio::test]
 async fn e2e_dynamic_add_backend_appears_in_tool_list() {
-    let mut proxy = build_proxy().await;
+    let mut proxy = build_bare_proxy().await;
 
     // Initially 4 tools
     let resp = call(&mut proxy, McpRequest::ListTools(Default::default())).await;
@@ -755,7 +923,7 @@ async fn e2e_dynamic_add_backend_appears_in_tool_list() {
 
 #[tokio::test]
 async fn e2e_dynamic_backend_is_callable() {
-    let mut proxy = build_proxy().await;
+    let mut proxy = build_bare_proxy().await;
 
     let extra_router = McpRouter::new().server_info("extra", "1.0.0").tool(
         ToolBuilder::new("ping")
@@ -1564,6 +1732,8 @@ mod bearer_scoping {
                 arguments: serde_json::json!({"message": "hi"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         );
         let resp = svc.call(req).await.unwrap();
@@ -1585,6 +1755,8 @@ mod bearer_scoping {
                 arguments: serde_json::json!({"a": 3, "b": 4}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         );
         let resp = svc.call(req).await.unwrap();
@@ -1702,6 +1874,8 @@ mod websocket_transport {
                 arguments: serde_json::json!({"value": "hello ws"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -1725,7 +1899,7 @@ mod tool_discovery {
     use tower_mcp::protocol::{CallToolParams, ListToolsParams, McpRequest, RequestId};
     use tower_mcp::router::{Extensions, RouterRequest, RouterResponse};
 
-    use super::{build_proxy, get_tool_names, get_tool_result_text};
+    use super::{build_bare_proxy, get_tool_names, get_tool_result_text};
     use std::convert::Infallible;
 
     async fn call<S>(svc: &mut S, request: McpRequest) -> RouterResponse
@@ -1742,7 +1916,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_index_and_search() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build the discovery index
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -1783,7 +1957,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_search_finds_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
         let discovery_tools = mcp_proxy::discovery::build_discovery_tools(index);
@@ -1807,6 +1981,8 @@ mod tool_discovery {
                 arguments: serde_json::json!({"query": "add numbers"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -1819,7 +1995,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_categories() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
         let discovery_tools = mcp_proxy::discovery::build_discovery_tools(index);
@@ -1843,6 +2019,8 @@ mod tool_discovery {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -1862,7 +2040,7 @@ mod search_mode {
     use tower_mcp::protocol::{CallToolParams, ListToolsParams, McpRequest, RequestId};
     use tower_mcp::router::{Extensions, RouterRequest, RouterResponse};
 
-    use super::{build_proxy, get_tool_names, get_tool_result_text};
+    use super::{build_bare_proxy, build_proxy, get_tool_names, get_tool_result_text};
     use mcp_proxy::filter::SearchModeFilterService;
     use std::convert::Infallible;
     use tower::util::BoxCloneService;
@@ -1881,7 +2059,7 @@ mod search_mode {
 
     #[tokio::test]
     async fn e2e_search_mode_hides_backend_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build discovery index and register proxy/ namespace tools
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -1948,6 +2126,8 @@ mod search_mode {
                 arguments: serde_json::json!({"a": 3, "b": 7}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -1957,7 +2137,7 @@ mod search_mode {
 
     #[tokio::test]
     async fn e2e_search_mode_search_finds_hidden_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build discovery index (indexes math/add, text/echo, etc.)
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -1985,6 +2165,8 @@ mod search_mode {
                 arguments: serde_json::json!({"query": "add numbers"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

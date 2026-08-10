@@ -220,6 +220,8 @@ mod tests {
                 arguments: serde_json::json!({"sql": "SELECT 1"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -245,6 +247,8 @@ mod tests {
                 arguments: serde_json::json!({"sql": "SELECT 1", "timeout": 60}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions: tower_mcp::router::Extensions::new(),
         };
@@ -285,6 +289,8 @@ mod tests {
                 arguments: serde_json::json!({"sql": "SELECT 1"}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -324,6 +330,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;

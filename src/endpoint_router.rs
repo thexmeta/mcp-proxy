@@ -150,7 +150,7 @@ async fn build_mcp_proxy_for_backends(
                 tracing::info!(url = %url, "Connecting to WebSocket backend");
                 let transport = if let Some(token) = &backend.bearer_token {
                     crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(
-                        url, token,
+                        url, token, None,
                     )
                     .await
                     .with_context(|| {

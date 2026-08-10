@@ -153,6 +153,8 @@ mod tests {
             arguments: serde_json::json!({}),
             meta: None,
             task: None,
+            input_responses: None,
+            request_state: None,
         });
         assert!(request_targets_namespace(&req, &namespaces));
     }
@@ -165,6 +167,8 @@ mod tests {
             arguments: serde_json::json!({}),
             meta: None,
             task: None,
+            input_responses: None,
+            request_state: None,
         });
         assert!(!request_targets_namespace(&req, &namespaces));
     }
@@ -201,6 +205,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
             extensions,
         };
@@ -222,6 +228,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
@@ -243,6 +251,8 @@ mod tests {
                 arguments: serde_json::json!({}),
                 meta: None,
                 task: None,
+                input_responses: None,
+                request_state: None,
             }),
         )
         .await;
