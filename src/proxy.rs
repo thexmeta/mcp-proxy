@@ -121,18 +121,23 @@ async fn build_mcp_proxy_for_backends(
                 tracing::info!(url = %url, "Connecting to WebSocket backend");
                 let transport = if let Some(token) = &backend.bearer_token {
                     crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(
-                        url, token, None,
+                        url,
+                        token,
+                        backend.protocol_version.as_deref(),
                     )
                     .await
                     .with_context(|| {
                         format!("connecting to WebSocket backend '{}'", backend.name)
                     })?
                 } else {
-                    crate::ws_transport::WebSocketClientTransport::connect(url)
-                        .await
-                        .with_context(|| {
-                            format!("connecting to WebSocket backend '{}'", backend.name)
-                        })?
+                    crate::ws_transport::WebSocketClientTransport::connect_with_protocol_version(
+                        url,
+                        backend.protocol_version.as_deref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("connecting to WebSocket backend '{}'", backend.name)
+                    })?
                 };
 
                 builder = builder.backend(&backend.name, transport).await;
@@ -390,6 +395,30 @@ impl Proxy {
                     .context("invalid protocol versions")?
             }
         };
+
+        // Validate default_protocol_version if specified
+        if let Some(ref default_pv) = config.proxy.protocol_support.default_protocol_version {
+            let enabled: Vec<&str> = config
+                .proxy
+                .protocol_support
+                .versions
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let effective = if enabled.is_empty() {
+                vec!["2026-07-28", "2025-11-25"]
+            } else {
+                enabled
+            };
+            if !effective.contains(&default_pv.as_str()) {
+                anyhow::bail!(
+                    "default_protocol_version '{}' is not in enabled versions: {:?}",
+                    default_pv,
+                    effective
+                );
+            }
+            tracing::info!(default_protocol_version = %default_pv, "Default protocol version configured");
+        }
 
         let transport = tower_mcp::transport::http::HttpTransport::from_service(service)
             .protocol_support(protocol_support);
@@ -997,6 +1026,18 @@ fn build_middleware_stack(
             .refresh_period(Duration::from_secs(rl.period_seconds))
             .name("global-ratelimit")
             .build();
+        let limited = tower::Layer::layer(&layer, service);
+        service = BoxCloneService::new(tower_mcp::CatchError::new(limited));
+    }
+
+    // Per-client-identity rate limit (applied before global rate limit)
+    if let Some(ref crl) = config.proxy.client_rate_limit {
+        tracing::info!(
+            max_requests = crl.max_requests,
+            window_seconds = crl.window_seconds,
+            "Applying per-client-identity rate limit"
+        );
+        let layer = crate::client_rate_limit::ClientIdentityRateLimitLayer::new(crl.clone());
         let limited = tower::Layer::layer(&layer, service);
         service = BoxCloneService::new(tower_mcp::CatchError::new(limited));
     }

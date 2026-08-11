@@ -28,6 +28,7 @@ use mcp_proxy::filter::CapabilityFilterService;
 use mcp_proxy::inject::{InjectArgsService, InjectionRules};
 use mcp_proxy::validation::{ValidationConfig, ValidationService};
 use tower::Layer;
+use tower_mcp_types::protocol::{Implementation, RequestMeta};
 
 // ---------------------------------------------------------------------------
 // Test backend routers
@@ -167,6 +168,7 @@ async fn build_proxy() -> BoxCloneService<RouterRequest, RouterResponse, Infalli
             hot_reload: false,
             import_backends: None,
             rate_limit: None,
+            client_rate_limit: None,
             tool_discovery: false,
             tool_exposure: mcp_proxy::config::ToolExposure::default(),
             expose_grouped_in_default: false,
@@ -184,9 +186,7 @@ async fn build_proxy() -> BoxCloneService<RouterRequest, RouterResponse, Infalli
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
-    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
-
-    service
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
 }
 
 async fn build_proxy_with_error_backend()
@@ -217,6 +217,7 @@ async fn build_proxy_with_error_backend()
             hot_reload: false,
             import_backends: None,
             rate_limit: None,
+            client_rate_limit: None,
             tool_discovery: false,
             tool_exposure: mcp_proxy::config::ToolExposure::default(),
             expose_grouped_in_default: false,
@@ -234,9 +235,7 @@ async fn build_proxy_with_error_backend()
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
-    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
-
-    service
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
 }
 
 async fn build_proxy_with_slow_backend()
@@ -267,6 +266,7 @@ async fn build_proxy_with_slow_backend()
             hot_reload: false,
             import_backends: None,
             rate_limit: None,
+            client_rate_limit: None,
             tool_discovery: false,
             tool_exposure: mcp_proxy::config::ToolExposure::default(),
             expose_grouped_in_default: false,
@@ -284,9 +284,7 @@ async fn build_proxy_with_slow_backend()
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
-    let service = BoxCloneService::new(DiscoverLayer::new(&config).layer(service));
-
-    service
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
 }
 
 async fn call<S>(svc: &mut S, request: McpRequest) -> RouterResponse
@@ -310,6 +308,38 @@ fn tool_call(name: &str, args: serde_json::Value) -> McpRequest {
         input_responses: None,
         request_state: None,
     })
+}
+
+/// Helper: build a RouterRequest with optional RequestMeta in extensions.
+fn request_with_meta(inner: McpRequest, meta: Option<RequestMeta>) -> RouterRequest {
+    let mut extensions = Extensions::new();
+    if let Some(m) = meta {
+        extensions.insert(m);
+    }
+    RouterRequest {
+        id: RequestId::Number(1),
+        inner,
+        extensions,
+    }
+}
+
+/// Helper: create a standard 2026-07-28 RequestMeta.
+fn meta_2026() -> RequestMeta {
+    RequestMeta {
+        progress_token: None,
+        protocol_version: Some("2026-07-28".into()),
+        client_info: Some(Implementation {
+            name: "test-client".into(),
+            version: "1.0.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: Some(tower_mcp_types::protocol::ClientCapabilities::default()),
+        log_level: None,
+    }
 }
 
 fn get_tool_names(resp: &RouterResponse) -> Vec<String> {
@@ -2176,4 +2206,368 @@ mod search_mode {
             "search should find hidden 'add' tool: {text}"
         );
     }
+}
+
+// ===========================================================================
+// Wave 5: MCP 2026-07-28 E2E Tests (T5.2, T5.5)
+// ===========================================================================
+
+/// Helper: build a proxy with DiscoverLayer using custom protocol support config.
+async fn build_proxy_with_protocol(
+    versions: Vec<&str>,
+    instructions: Option<String>,
+) -> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig {
+        versions: versions.into_iter().map(String::from).collect(),
+        default_protocol_version: None,
+    };
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            protocol_support,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
+}
+
+// --- T5.2: Full proxy pipeline with 2026-07-28 stateless requests ---
+
+#[tokio::test]
+async fn test_e2e_2026_list_tools_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/add".to_string()),
+        "should find math/add: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"text/echo".to_string()),
+        "should find text/echo: {:?}",
+        names
+    );
+    assert_eq!(names.len(), 4, "should have 4 tools total: {:?}", names);
+}
+
+#[tokio::test]
+async fn test_e2e_2026_call_tool_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "30");
+}
+
+#[tokio::test]
+async fn test_e2e_2026_ping_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+    let req = request_with_meta(McpRequest::Ping, Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+#[tokio::test]
+async fn test_e2e_2026_discover_returns_all_versions() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "should include 2026-07-28"
+            );
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2025-11-25"),
+                "should include 2025-11-25"
+            );
+            assert!(
+                result.capabilities.tools.is_some(),
+                "should have tools capability"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_2026_discover_with_instructions() {
+    let mut proxy = build_proxy_with_protocol(
+        vec!["2026-07-28"],
+        Some("Be helpful and concise.".to_string()),
+    )
+    .await;
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert_eq!(
+                result.instructions.as_deref(),
+                Some("Be helpful and concise."),
+                "should include instructions"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_2026_no_session_required() {
+    // 2026-07-28 is stateless: multiple requests should work without session state
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+
+    // First request
+    let req1 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 2})),
+        Some(meta_2026()),
+    );
+    let resp1 = proxy.call(req1).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp1), "3");
+
+    // Second request (no session needed)
+    let req2 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 5, "b": 7})),
+        Some(meta_2026()),
+    );
+    let resp2 = proxy.call(req2).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp2), "12");
+
+    // Third request - list tools still works
+    let req3 = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp3 = proxy.call(req3).await.expect("infallible");
+    let names = get_tool_names(&resp3);
+    assert_eq!(names.len(), 4);
+}
+
+#[tokio::test]
+async fn test_e2e_2026_middleware_stack_works_stateless() {
+    // Verify the full middleware stack (Discover + alias) works
+    // with stateless 2026-07-28 requests
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig {
+        versions: vec!["2026-07-28".into()],
+        default_protocol_version: None,
+    };
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            protocol_support,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+
+    // Apply alias layer: rename math/add → math/sum
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
+    .expect("alias map");
+    let svc = AliasService::new(service.clone(), aliases);
+    let svc = DiscoverLayer::new(&config).layer(svc);
+    let mut svc = BoxCloneService::new(svc);
+
+    // List tools with 2026-07-28 meta shows aliased name
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = svc.call(req).await.expect("infallible");
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/sum".to_string()),
+        "aliased name: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"math/add".to_string()),
+        "original hidden: {:?}",
+        names
+    );
+
+    // Call tool via alias also works
+    let req = request_with_meta(
+        tool_call("math/sum", serde_json::json!({"a": 3, "b": 4})),
+        Some(meta_2026()),
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "7");
+}
+
+// --- T5.5: Mixed protocol versions ---
+
+#[tokio::test]
+async fn test_e2e_mixed_2026_and_2025_requests() {
+    // Simulate a proxy that serves both 2026-07-28 and 2025-11-25 clients
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+
+    // 2026-07-28 client with meta
+    let req_2026 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+        Some(meta_2026()),
+    );
+    let resp_2026 = proxy.call(req_2026).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp_2026), "30");
+
+    // 2025-11-25 client without meta
+    let req_2025 = request_with_meta(
+        tool_call("text/echo", serde_json::json!({"message": "hello"})),
+        None,
+    );
+    let resp_2025 = proxy.call(req_2025).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp_2025), "hello");
+
+    // Both should see the same tool list
+    let req_list_2026 =
+        request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp_list_2026 = proxy.call(req_list_2026).await.expect("infallible");
+    let names_2026 = get_tool_names(&resp_list_2026);
+
+    let req_list_2025 = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp_list_2025 = proxy.call(req_list_2025).await.expect("infallible");
+    let names_2025 = get_tool_names(&resp_list_2025);
+
+    assert_eq!(
+        names_2026, names_2025,
+        "both protocol versions should see same tools"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_mixed_discover_returns_all_versions() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+
+    // Discover from a 2026-07-28 client
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(result.supported_versions.iter().any(|v| v == "2026-07-28"));
+            assert!(result.supported_versions.iter().any(|v| v == "2025-11-25"));
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+
+    // Discover from a legacy client (no meta)
+    let req2 = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp2 = proxy.call(req2).await.expect("infallible");
+    match resp2.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(result.supported_versions.iter().any(|v| v == "2026-07-28"));
+            assert!(result.supported_versions.iter().any(|v| v == "2025-11-25"));
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_mixed_partial_meta_on_2025_request() {
+    // A 2025-11-25 client might send _meta with only some fields
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let meta = RequestMeta {
+        protocol_version: Some("2025-11-25".into()),
+        client_info: Some(Implementation {
+            name: "legacy-client".into(),
+            version: "0.9.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: None, // Not required for 2025
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 3, "b": 7})),
+        Some(meta),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "10");
 }

@@ -60,6 +60,7 @@ impl ProxyBuilder {
                     hot_reload: false,
                     import_backends: None,
                     rate_limit: None,
+                    client_rate_limit: None,
                     tool_discovery: false,
                     tool_exposure: crate::config::ToolExposure::default(),
                     expose_grouped_in_default: true,
@@ -531,6 +532,7 @@ fn default_backend() -> BackendConfig {
         enabled: true,
         endpoint_groups: Vec::new(),
         tool_groups: Vec::new(),
+        protocol_version: None,
     }
 }
 

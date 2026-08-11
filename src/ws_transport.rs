@@ -61,45 +61,60 @@ impl WebSocketClientTransport {
     /// # Errors
     ///
     /// Returns an error if the WebSocket handshake fails or the URL is invalid.
-    pub async fn connect_with_protocol_version(url: &str, version: Option<&str>) -> anyhow::Result<Self> {
-    use tokio_tungstenite::tungstenite::http::Request;
+    pub async fn connect_with_protocol_version(
+        url: &str,
+        version: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        use tokio_tungstenite::tungstenite::http::Request;
 
-    let mut request = Request::builder()
-        .uri(url)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        );
+        let mut request = Request::builder()
+            .uri(url)
+            .header("Host", host_header_from_url(url)?)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            );
 
-    if let Some(v) = version {
-        request = request.header("Sec-WebSocket-Protocol", format!("mcp.version.{v}"));
+        if let Some(v) = version {
+            request = request.header("Sec-WebSocket-Protocol", format!("mcp.version.{v}"));
+        }
+
+        let request = request
+            .body(())
+            .map_err(|e| anyhow::anyhow!("invalid WebSocket request: {e}"))?;
+
+        let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {e}"))?;
+
+        // Extract negotiated protocol version from server response
+        let negotiated_version = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("mcp.version."))
+            .map(|s| s.to_string());
+
+        let (sink, stream) = ws_stream.split();
+
+        Ok(Self {
+            sink: Arc::new(Mutex::new(sink)),
+            stream: Arc::new(Mutex::new(stream)),
+            connected: Arc::new(AtomicBool::new(true)),
+            negotiated_version: Arc::new(Mutex::new(negotiated_version)),
+        })
     }
 
-    let request = request.body(()).map_err(|e| anyhow::anyhow!("invalid WebSocket request: {e}"))?;
-
-    let (ws_stream, response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {e}"))?;
-
-    // Extract negotiated protocol version from server response
-    let negotiated_version = response
-        .headers()
-        .get("Sec-WebSocket-Protocol")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("mcp.version."))
-        .map(|s| s.to_string());
-
-    let (sink, stream) = ws_stream.split();
-
-    Ok(Self {
-        sink: Arc::new(Mutex::new(sink)),
-        stream: Arc::new(Mutex::new(stream)),
-        connected: Arc::new(AtomicBool::new(true)),
-        negotiated_version: Arc::new(Mutex::new(negotiated_version)),
-    })
+    /// Get the negotiated protocol version from the server, if any.
+    ///
+    /// Returns the protocol version string (e.g. `"2026-07-28"`) if the server
+    /// responded with a `Sec-WebSocket-Protocol: mcp.version.{version}` header
+    /// during the WebSocket handshake. Returns `None` if no version was negotiated.
+    pub async fn negotiated_version(&self) -> Option<String> {
+        self.negotiated_version.lock().await.clone()
     }
 
     /// Connect to a WebSocket endpoint with a bearer token for authentication.
@@ -116,6 +131,7 @@ impl WebSocketClientTransport {
 
         let mut request = Request::builder()
             .uri(url)
+            .header("Host", host_header_from_url(url)?)
             .header("Authorization", format!("Bearer {token}"))
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -129,7 +145,9 @@ impl WebSocketClientTransport {
             request = request.header("Sec-WebSocket-Protocol", format!("mcp.version.{v}"));
         }
 
-        let request = request.body(()).map_err(|e| anyhow::anyhow!("invalid WebSocket request: {e}"))?;
+        let request = request
+            .body(())
+            .map_err(|e| anyhow::anyhow!("invalid WebSocket request: {e}"))?;
 
         let (ws_stream, response) = tokio_tungstenite::connect_async(request)
             .await
@@ -203,6 +221,39 @@ impl tower_mcp::client::ClientTransport for WebSocketClientTransport {
     }
 }
 
+/// Extract the `Host` header value from a URL string per RFC 6455 §4.1.
+///
+/// Returns `host:port` when the port is non-standard for the scheme, or just
+/// `host` when the port is the default (80 for `ws`/`http`, 443 for `wss`/`https`)
+/// or absent.
+fn host_header_from_url(url: &str) -> anyhow::Result<String> {
+    use tokio_tungstenite::tungstenite::http::Uri;
+
+    let uri: Uri = url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("failed to parse URL for Host header: {e}"))?;
+
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host component: {url}"))?
+        .to_string();
+
+    match uri.port_u16() {
+        Some(port) => {
+            let default_port = match uri.scheme_str() {
+                Some("wss" | "https") => 443,
+                _ => 80,
+            };
+            if port == default_port {
+                Ok(host)
+            } else {
+                Ok(format!("{host}:{port}"))
+            }
+        }
+        None => Ok(host),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,11 +271,60 @@ mod tests {
     #[tokio::test]
     async fn connect_with_bearer_token_fails_with_invalid_url() {
         let result =
-            WebSocketClientTransport::connect_with_bearer_token("ws://127.0.0.1:1", "tok", None).await;
+            WebSocketClientTransport::connect_with_bearer_token("ws://127.0.0.1:1", "tok", None)
+                .await;
         let err = result.err().expect("should fail").to_string();
         assert!(
             err.contains("WebSocket connection failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn host_header_extracts_host_and_non_default_port() {
+        assert_eq!(
+            host_header_from_url("ws://localhost:8080/ws").unwrap(),
+            "localhost:8080"
+        );
+    }
+
+    #[test]
+    fn host_header_omits_default_ws_port() {
+        assert_eq!(
+            host_header_from_url("ws://localhost:80/ws").unwrap(),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn host_header_omits_default_wss_port() {
+        assert_eq!(
+            host_header_from_url("wss://example.com:443/ws").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn host_header_includes_non_default_wss_port() {
+        assert_eq!(
+            host_header_from_url("wss://example.com:8443/ws").unwrap(),
+            "example.com:8443"
+        );
+    }
+
+    #[test]
+    fn host_header_without_port() {
+        assert_eq!(
+            host_header_from_url("ws://localhost/ws").unwrap(),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn host_header_with_credentials_stripped() {
+        assert_eq!(
+            host_header_from_url("ws://user:pass@localhost:9090/ws").unwrap(),
+            "localhost:9090"
         );
     }
 }

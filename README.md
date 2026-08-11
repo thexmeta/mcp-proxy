@@ -228,6 +228,28 @@ expose_tools = ["read_file", "list_directory"]
 # hide_tools = ["write_file", "delete_file"]
 ```
 
+### Protocol version support
+
+mcp-proxy supports both MCP 2026-07-28 (stateless) and 2025-11-25 (session-based) protocols simultaneously. Clients auto-negotiate via HTTP headers or WebSocket subprotocol negotiation.
+
+```toml
+[proxy.protocol_support]
+# Both enabled by default for maximum client compatibility
+versions = ["2026-07-28", "2025-11-25"]
+# Default version for new connections (optional)
+default_protocol_version = "2026-07-28"
+```
+
+Per-backend protocol version (for HTTP/WebSocket backends):
+
+```toml
+[[backends]]
+name = "remote-api"
+transport = "http"
+url = "http://api.internal:8080"
+protocol_version = "2026-07-28"
+```
+
 ## Library Usage
 
 Add to your `Cargo.toml`:

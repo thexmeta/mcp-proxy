@@ -39,10 +39,10 @@
 
 | Task ID | Description | Agent | Dependencies | Status |
 |---------|-------------|-------|--------------|--------|
-| T4.1 | Add protocol version config options in `src/config.rs` | gem-implementer | T2.1 | pending |
-| T4.2 | Add per-backend protocol_version config option | gem-implementer | T4.1 | pending |
-| T4.3 | Update `src/admin_tools.rs` for dual-protocol support | gem-implementer | T2.1 | pending |
-| T4.4 | Update example configs in `examples/` for 2026-07-28 | gem-implementer | T4.1 | pending |
+| T4.1 | Add protocol version config options in `src/config.rs` | gem-implementer | T2.1 | ✅ done |
+| T4.2 | Add per-backend protocol_version config option | gem-implementer | T4.1 | ✅ done |
+| T4.3 | Update `src/admin_tools.rs` for dual-protocol support | gem-implementer | T2.1 | ✅ done |
+| T4.4 | Update example configs in `examples/` for 2026-07-28 | gem-implementer | T4.1 | ✅ done |
 
 ### Wave 5: Testing & Conformance
 
@@ -94,8 +94,8 @@ plan_lineage:
 ## Context Version
 
 ```yaml
-context_version: 4
-context_updated_at: "2026-08-10T12:00:00Z"
+context_version: 5
+context_updated_at: "2026-08-11T12:00:00Z"
 changed_fields:
   - "Wave 1 completed: All Wave 1 tasks (T1.1-T1.6) done"
   - "Cargo.toml updated to tower-mcp 0.20.1 with protocol-2026-07-28 feature"
@@ -110,11 +110,18 @@ changed_fields:
   - "Discover middleware implemented (src/discover.rs)"
   - "MetaValidationLayer implemented (src/meta_validation.rs)"
   - "Backward compatibility verified"
-  - "Wave 3 T3.1 in-progress: WebSocket transport updated with protocol version subprotocol support"
+  - "Wave 3 completed: WebSocket transport updated with protocol version subprotocol support"
   - "ws_transport.rs: connect_with_protocol_version() added, Sec-WebSocket-Protocol mcp.version.* header support"
   - "ws_transport.rs: connect_with_bearer_token() updated with optional protocol_version parameter"
   - "Callers in proxy.rs, endpoint_router.rs, reload.rs updated to pass None for protocol_version"
-  - "All 302 lib tests still passing after ws_transport changes"
+  - "Wave 4 completed: All Wave 4 tasks (T4.1-T4.4) done"
+  - "T4.1: Added default_protocol_version to ProtocolSupportConfig with validation in proxy.rs"
+  - "T4.2: BackendConfig.protocol_version already existed from Wave 3"
+  - "T4.3: Added proxy/protocol_info admin tool for dual-protocol introspection"
+  - "T4.4: Updated gateway.toml (fixed [gateway]→[proxy], added protocol_support) and developer-local.toml (added protocol_support)"
+  - "312 lib tests passing (3 new config tests added)"
+  - "21 integration tests passing"
+  - "59/60 e2e tests passing (1 pre-existing WebSocket host header failure unrelated to Wave 4)"
 ```
 
 ## Agent Assignments Summary

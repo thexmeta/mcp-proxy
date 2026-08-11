@@ -511,10 +511,18 @@ async fn add_backend(proxy: &McpProxy, backend: &BackendConfig) -> anyhow::Resul
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("websocket backend requires 'url'"))?;
             let transport = if let Some(token) = &backend.bearer_token {
-                crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(url, token, None)
-                    .await?
+                crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(
+                    url,
+                    token,
+                    backend.protocol_version.as_deref(),
+                )
+                .await?
             } else {
-                crate::ws_transport::WebSocketClientTransport::connect(url).await?
+                crate::ws_transport::WebSocketClientTransport::connect_with_protocol_version(
+                    url,
+                    backend.protocol_version.as_deref(),
+                )
+                .await?
             };
 
             if has_middleware {

@@ -334,6 +334,58 @@ fn build_admin_router(
         }
     }
 
+    // Protocol info tool (dual-protocol support)
+    let state_for_proto = state.clone();
+    let protocol_info = ToolBuilder::new("protocol_info")
+        .description("Show supported MCP protocol versions and configuration")
+        .handler(move |_: NoParams| {
+            let s = state_for_proto.clone();
+            async move {
+                let config_toml = (*s.config_snapshot).clone();
+                // Parse the config to extract protocol settings
+                let result = match crate::config::ProxyConfig::parse(&config_toml) {
+                    Ok(config) => {
+                        let versions = if config.proxy.protocol_support.versions.is_empty() {
+                            vec!["2026-07-28".to_string(), "2025-11-25".to_string()]
+                        } else {
+                            config.proxy.protocol_support.versions.clone()
+                        };
+                        let default = config
+                            .proxy
+                            .protocol_support
+                            .default_protocol_version
+                            .unwrap_or_else(|| versions.first().cloned().unwrap_or_default());
+                        let backend_versions: Vec<serde_json::Value> = config
+                            .backends
+                            .iter()
+                            .map(|b| {
+                                serde_json::json!({
+                                    "name": b.name,
+                                    "transport": format!("{:?}", b.transport).to_lowercase(),
+                                    "protocol_version": b.protocol_version,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "supported_versions": versions,
+                            "default_version": default,
+                            "backend_protocol_versions": backend_versions,
+                        })
+                    }
+                    Err(e) => {
+                        serde_json::json!({
+                            "error": format!("Failed to parse config: {e}"),
+                        })
+                    }
+                };
+                Ok(CallToolResult::text(
+                    serde_json::to_string_pretty(&result).unwrap(),
+                ))
+            }
+        })
+        .build();
+    router = router.tool(protocol_info);
+
     // agentskills.io prompts
     for skill in skills {
         router = router.prompt(skill);

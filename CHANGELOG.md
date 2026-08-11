@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Features
+
+- MCP 2026-07-28 protocol support (stateless, per-request `_meta`, `server/discover`, `subscriptions/listen`)
+- Per-client-identity rate limiting based on `_meta.clientInfo.name`
+- `proxy/protocol_info` admin tool for dual-protocol introspection
+- Model-Redirected Tool Results (MRTR) handler for sampling/elicitation stubs
+- Per-backend `protocol_version` config option for HTTP/WebSocket backends
+- `default_protocol_version` config option in `[proxy.protocol_support]`
+- Discover middleware for `server/discover` RPC (SEP-2575)
+- MetaValidation middleware for per-request `_meta` validation (SEP-2243)
+
+### Dependencies
+
+- Upgrade tower-mcp 0.12.0 → 0.20.1 with `protocol-2026-07-28` feature
+
+### Miscellaneous Tasks
+
+- Remove local `patches/tower-mcp/` directory (upstream fix incorporated)
+- Update MSRV to Rust 1.97
+- Update CI for Rust 1.97 MSRV
+
+### Testing
+
+- E2E tests for 2026-07-28 stateless requests, discover, mixed-protocol scenarios
+- Config tests for `ProtocolSupportConfig` and per-backend `protocol_version`
+- Unit tests for `ClientIdentityRateLimitService` and `MetaValidationService`
+
 ## [0.4.0] - 2026-06-10
 
 ### Bug Fixes

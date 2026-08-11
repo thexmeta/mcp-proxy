@@ -167,6 +167,7 @@ pub mod bearer_scope;
 pub mod builder;
 pub mod cache;
 pub mod canary;
+pub mod client_rate_limit;
 pub mod coalesce;
 pub mod composite;
 pub mod config;
@@ -184,6 +185,7 @@ pub mod meta_validation;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mirror;
+pub mod mrtr;
 pub mod outlier;
 pub mod param_override;
 #[cfg(feature = "oauth")]

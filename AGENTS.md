@@ -11,6 +11,13 @@ Package name: `mcp-proxy`. Binary name: `mcp-proxy`. Library name: `mcp_proxy`.
 - **2025-11-25** (session-based with `initialize` handshake, `Mcp-Session-Id`, SSE)
 - **2025-03-26** (legacy)
 
+Protocol version is configurable via `[proxy.protocol_support]` in TOML config:
+```toml
+[proxy.protocol_support]
+versions = ["2026-07-28", "2025-11-25"]
+default_protocol_version = "2026-07-28"
+```
+
 ## Project structure
 
 ```
@@ -36,6 +43,10 @@ src/
   metrics.rs       # Prometheus counters and histograms (MetricsService)
   rbac.rs          # Role-based access control (RbacService)
   token.rs         # Auth token passthrough to backends (TokenPassthroughService)
+  client_rate_limit.rs # Per-client-identity rate limiting (ClientIdentityRateLimitService)
+  discover.rs      # server/discover RPC handler (DiscoverService, SEP-2575)
+  meta_validation.rs # Per-request _meta validation (MetaValidationService, SEP-2243)
+  mrtr.rs          # Model-Redirected Tool Results (ProxyClientHandler for sampling/elicitation)
 
   # Per-backend middleware (applied per-backend in proxy.rs and reload.rs)
   retry.rs         # Retry with exponential backoff (McpRetryPolicy)
@@ -60,8 +71,8 @@ The middleware stack is built in `proxy.rs::build_middleware_stack()`. Order mat
 ```
 Request flow (outer to inner):
 Auth (axum layer) -> Audit -> Access Log -> Metrics -> Token Passthrough -> RBAC
-  -> Alias -> Filter -> Validation -> Coalesce -> Cache
-  -> Mirror -> Inject Args -> McpProxy
+  -> Client Rate Limit -> Alias -> Filter -> Validation -> Coalesce -> Cache
+  -> Mirror -> Inject Args -> Discover -> MetaValidation -> McpProxy
 ```
 
 **Per-backend middleware** (applied to each backend individually):

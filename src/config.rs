@@ -395,6 +395,9 @@ pub struct ProxySettings {
     pub import_backends: Option<String>,
     /// Global rate limit applied to all requests before per-backend dispatch.
     pub rate_limit: Option<GlobalRateLimitConfig>,
+    /// Per-client-identity rate limit. For 2026-07-28, identifies clients by
+    /// `_meta.clientInfo.name`. For older protocols, all requests share one bucket.
+    pub client_rate_limit: Option<ClientRateLimitConfig>,
     /// Enable BM25-based tool discovery and search (default: false).
     /// Adds `proxy/search_tools`, `proxy/similar_tools`, and
     /// `proxy/tool_categories` tools for finding tools across backends.
@@ -467,14 +470,15 @@ pub enum ToolExposure {
 /// Protocol version support configuration.
 ///
 /// Controls which MCP protocol versions the HTTP server accepts.
-/// By default, only the latest compiled version (2026-07-28) is enabled.
-/// Specify versions to enable multiple versions simultaneously (e.g., for backward compatibility).
+/// By default, both 2026-07-28 and 2025-11-25 are enabled for backward
+/// compatibility. Specify versions to restrict to specific versions.
 ///
 /// # Examples
 ///
 /// ```toml
 /// [proxy.protocol_support]
 /// versions = ["2026-07-28", "2025-11-25"]
+/// default_protocol_version = "2026-07-28"
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProtocolSupportConfig {
@@ -482,6 +486,11 @@ pub struct ProtocolSupportConfig {
     /// Valid values: "2026-07-28", "2025-11-25"
     #[serde(default)]
     pub versions: Vec<String>,
+    /// Default protocol version for new connections when the client does not
+    /// specify one. Must be one of the enabled versions. If not set, the
+    /// highest enabled version is used.
+    #[serde(default)]
+    pub default_protocol_version: Option<String>,
 }
 
 /// Configuration for a config file watcher.
@@ -535,6 +544,26 @@ pub struct GlobalRateLimitConfig {
     /// Period length in seconds (default: 1).
     #[serde(default = "default_rate_period")]
     pub period_seconds: u64,
+}
+
+/// Per-client-identity rate limit configuration.
+///
+/// For 2026-07-28 protocol, clients are identified by `_meta.clientInfo.name`.
+/// For older protocols, clients get a shared anonymous identity.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ClientRateLimitConfig {
+    /// Maximum requests per client per window.
+    pub max_requests: usize,
+    /// Window duration in seconds (default: 60).
+    #[serde(default = "default_rate_period")]
+    pub window_seconds: u64,
+    /// How often to clean up idle client entries in seconds (default: 300).
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_seconds: u64,
+}
+
+fn default_cleanup_interval() -> u64 {
+    300
 }
 
 /// HTTP server listen address.
@@ -670,6 +699,12 @@ pub struct BackendConfig {
     /// Alternative to declaring tools in ToolGroupConfig.tools.
     #[serde(default)]
     pub tool_groups: Vec<String>,
+    /// Protocol version to use when connecting to this backend (for WebSocket/HTTP).
+    /// If not set, the proxy will attempt to negotiate the highest supported version.
+    /// For WebSocket, this sets the `Sec-WebSocket-Protocol: mcp.version.{version}` header.
+    /// For HTTP, this sets the `MCP-Protocol-Version` header.
+    /// Valid values: "2026-07-28", "2025-11-25"
+    pub protocol_version: Option<String>,
 }
 
 /// Backend transport protocol.
@@ -1585,6 +1620,7 @@ impl ProxyConfig {
                 hot_reload: false,
                 import_backends: None,
                 rate_limit: None,
+                client_rate_limit: None,
                 tool_discovery: false,
                 tool_exposure: ToolExposure::default(),
                 expose_grouped_in_default: true,
@@ -2190,6 +2226,80 @@ mod tests {
         assert!(config.auth.is_none());
         assert!(!config.observability.audit);
         assert!(!config.observability.metrics.enabled);
+    }
+
+    #[test]
+    fn test_protocol_support_config_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [proxy.protocol_support]
+        versions = ["2026-07-28", "2025-11-25"]
+        default_protocol_version = "2026-07-28"
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(
+            config.proxy.protocol_support.versions,
+            vec!["2026-07-28", "2025-11-25"]
+        );
+        assert_eq!(
+            config
+                .proxy
+                .protocol_support
+                .default_protocol_version
+                .as_deref(),
+            Some("2026-07-28")
+        );
+    }
+
+    #[test]
+    fn test_protocol_support_config_empty_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.proxy.protocol_support.versions.is_empty());
+        assert!(
+            config
+                .proxy
+                .protocol_support
+                .default_protocol_version
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_backend_protocol_version() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://localhost:8080"
+        protocol_version = "2026-07-28"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(
+            config.backends[0].protocol_version.as_deref(),
+            Some("2026-07-28")
+        );
     }
 
     #[test]
