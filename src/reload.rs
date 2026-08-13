@@ -187,19 +187,7 @@ async fn watch_loop(
         let watcher = build_watcher(watcher_config);
         let is_signal = matches!(watcher_config, WatcherConfig::Signal);
 
-        if is_signal {
-            // Signal watchers: always register
-            tracing::info!(watcher = watcher.name(), "Trying config file watcher");
-            match watcher.watch(&config_path).await {
-                Ok(rx) => {
-                    receivers.push(rx);
-                    tracing::info!(watcher = watcher.name(), "Config file watcher started");
-                }
-                Err(e) => {
-                    tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed");
-                }
-            }
-        } else if !file_watcher_started {
+        if !file_watcher_started && !is_signal {
             // File watchers: use first one that succeeds (fallback chain)
             tracing::info!(watcher = watcher.name(), "Trying config file watcher");
             match watcher.watch(&config_path).await {
@@ -210,6 +198,18 @@ async fn watch_loop(
                 }
                 Err(e) => {
                     tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed, trying next");
+                }
+            }
+        } else if is_signal && !file_watcher_started {
+            // Signal watcher: only register if no file watcher succeeded
+            tracing::info!(watcher = watcher.name(), "Trying config file watcher");
+            match watcher.watch(&config_path).await {
+                Ok(rx) => {
+                    receivers.push(rx);
+                    tracing::info!(watcher = watcher.name(), "Config file watcher started");
+                }
+                Err(e) => {
+                    tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed");
                 }
             }
         }
