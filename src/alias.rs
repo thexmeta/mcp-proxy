@@ -147,8 +147,31 @@ impl RenameRule {
 
     /// Check if this rule matches the given namespaced tool name.
     /// Returns the replacement if matched, None otherwise.
+    ///
+    /// Strategy: try matching against the full namespaced name first
+    /// (for rename_all patterns like `roslyn_*` that match `roslyn_list_types`),
+    /// then fall back to matching against the local name (after namespace
+    /// stripping) for patterns like `search_*` that match tool-specific names.
     pub fn apply_forward(&self, namespaced_name: &str) -> Option<String> {
-        // Strip the namespace prefix
+        // Try matching against the full namespaced name first.
+        // This handles rename_all patterns like `roslyn_*` → `""` which need
+        // to match `roslyn_list_types` (the full namespaced name).
+        if self.pattern.matches(namespaced_name) {
+            let result = self.apply_replacement(namespaced_name);
+            // When the replacement is empty (prefix stripping), the result still
+            // contains the namespace prefix. Strip it to get the final local name.
+            // E.g., pattern `roslyn_*` → `""` on `roslyn_roslyn_list_types`
+            // produces `roslyn_list_types`; strip `roslyn_` → `list_types`.
+            if self.replacement.is_empty() {
+                return result.strip_prefix(&self.namespace).map(|s| s.to_string());
+            }
+            // For non-empty replacements, the result is the renamed full name.
+            return Some(result);
+        }
+
+        // Fall back to matching against the local name (namespace stripped).
+        // This handles patterns like `search_*` that match tool names
+        // without the namespace prefix.
         let local_name = namespaced_name.strip_prefix(&self.namespace)?;
         if self.pattern.matches(local_name) {
             Some(format!(
@@ -761,6 +784,116 @@ mod tests {
                 assert!(names.contains(&"api/fetch_product"));
                 // Non-matching should be unchanged
                 assert!(names.contains(&"db/create_user"));
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    /// Test rename_all where backend tools DON'T include their own prefix.
+    /// E.g., Roslyn tools are `list_types` (not `roslyn_list_types`).
+    /// After namespace prefix, full name is `roslyn_list_types`.
+    /// Pattern `roslyn_*` should match the full namespaced name.
+    #[tokio::test]
+    async fn test_rename_all_backend_without_prefix() {
+        let mock = MockService::with_tools(&[
+            "roslyn/list_types",
+            "roslyn/get_call_graph",
+            "roslyn/check_syntax",
+            "lsp/rename_symbol",
+            "lsp/find_references",
+            "db/query",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("roslyn/".into(), "roslyn_*".into(), "".into()),
+                ("lsp/".into(), "lsp_*".into(), "".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // Should strip `roslyn_` and `lsp_` prefix
+                assert!(
+                    names.contains(&"roslyn/list_types"),
+                    "Expected roslyn/list_types, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"roslyn/get_call_graph"),
+                    "Expected roslyn/get_call_graph, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"roslyn/check_syntax"),
+                    "Expected roslyn/check_syntax, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"lsp/rename_symbol"),
+                    "Expected lsp/rename_symbol, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"lsp/find_references"),
+                    "Expected lsp/find_references, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db/query"),
+                    "Expected db/query unchanged, got: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    /// Test rename_all where backend tools DO include their own prefix.
+    /// E.g., Tavily tools are `tavily_search` (already prefixed).
+    /// After namespace prefix, full name is `tavily_tavily_search`.
+    /// Pattern `tavily_*` should match and strip to `tavily_search`.
+    #[tokio::test]
+    async fn test_rename_all_backend_with_prefix() {
+        let mock = MockService::with_tools(&[
+            "tavily/tavily_search",
+            "tavily/tavily_extract",
+            "db/query",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(
+                    names.contains(&"tavily/search"),
+                    "Expected tavily/search, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"tavily/extract"),
+                    "Expected tavily/extract, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db/query"),
+                    "Expected db/query unchanged, got: {:?}",
+                    names
+                );
             }
             other => panic!("expected ListTools, got: {:?}", other),
         }
