@@ -176,21 +176,41 @@ async fn watch_loop(
         String,
     )>,
 ) {
-    // Register ALL watchers that succeed (not just the first).
-    // This ensures signal watchers (SIGHUP) are registered even when
-    // mtime watchers also succeed, preventing SIGHUP from killing the process.
+    // Separate signal watchers from file watchers.
+    // File watchers (inotify, mtime) are tried as fallbacks — use the first that succeeds.
+    // Signal watchers (SIGHUP) are always registered alongside the chosen file watcher
+    // to prevent SIGHUP from killing the process.
     let mut receivers: Vec<mpsc::Receiver<()>> = Vec::new();
+    let mut file_watcher_started = false;
 
     for watcher_config in &watchers {
         let watcher = build_watcher(watcher_config);
-        tracing::info!(watcher = watcher.name(), "Trying config file watcher");
-        match watcher.watch(&config_path).await {
-            Ok(rx) => {
-                receivers.push(rx);
-                tracing::info!(watcher = watcher.name(), "Config file watcher started");
+        let is_signal = matches!(watcher_config, WatcherConfig::Signal);
+
+        if is_signal {
+            // Signal watchers: always register
+            tracing::info!(watcher = watcher.name(), "Trying config file watcher");
+            match watcher.watch(&config_path).await {
+                Ok(rx) => {
+                    receivers.push(rx);
+                    tracing::info!(watcher = watcher.name(), "Config file watcher started");
+                }
+                Err(e) => {
+                    tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed");
+                }
             }
-            Err(e) => {
-                tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed, trying next");
+        } else if !file_watcher_started {
+            // File watchers: use first one that succeeds (fallback chain)
+            tracing::info!(watcher = watcher.name(), "Trying config file watcher");
+            match watcher.watch(&config_path).await {
+                Ok(rx) => {
+                    receivers.push(rx);
+                    file_watcher_started = true;
+                    tracing::info!(watcher = watcher.name(), "Config file watcher started");
+                }
+                Err(e) => {
+                    tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed, trying next");
+                }
             }
         }
     }
@@ -232,6 +252,13 @@ async fn watch_loop(
         }
     };
 
+    // Track file mtime to skip redundant reloads when the watcher fires
+    // but the config file hasn't actually been modified (e.g. spurious
+    // inotify events from systemd ProtectSystem/BindReadOnlyPaths).
+    let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&config_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+
     // Merge all watcher receivers into a single stream for concurrent polling.
     // This ensures signal watchers (SIGHUP) are checked alongside mtime watchers
     // without one blocking the other.
@@ -250,6 +277,19 @@ async fn watch_loop(
                 tracing::info!("All config watcher channels closed, stopping hot reload");
                 break;
             }
+        }
+
+        // Mtime guard: skip reload if the file hasn't actually been modified.
+        // This filters out spurious inotify events caused by systemd sandboxing
+        // (ProtectSystem, BindReadOnlyPaths) or other filesystem-level noise.
+        if let Ok(meta) = std::fs::metadata(&config_path)
+            && let Ok(mtime) = meta.modified()
+        {
+            if last_mtime == Some(mtime) {
+                tracing::debug!("Config file watcher fired but mtime unchanged, skipping reload");
+                continue;
+            }
+            last_mtime = Some(mtime);
         }
 
         tracing::info!("Config file changed, reloading backends and endpoint groups");
@@ -272,9 +312,18 @@ async fn watch_loop(
         let old_names: HashSet<&String> = backend_fingerprints.keys().collect();
         let new_names: HashSet<&String> = new_fingerprints.keys().collect();
 
+        // Track actual changes for conditional discovery re-indexing
+        let mut removed_backends: Vec<&String> = Vec::new();
+        let mut added_backends: Vec<&String> = Vec::new();
+        let mut replaced_backends: Vec<&String> = Vec::new();
+        let mut removed_egs: Vec<&String> = Vec::new();
+        let mut added_egs: Vec<&String> = Vec::new();
+        let mut replaced_egs: Vec<&String> = Vec::new();
+
         // Remove backends that are no longer in config
         for removed in old_names.difference(&new_names) {
             tracing::info!(backend = %removed, "Removing backend via hot reload");
+            removed_backends.push(removed);
             if proxy.remove_backend(removed).await {
                 tracing::info!(backend = %removed, "Backend removed");
             } else {
@@ -295,6 +344,7 @@ async fn watch_loop(
                         "Backend config changed, replacing via hot reload"
                     );
 
+                    replaced_backends.push(&backend.name);
                     // Remove old, add new
                     proxy.remove_backend(&backend.name).await;
                     if let Err(e) = add_backend(&proxy, backend).await {
@@ -310,6 +360,7 @@ async fn watch_loop(
                 continue;
             }
 
+            added_backends.push(&backend.name);
             tracing::info!(
                 name = %backend.name,
                 transport = ?backend.transport,
@@ -341,6 +392,7 @@ async fn watch_loop(
         // Remove endpoint groups that are no longer in config
         for removed in old_eg_names.difference(&new_eg_names) {
             tracing::info!(endpoint_group = %removed, "Removing endpoint group via hot reload");
+            removed_egs.push(removed);
             endpoint_group_registry.remove(removed);
         }
 
@@ -357,6 +409,7 @@ async fn watch_loop(
                         "Endpoint group config changed, replacing via hot reload"
                     );
 
+                    replaced_egs.push(&endpoint_group.name);
                     // Rebuild the endpoint group
                     if let Err(e) = rebuild_endpoint_group(
                         &endpoint_group_registry,
@@ -377,6 +430,7 @@ async fn watch_loop(
                 continue;
             }
 
+            added_egs.push(&endpoint_group.name);
             tracing::info!(
                 name = %endpoint_group.name,
                 path = %endpoint_group.path,
@@ -396,13 +450,24 @@ async fn watch_loop(
             }
         }
 
+        // Track whether anything actually changed
+        let backends_changed = !removed_backends.is_empty()
+            || !added_backends.is_empty()
+            || !replaced_backends.is_empty();
+        let endpoint_groups_changed = !removed_egs.is_empty()
+            || !added_egs.is_empty()
+            || !replaced_egs.is_empty();
+        let anything_changed = backends_changed || endpoint_groups_changed;
+
         // Update fingerprints to reflect current state
         backend_fingerprints = new_fingerprints;
         endpoint_group_fingerprints = new_eg_fingerprints;
 
-        // Re-index discovery if enabled
+        // Re-index discovery only when backends or endpoint groups actually changed
         #[cfg(feature = "discovery")]
-        if let Some((ref index, ref separator)) = discovery_index {
+        if anything_changed
+            && let Some((ref index, ref separator)) = discovery_index
+        {
             let mut proxy_clone = proxy.clone();
             crate::discovery::reindex(index, &mut proxy_clone, separator).await;
         }
