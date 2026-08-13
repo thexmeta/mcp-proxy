@@ -181,6 +181,7 @@ pub mod inject;
 #[cfg(feature = "oauth")]
 pub mod introspection;
 pub mod mcp_json;
+pub mod mcp_method_header;
 pub mod meta_validation;
 #[cfg(feature = "metrics")]
 pub mod metrics;

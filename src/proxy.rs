@@ -431,6 +431,12 @@ impl Proxy {
 
         let (router, session_handle) = transport.into_router_with_handle();
 
+        // Auto-inject Mcp-Method header for backward compatibility with
+        // clients that don't send it (e.g., antigravity, older MCP clients)
+        let router = router.layer(axum::middleware::from_fn(
+            crate::mcp_method_header::inject_mcp_method_header,
+        ));
+
         // Inbound authentication (axum-level middleware)
         let router = apply_auth(&config, router).await?;
 

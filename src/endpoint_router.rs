@@ -823,6 +823,11 @@ pub async fn build_single_endpoint_group(
     let (router, session_handle) =
         tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
 
+    // Auto-inject Mcp-Method header for backward compatibility
+    let router = router.layer(axum::middleware::from_fn(
+        crate::mcp_method_header::inject_mcp_method_header,
+    ));
+
     // Apply auth (same as main proxy)
     let router = apply_auth(config, router).await?;
 
