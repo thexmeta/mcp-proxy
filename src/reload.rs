@@ -200,9 +200,14 @@ async fn watch_loop(
         return;
     }
 
-    // Track known backends and their config fingerprints for change detection
+    // Track known backends and their config fingerprints for change detection.
+    // IMPORTANT: resolve_env_vars() must be called before fingerprinting —
+    // the hot-reload path resolves env vars before fingerprinting, so the
+    // initial fingerprints must also resolve them to ensure a matching
+    // comparison on the first reload cycle.
     let mut backend_fingerprints: HashMap<String, String> = {
-        if let Ok(config) = ProxyConfig::load(&config_path) {
+        if let Ok(mut config) = ProxyConfig::load(&config_path) {
+            config.resolve_env_vars();
             config
                 .backends
                 .iter()
@@ -406,14 +411,128 @@ async fn watch_loop(
 
 /// Generate a fingerprint for a backend config to detect changes.
 /// Uses TOML serialization for a stable, content-based comparison.
+///
+/// To guarantee deterministic output, `env` (HashMap) and `default_args`
+/// (serde_json::Map) are converted to sorted BTreeMap/BTreeMap before
+/// serializing — HashMap/serde_json::Map have non-deterministic iteration
+/// order, which would produce different TOML strings on each call even when
+/// nothing changed.
 fn config_fingerprint(backend: &BackendConfig) -> String {
-    toml::to_string(backend).unwrap_or_default()
+    use std::collections::BTreeMap;
+
+    // Sort env keys
+    let sorted_env: BTreeMap<&str, &str> = backend
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    // Sort default_args keys recursively
+    let sorted_args: BTreeMap<&str, &serde_json::Value> = backend
+        .default_args
+        .iter()
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+
+    // Serialize to JSON with sorted maps, then back to serde_json::Value
+    // to produce a deterministic TOML output
+    let sorted_json = serde_json::json!({
+        "name": backend.name,
+        "enabled": backend.enabled,
+        "transport": backend.transport,
+        "command": backend.command,
+        "args": backend.args,
+        "url": backend.url,
+        "env": sorted_env,
+        "working_dir": backend.working_dir,
+        "timeout": backend.timeout,
+        "circuit_breaker": backend.circuit_breaker,
+        "rate_limit": backend.rate_limit,
+        "concurrency": backend.concurrency,
+        "retry": backend.retry,
+        "outlier_detection": backend.outlier_detection,
+        "hedging": backend.hedging,
+        "mirror_of": backend.mirror_of,
+        "mirror_percent": backend.mirror_percent,
+        "cache": backend.cache,
+        "bearer_token": backend.bearer_token,
+        "forward_auth": backend.forward_auth,
+        "aliases": backend.aliases,
+        "rename_all": backend.rename_all,
+        "default_args": sorted_args,
+        "inject_args": backend.inject_args,
+        "param_overrides": backend.param_overrides,
+        "expose_tools": backend.expose_tools,
+        "hide_tools": backend.hide_tools,
+        "expose_resources": backend.expose_resources,
+        "hide_resources": backend.hide_resources,
+        "expose_prompts": backend.expose_prompts,
+        "hide_prompts": backend.hide_prompts,
+        "hide_destructive": backend.hide_destructive,
+        "read_only_only": backend.read_only_only,
+        "failover_for": backend.failover_for,
+        "priority": backend.priority,
+        "canary_of": backend.canary_of,
+        "weight": backend.weight,
+        "endpoint_groups": backend.endpoint_groups,
+    });
+
+    // Convert serde_json::Value → TOML string for the fingerprint.
+    // Filter out null values so the fingerprint stays minimal.
+    json_value_to_toml_string(&sorted_json)
 }
 
 /// Generate a fingerprint for an endpoint group config to detect changes.
 /// Uses TOML serialization for a stable, content-based comparison.
 fn config_fingerprint_endpoint_group(eg: &crate::config::EndpointGroupConfig) -> String {
     toml::to_string(eg).unwrap_or_default()
+}
+
+/// Recursively normalize a `serde_json::Value` so that all maps have sorted
+/// keys. This ensures deterministic serialization for fingerprinting.
+fn normalize_json_value(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&str, &serde_json::Value> =
+                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            serde_json::Value::Object(
+                sorted
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), normalize_json_value(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(normalize_json_value).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Convert a `serde_json::Value` to a deterministic string for fingerprinting.
+/// All maps are sorted by key, and null values are stripped.
+fn json_value_to_toml_string(val: &serde_json::Value) -> String {
+    let normalized = normalize_json_value(val);
+    // Strip null values for a cleaner fingerprint
+    let stripped = strip_nulls(&normalized);
+    // JSON serialization is deterministic for BTreeMap-backed objects
+    serde_json::to_string(&stripped).unwrap_or_default()
+}
+
+/// Recursively strip null values from a JSON value.
+fn strip_nulls(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), strip_nulls(v)))
+                .collect(),
+        ),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(strip_nulls).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Build and register an endpoint group MCP proxy and router.
@@ -853,5 +972,57 @@ mod tests {
             config_fingerprint(&b2),
             "toggling enabled should produce different fingerprints"
         );
+    }
+
+    /// Regression test: fingerprint must be deterministic despite HashMap
+    /// iteration order. Two configs with the same env and default_args
+    /// must always produce identical fingerprints regardless of internal
+    /// iteration order.
+    #[test]
+    fn test_fingerprint_deterministic_with_hashmap_fields() {
+        let mut env1 = std::collections::HashMap::new();
+        env1.insert("API_KEY".to_string(), "secret1".to_string());
+        env1.insert("BASE_URL".to_string(), "http://api".to_string());
+
+        // Re-insert in different order to simulate different iteration state
+        let mut fresh_env = std::collections::HashMap::new();
+        fresh_env.insert("BASE_URL".to_string(), "http://api".to_string());
+        fresh_env.insert("API_KEY".to_string(), "secret1".to_string());
+
+        let mut default_args1 = serde_json::Map::new();
+        default_args1.insert(
+            "temperature".to_string(),
+            serde_json::json!(0.7),
+        );
+        default_args1.insert(
+            "max_tokens".to_string(),
+            serde_json::json!(4096),
+        );
+
+        let mut default_args2 = serde_json::Map::new();
+        default_args2.insert(
+            "max_tokens".to_string(),
+            serde_json::json!(4096),
+        );
+        default_args2.insert(
+            "temperature".to_string(),
+            serde_json::json!(0.7),
+        );
+
+        let mut b1 = http_backend("api", "http://api:8080");
+        b1.env = env1;
+        b1.default_args = default_args1;
+
+        let mut b2 = http_backend("api", "http://api:8080");
+        b2.env = fresh_env;
+        b2.default_args = default_args2;
+
+        let fp1 = config_fingerprint(&b1);
+        let fp2 = config_fingerprint(&b2);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic for identical configs");
+
+        // Same config called twice must also be stable
+        let fp3 = config_fingerprint(&b1);
+        assert_eq!(fp1, fp3, "fingerprint must be stable across multiple calls");
     }
 }
