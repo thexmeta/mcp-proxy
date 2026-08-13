@@ -861,11 +861,8 @@ mod tests {
     /// Pattern `tavily_*` should match and strip to `tavily_search`.
     #[tokio::test]
     async fn test_rename_all_backend_with_prefix() {
-        let mock = MockService::with_tools(&[
-            "tavily/tavily_search",
-            "tavily/tavily_extract",
-            "db/query",
-        ]);
+        let mock =
+            MockService::with_tools(&["tavily/tavily_search", "tavily/tavily_extract", "db/query"]);
 
         let aliases = AliasMap::new(
             vec![],

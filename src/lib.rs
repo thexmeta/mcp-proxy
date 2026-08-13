@@ -209,3 +209,4 @@ mod proxy;
 pub use builder::ProxyBuilder;
 pub use config::ProxyConfig;
 pub use proxy::Proxy;
+pub use proxy::build_dynamic_endpoint_group_router;

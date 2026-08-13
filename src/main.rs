@@ -228,10 +228,18 @@ fn print_config_summary(config: &ProxyConfig) -> Result<()> {
 }
 
 fn init_logging(config: &ProxyConfig) {
-    let env_filter = format!(
+    let config_filter = format!(
         "tower_mcp={level},mcp_proxy={level}",
         level = config.observability.log_level
     );
+
+    // Build EnvFilter: if RUST_LOG is set, use it exclusively (user has full control).
+    // Otherwise, use config defaults.
+    let env_filter = if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::try_from_default_env().expect("valid RUST_LOG")
+    } else {
+        tracing_subscriber::EnvFilter::new(&config_filter)
+    };
 
     #[cfg(feature = "otel")]
     if config.observability.tracing.enabled {
@@ -271,7 +279,7 @@ fn init_logging(config: &ProxyConfig) {
         };
 
         tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new(&env_filter))
+            .with(env_filter)
             .with(fmt_layer)
             .with(otel_layer)
             .init();

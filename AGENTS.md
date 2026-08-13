@@ -2,7 +2,7 @@
 
 ## Overview
 
-mcp-proxy is a config-driven MCP (Model Context Protocol) reverse proxy built in Rust. It aggregates multiple MCP backends behind a single HTTP endpoint with per-backend middleware, authentication, and observability. Built on tower-mcp 0.20+ and the tower middleware ecosystem.
+mcp-proxy is a config-driven MCP (Model Context Protocol) reverse proxy built in Rust. It aggregates multiple MCP backends behind a single HTTP endpoint with per-backend middleware, authentication, and observability. Built on tower-mcp 0.21+ and the tower middleware ecosystem.
 
 Package name: `mcp-proxy`. Binary name: `mcp-proxy`. Library name: `mcp_proxy`.
 

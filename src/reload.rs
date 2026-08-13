@@ -176,17 +176,18 @@ async fn watch_loop(
         String,
     )>,
 ) {
-    // Try each watcher in order until one works
-    let mut receiver: Option<mpsc::Receiver<()>> = None;
+    // Register ALL watchers that succeed (not just the first).
+    // This ensures signal watchers (SIGHUP) are registered even when
+    // mtime watchers also succeed, preventing SIGHUP from killing the process.
+    let mut receivers: Vec<mpsc::Receiver<()>> = Vec::new();
 
-    for watcher_config in watchers {
-        let watcher = build_watcher(&watcher_config);
+    for watcher_config in &watchers {
+        let watcher = build_watcher(watcher_config);
         tracing::info!(watcher = watcher.name(), "Trying config file watcher");
         match watcher.watch(&config_path).await {
             Ok(rx) => {
-                receiver = Some(rx);
+                receivers.push(rx);
                 tracing::info!(watcher = watcher.name(), "Config file watcher started");
-                break;
             }
             Err(e) => {
                 tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed, trying next");
@@ -194,10 +195,10 @@ async fn watch_loop(
         }
     }
 
-    let Some(mut receiver) = receiver else {
+    if receivers.is_empty() {
         tracing::error!("All config file watchers failed, hot reload disabled");
         return;
-    };
+    }
 
     // Track known backends and their config fingerprints for change detection
     let mut backend_fingerprints: HashMap<String, String> = {
@@ -226,11 +227,24 @@ async fn watch_loop(
         }
     };
 
+    // Merge all watcher receivers into a single stream for concurrent polling.
+    // This ensures signal watchers (SIGHUP) are checked alongside mtime watchers
+    // without one blocking the other.
+    use futures_util::stream::{SelectAll, StreamExt};
+    use tokio_stream::wrappers::ReceiverStream;
+    let mut stream: SelectAll<_> = receivers.into_iter().map(ReceiverStream::new).collect();
+
     loop {
-        // Wait for file change event
-        if receiver.recv().await.is_none() {
-            tracing::info!("Config watcher channel closed, stopping hot reload");
-            break;
+        // Wait for a change event from any registered watcher concurrently.
+        let notification = stream.next().await;
+
+        match notification {
+            Some(()) => { /* got a notification, proceed with reload */ }
+            None => {
+                // All watcher streams ended (all channels closed or watchers exited).
+                tracing::info!("All config watcher channels closed, stopping hot reload");
+                break;
+            }
         }
 
         tracing::info!("Config file changed, reloading backends and endpoint groups");
@@ -812,5 +826,32 @@ mod tests {
         assert!(removed.contains(&"db".to_string()));
         assert_eq!(added.len(), 1);
         assert!(added.contains(&"cache".to_string()));
+    }
+
+    #[test]
+    fn test_config_fingerprint_differs_on_enabled_toggle() {
+        let b1: BackendConfig = toml::from_str(
+            r#"
+            name = "api"
+            transport = "http"
+            url = "http://localhost:8080"
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let b2: BackendConfig = toml::from_str(
+            r#"
+            name = "api"
+            transport = "http"
+            url = "http://localhost:8080"
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert_ne!(
+            config_fingerprint(&b1),
+            config_fingerprint(&b2),
+            "toggling enabled should produce different fingerprints"
+        );
     }
 }

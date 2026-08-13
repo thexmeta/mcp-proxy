@@ -282,12 +282,18 @@ async fn build_mcp_proxy_for_backends(
 
 /// Build a dynamic router that delegates endpoint group requests to the registry.
 /// This enables hot reload support by looking up the current router at request time.
-fn build_dynamic_endpoint_group_router(
+///
+/// # Routing
+///
+/// The route pattern `/{group_name}/mcp/{*path}` captures the group name and
+/// forwards the request to the group's dedicated router. The `*path` wildcard
+/// requires the `{*path}` syntax introduced in matchit 0.8+.
+pub fn build_dynamic_endpoint_group_router(
     router: Router,
     registry: crate::endpoint_router::EndpointGroupRegistry,
 ) -> Router {
     router.route(
-        "/{group_name}/mcp/*path",
+        "/{group_name}/mcp/{*path}",
         get(move |path: axum::extract::Path<String>, req: Request| {
             let group_name = path.clone();
             let registry = registry.clone();

@@ -18,6 +18,7 @@ SyslogIdentifier=mcp-proxy
 
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/mxadm/.Xauthority
+Environment=RUST_LOG=tower_mcp::client=error
 
 # Security hardening
 NoNewPrivileges=true
