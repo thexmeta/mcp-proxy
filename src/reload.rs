@@ -200,8 +200,9 @@ async fn watch_loop(
                     tracing::warn!(watcher = watcher.name(), error = %e, "Watcher failed, trying next");
                 }
             }
-        } else if is_signal && !file_watcher_started {
-            // Signal watcher: only register if no file watcher succeeded
+        } else if is_signal {
+            // Signal watcher: always registered alongside the chosen file watcher
+            // so SIGHUP never kills the process, regardless of which file watcher won.
             tracing::info!(watcher = watcher.name(), "Trying config file watcher");
             match watcher.watch(&config_path).await {
                 Ok(rx) => {
@@ -454,9 +455,8 @@ async fn watch_loop(
         let backends_changed = !removed_backends.is_empty()
             || !added_backends.is_empty()
             || !replaced_backends.is_empty();
-        let endpoint_groups_changed = !removed_egs.is_empty()
-            || !added_egs.is_empty()
-            || !replaced_egs.is_empty();
+        let endpoint_groups_changed =
+            !removed_egs.is_empty() || !added_egs.is_empty() || !replaced_egs.is_empty();
         let anything_changed = backends_changed || endpoint_groups_changed;
 
         // Update fingerprints to reflect current state
@@ -465,9 +465,7 @@ async fn watch_loop(
 
         // Re-index discovery only when backends or endpoint groups actually changed
         #[cfg(feature = "discovery")]
-        if anything_changed
-            && let Some((ref index, ref separator)) = discovery_index
-        {
+        if anything_changed && let Some((ref index, ref separator)) = discovery_index {
             let mut proxy_clone = proxy.clone();
             crate::discovery::reindex(index, &mut proxy_clone, separator).await;
         }
@@ -1055,24 +1053,12 @@ mod tests {
         fresh_env.insert("API_KEY".to_string(), "secret1".to_string());
 
         let mut default_args1 = serde_json::Map::new();
-        default_args1.insert(
-            "temperature".to_string(),
-            serde_json::json!(0.7),
-        );
-        default_args1.insert(
-            "max_tokens".to_string(),
-            serde_json::json!(4096),
-        );
+        default_args1.insert("temperature".to_string(), serde_json::json!(0.7));
+        default_args1.insert("max_tokens".to_string(), serde_json::json!(4096));
 
         let mut default_args2 = serde_json::Map::new();
-        default_args2.insert(
-            "max_tokens".to_string(),
-            serde_json::json!(4096),
-        );
-        default_args2.insert(
-            "temperature".to_string(),
-            serde_json::json!(0.7),
-        );
+        default_args2.insert("max_tokens".to_string(), serde_json::json!(4096));
+        default_args2.insert("temperature".to_string(), serde_json::json!(0.7));
 
         let mut b1 = http_backend("api", "http://api:8080");
         b1.env = env1;
@@ -1084,7 +1070,10 @@ mod tests {
 
         let fp1 = config_fingerprint(&b1);
         let fp2 = config_fingerprint(&b2);
-        assert_eq!(fp1, fp2, "fingerprint must be deterministic for identical configs");
+        assert_eq!(
+            fp1, fp2,
+            "fingerprint must be deterministic for identical configs"
+        );
 
         // Same config called twice must also be stable
         let fp3 = config_fingerprint(&b1);

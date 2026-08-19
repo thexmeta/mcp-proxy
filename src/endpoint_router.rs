@@ -15,7 +15,7 @@ use tower_mcp::client::StdioClientTransport;
 use tower_mcp::proxy::McpProxy;
 use tower_mcp::{RouterRequest, RouterResponse};
 
-use crate::config::{EndpointGroupConfig, ProxyConfig, TransportType};
+use crate::config::{BackendConfig, EndpointGroupConfig, ProxyConfig, TransportType};
 
 /// Shared registry for endpoint groups that supports hot reload.
 /// This allows dynamic addition/removal/update of endpoint groups without restarting the proxy.
@@ -746,6 +746,38 @@ fn build_endpoint_group_middleware_stack(
     Ok(service)
 }
 
+/// Resolve the effective backend configs for an endpoint group.
+///
+/// Membership is the UNION of two sources that work together:
+/// - backends explicitly listed in the group's `backends` field
+/// - backends whose own `endpoint_groups` field references this group by name
+///
+/// A backend that references a group not declared in `config.proxy.endpoint_groups`
+/// is ignored for membership (and a warning is emitted) so it is not silently
+/// excluded from the default `/` endpoint.
+pub fn resolve_group_backends<'a>(
+    backends: &'a [BackendConfig],
+    groups: &[EndpointGroupConfig],
+    group: &EndpointGroupConfig,
+) -> Vec<&'a BackendConfig> {
+    let declared: HashSet<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+    backends
+        .iter()
+        .filter(|b| {
+            let explicit = group.backends.contains(&b.name);
+            let reverse = b.endpoint_groups.contains(&group.name);
+            if reverse && !declared.contains(group.name.as_str()) {
+                tracing::warn!(
+                    backend = %b.name,
+                    endpoint_group = %group.name,
+                    "Backend references endpoint group that is not declared in proxy.endpoint_groups"
+                );
+            }
+            explicit || reverse
+        })
+        .collect()
+}
+
 /// Build endpoint group routers from the configuration.
 /// Returns a vector of EndpointGroupRouter and the set of backend names used in groups.
 pub async fn build_endpoint_group_routers(
@@ -758,7 +790,11 @@ pub async fn build_endpoint_group_routers(
     for group in &config.proxy.endpoint_groups {
         let router = build_single_endpoint_group(config, group).await?;
         endpoint_group_routers.push(router.clone());
-        grouped_backend_names.extend(group.backends.iter().cloned());
+        grouped_backend_names.extend(
+            resolve_group_backends(&config.backends, &config.proxy.endpoint_groups, group)
+                .iter()
+                .map(|b| b.name.clone()),
+        );
 
         // Populate registry if provided
         if let Some(reg) = registry {
@@ -787,12 +823,9 @@ pub async fn build_single_endpoint_group(
         );
     }
 
-    // Collect backend configs for this group
-    let group_backends: Vec<_> = config
-        .backends
-        .iter()
-        .filter(|b| group.backends.contains(&b.name))
-        .collect();
+    // Collect backend configs for this group (UNION of explicit + reverse references)
+    let group_backends =
+        resolve_group_backends(&config.backends, &config.proxy.endpoint_groups, group);
 
     if group_backends.is_empty() {
         anyhow::bail!("Endpoint group '{}' has no valid backends", group.name);
@@ -1047,4 +1080,110 @@ async fn apply_auth(config: &ProxyConfig, router: Router) -> Result<Router> {
     };
 
     Ok(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(name: &str, endpoint_groups: Vec<&str>) -> BackendConfig {
+        BackendConfig {
+            name: name.to_string(),
+            transport: TransportType::Http,
+            endpoint_groups: endpoint_groups.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn group(name: &str, path: &str, backends: Vec<&str>) -> EndpointGroupConfig {
+        EndpointGroupConfig {
+            name: name.to_string(),
+            path: path.to_string(),
+            backends: backends.into_iter().map(String::from).collect(),
+            tools: vec![],
+            description: None,
+            tool_discovery: false,
+        }
+    }
+
+    fn names<'a>(result: &[&'a BackendConfig]) -> Vec<&'a str> {
+        result.iter().map(|b| b.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_explicit_only() {
+        let backends = vec![backend("a", vec![]), backend("b", vec![])];
+        let groups = vec![group("g1", "/g1", vec!["a"])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        assert_eq!(names(&result), vec!["a"]);
+    }
+
+    #[test]
+    fn test_reverse_only() {
+        let backends = vec![backend("a", vec![]), backend("b", vec!["g1"])];
+        let groups = vec![group("g1", "/g1", vec![])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        assert_eq!(names(&result), vec!["b"]);
+    }
+
+    #[test]
+    fn test_union_both_sources() {
+        let backends = vec![backend("a", vec![]), backend("b", vec!["g1"])];
+        let groups = vec![group("g1", "/g1", vec!["a"])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        let mut result_names = names(&result);
+        result_names.sort();
+        assert_eq!(result_names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_dedup_when_both_match() {
+        let backends = vec![backend("a", vec!["g1"])];
+        let groups = vec![group("g1", "/g1", vec!["a"])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        assert_eq!(result.len(), 1, "backend should appear exactly once");
+        assert_eq!(names(&result), vec!["a"]);
+    }
+
+    #[test]
+    fn test_unrelated_backend_excluded() {
+        let backends = vec![backend("a", vec!["g2"]), backend("b", vec![])];
+        let groups = vec![group("g1", "/g1", vec![]), group("g2", "/g2", vec![])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        assert!(result.is_empty(), "backend refs g2, not g1");
+    }
+
+    #[test]
+    fn test_multiple_groups_independent() {
+        let backends = vec![
+            backend("a", vec!["g1"]),
+            backend("b", vec!["g2"]),
+            backend("c", vec!["g1"]),
+        ];
+        let groups = vec![group("g1", "/g1", vec![]), group("g2", "/g2", vec![])];
+        let result_g1 = resolve_group_backends(&backends, &groups, &groups[0]);
+        let result_g2 = resolve_group_backends(&backends, &groups, &groups[1]);
+        let mut g1_names = names(&result_g1);
+        g1_names.sort();
+        assert_eq!(g1_names, vec!["a", "c"]);
+        assert_eq!(names(&result_g2), vec!["b"]);
+    }
+
+    #[test]
+    fn test_backend_in_multiple_groups() {
+        let backends = vec![backend("a", vec!["g1", "g2"])];
+        let groups = vec![group("g1", "/g1", vec![]), group("g2", "/g2", vec![])];
+        let result_g1 = resolve_group_backends(&backends, &groups, &groups[0]);
+        let result_g2 = resolve_group_backends(&backends, &groups, &groups[1]);
+        assert_eq!(names(&result_g1), vec!["a"]);
+        assert_eq!(names(&result_g2), vec!["a"]);
+    }
+
+    #[test]
+    fn test_empty_group_empty_backends() {
+        let backends = vec![backend("a", vec![]), backend("b", vec![])];
+        let groups = vec![group("g1", "/g1", vec![])];
+        let result = resolve_group_backends(&backends, &groups, &groups[0]);
+        assert!(result.is_empty());
+    }
 }

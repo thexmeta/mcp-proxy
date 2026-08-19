@@ -319,6 +319,9 @@ pub struct EndpointGroupConfig {
     /// The MCP endpoint will be available at `{path}/mcp`.
     pub path: String,
     /// Backend names that belong to this group.
+    /// May be empty if membership is declared via each backend's own
+    /// `endpoint_groups` field (reverse reference).
+    #[serde(default)]
     pub backends: Vec<String>,
     /// Optional: specific tools to expose from these backends.
     /// Format: `"backend/tool"` or `"backend/*"` for all tools.
@@ -578,7 +581,7 @@ pub struct ListenConfig {
 }
 
 /// Configuration for a single backend MCP server.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct BackendConfig {
     /// Unique backend name, used as the namespace prefix for its tools/resources.
     pub name: String,
@@ -708,10 +711,11 @@ pub struct BackendConfig {
 }
 
 /// Backend transport protocol.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     /// Subprocess communicating via stdin/stdout.
+    #[default]
     Stdio,
     /// HTTP+SSE remote server.
     Http,
@@ -720,14 +724,14 @@ pub enum TransportType {
 }
 
 /// Per-backend request timeout.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TimeoutConfig {
     /// Timeout duration in seconds.
     pub seconds: u64,
 }
 
 /// Per-backend circuit breaker configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitBreakerConfig {
     /// Failure rate threshold (0.0-1.0) to trip open (default: 0.5)
     #[serde(default = "default_failure_rate")]
@@ -744,7 +748,7 @@ pub struct CircuitBreakerConfig {
 }
 
 /// Per-backend rate limiting configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     /// Maximum requests per period
     pub requests: usize,
@@ -754,7 +758,7 @@ pub struct RateLimitConfig {
 }
 
 /// Per-backend concurrency limit configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConcurrencyConfig {
     /// Maximum concurrent requests.
     pub max_concurrent: usize,
@@ -1026,7 +1030,7 @@ pub struct RoleMappingConfig {
 }
 
 /// Tool alias: exposes a backend tool under a different name.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AliasConfig {
     /// Original tool name (backend-local, without namespace prefix)
     pub from: String,
@@ -1062,7 +1066,7 @@ pub struct AliasConfig {
 /// from = "re:^tavily_(.+)$"
 /// to = "search_$1"
 /// ```
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RenameAllConfig {
     /// Pattern to match backend-local tool names.
     /// Supports glob patterns (`*`, `?`) and regex patterns (prefix with `re:`).
@@ -1074,7 +1078,7 @@ pub struct RenameAllConfig {
 }
 
 /// Per-backend response cache configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BackendCacheConfig {
     /// TTL for cached resource reads in seconds (0 = disabled)
     #[serde(default)]

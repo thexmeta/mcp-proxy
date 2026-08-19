@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{Path, Request};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::any;
 use tokio::process::Command;
 use tower::Layer;
 use tower::Service;
@@ -285,27 +285,28 @@ async fn build_mcp_proxy_for_backends(
 ///
 /// # Routing
 ///
-/// The route pattern `/{group_name}/mcp/{*path}` captures the group name and
-/// forwards the request to the group's dedicated router. The `*path` wildcard
-/// requires the `{*path}` syntax introduced in matchit 0.8+.
+/// Two routes are registered for each pattern:
+/// - `/{group_name}/mcp` — bare MCP endpoint (no trailing path)
+/// - `/{group_name}/mcp/{*path}` — sub-path under the MCP endpoint
+///
+/// Both routes strip the `/{group_name}/mcp` prefix and forward to the group's
+/// router, which serves at `/`. The `*path` wildcard requires the `{*path}`
+/// syntax introduced in matchit 0.8+ and needs at least one path segment.
 pub fn build_dynamic_endpoint_group_router(
     router: Router,
     registry: crate::endpoint_router::EndpointGroupRegistry,
 ) -> Router {
-    router.route(
-        "/{group_name}/mcp/{*path}",
-        get(move |path: axum::extract::Path<String>, req: Request| {
-            let group_name = path.clone();
-            let registry = registry.clone();
+    // Route 1: /{group_name}/mcp (bare endpoint, no trailing path)
+    let reg1 = registry.clone();
+    let router = router.route(
+        "/{group_name}/mcp",
+        any(move |Path(group_name): Path<String>, req: Request| {
+            let registry = reg1.clone();
             async move {
                 if let Some(group_router) = registry.get(&group_name) {
-                    // Strip the /{group_name}/mcp prefix and forward to the group's router
-                    let uri = req.uri().clone();
-                    let path_str = uri.path().to_string();
-                    let prefix = format!("/{}/mcp", group_name);
-                    let sub_path = path_str.strip_prefix(&prefix).unwrap_or("/");
+                    // Strip the /{group_name}/mcp prefix → group router serves at /
                     let mut new_req = req;
-                    *new_req.uri_mut() = format!("/mcp{}", sub_path).parse().unwrap();
+                    *new_req.uri_mut() = "/".parse().unwrap();
                     group_router
                         .router
                         .clone()
@@ -319,6 +320,33 @@ pub fn build_dynamic_endpoint_group_router(
                 }
             }
         }),
+    );
+
+    // Route 2: /{group_name}/mcp/{*path} (sub-path under MCP endpoint)
+    router.route(
+        "/{group_name}/mcp/{*path}",
+        any(
+            move |Path((group_name, sub_path)): Path<(String, String)>, req: Request| {
+                let registry = registry.clone();
+                async move {
+                    if let Some(group_router) = registry.get(&group_name) {
+                        // Strip the /{group_name}/mcp prefix → group router serves at /
+                        let mut new_req = req;
+                        *new_req.uri_mut() = format!("/{sub_path}").parse().unwrap();
+                        group_router
+                            .router
+                            .clone()
+                            .call(new_req)
+                            .await
+                            .unwrap_or_else(|_| {
+                                (StatusCode::INTERNAL_SERVER_ERROR, "Router error").into_response()
+                            })
+                    } else {
+                        (StatusCode::NOT_FOUND, "Endpoint group not found").into_response()
+                    }
+                }
+            },
+        ),
     )
 }
 
@@ -329,29 +357,65 @@ impl Proxy {
     /// the axum router. Call [`serve()`](Self::serve) to run standalone or
     /// [`into_router()`](Self::into_router) to embed in an existing app.
     pub async fn from_config(config: ProxyConfig) -> Result<Self> {
+        println!("DEBUG: Proxy::from_config START");
+        tracing::info!("Proxy::from_config START");
         // Create endpoint group registry for hot reload support
         let endpoint_group_registry = crate::endpoint_router::EndpointGroupRegistry::new();
 
-        // Collect all backend names that are assigned to endpoint groups
+        // Collect all backend names that are assigned to endpoint groups.
+        // Membership is the UNION of each group's explicit `backends` and any
+        // backend whose own `endpoint_groups` references the group by name.
         let grouped_backend_names: std::collections::HashSet<String> = config
             .proxy
             .endpoint_groups
             .iter()
-            .flat_map(|g| g.backends.iter().cloned())
+            .flat_map(|g| {
+                let explicit = g.backends.iter().cloned();
+                let reverse = config
+                    .backends
+                    .iter()
+                    .filter(|b| b.endpoint_groups.contains(&g.name))
+                    .map(|b| b.name.clone());
+                explicit.chain(reverse)
+            })
             .collect();
 
         // Build the default proxy with backends NOT in endpoint groups
         // (or all backends if expose_grouped_in_default is true)
-        let default_backend_refs: Vec<&crate::config::BackendConfig> =
-            if config.proxy.expose_grouped_in_default {
+        tracing::info!(
+            expose_grouped_in_default = config.proxy.expose_grouped_in_default,
+            grouped_backend_count = grouped_backend_names.len(),
+            total_backend_count = config.backends.len(),
+            "Building default proxy"
+        );
+        let default_backend_refs: Vec<&crate::config::BackendConfig> = if config
+            .proxy
+            .expose_grouped_in_default
+        {
+            config.backends.iter().collect()
+        } else {
+            let filtered: Vec<_> = config
+                .backends
+                .iter()
+                .filter(|b| !grouped_backend_names.contains(&b.name))
+                .collect();
+            // Fallback: if no default backends would be available (all backends are in
+            // endpoint groups), include grouped backends to avoid "No backends configured"
+            // error. The endpoint groups will still be accessible at their dedicated paths.
+            if filtered.is_empty() && !config.backends.is_empty() {
+                tracing::warn!(
+                    "No default backends available (all backends are in endpoint groups), \
+                         falling back to expose_grouped_in_default=true for the default /mcp endpoint"
+                );
                 config.backends.iter().collect()
             } else {
-                config
-                    .backends
-                    .iter()
-                    .filter(|b| !grouped_backend_names.contains(&b.name))
-                    .collect()
-            };
+                filtered
+            }
+        };
+        tracing::info!(
+            default_backend_count = default_backend_refs.len(),
+            "Default proxy backends"
+        );
 
         // Build default proxy with filtered backends
         let (mcp_proxy, cb_handles) = build_mcp_proxy_for_backends(

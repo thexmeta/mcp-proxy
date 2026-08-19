@@ -1,0 +1,27 @@
+[proxy]
+name = "test-proxy"
+version = "1.0.0"
+separator = "."
+listen = { host = "127.0.0.1", port = 3300 }
+expose_grouped_in_default = false
+
+[[backends]]
+name = "context7"
+transport = "http"
+url = "http://localhost:3001/mcp"
+enabled = true
+endpoint_groups = ["search"]
+
+[[backends]]
+name = "deepwiki"
+transport = "http"
+url = "http://localhost:3002/mcp"
+enabled = true
+endpoint_groups = ["search"]
+
+[[endpoint_groups]]
+name = "search"
+path = "/search"
+backends = []
+description = "Unified search across knowledge sources"
+tool_discovery = true

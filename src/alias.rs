@@ -148,30 +148,15 @@ impl RenameRule {
     /// Check if this rule matches the given namespaced tool name.
     /// Returns the replacement if matched, None otherwise.
     ///
-    /// Strategy: try matching against the full namespaced name first
-    /// (for rename_all patterns like `roslyn_*` that match `roslyn_list_types`),
-    /// then fall back to matching against the local name (after namespace
-    /// stripping) for patterns like `search_*` that match tool-specific names.
+    /// Matching is performed against the original (namespace-stripped) tool
+    /// name only, never against the backend namespace prefix. This preserves
+    /// the backend name and transforms only the server's own tool name. The
+    /// transformed local name is then re-namespaced so the backend prefix
+    /// stays intact.
     pub fn apply_forward(&self, namespaced_name: &str) -> Option<String> {
-        // Try matching against the full namespaced name first.
-        // This handles rename_all patterns like `roslyn_*` → `""` which need
-        // to match `roslyn_list_types` (the full namespaced name).
-        if self.pattern.matches(namespaced_name) {
-            let result = self.apply_replacement(namespaced_name);
-            // When the replacement is empty (prefix stripping), the result still
-            // contains the namespace prefix. Strip it to get the final local name.
-            // E.g., pattern `roslyn_*` → `""` on `roslyn_roslyn_list_types`
-            // produces `roslyn_list_types`; strip `roslyn_` → `list_types`.
-            if self.replacement.is_empty() {
-                return result.strip_prefix(&self.namespace).map(|s| s.to_string());
-            }
-            // For non-empty replacements, the result is the renamed full name.
-            return Some(result);
-        }
-
-        // Fall back to matching against the local name (namespace stripped).
-        // This handles patterns like `search_*` that match tool names
-        // without the namespace prefix.
+        // Match against the original (namespace-stripped) tool name, NOT the
+        // backend namespace prefix. This preserves the backend name and only
+        // transforms the server's own tool name.
         let local_name = namespaced_name.strip_prefix(&self.namespace)?;
         if self.pattern.matches(local_name) {
             Some(format!(
@@ -188,22 +173,34 @@ impl RenameRule {
     fn apply_replacement(&self, local_name: &str) -> String {
         match &self.pattern {
             CompiledPattern::Glob(pat) => {
-                // For glob patterns, handle special cases:
-                // 1. If pattern ends with "*" and replacement is empty -> strip prefix
-                // 2. If pattern ends with "*" and replacement contains "$0" -> $0 is the ENTIRE matched string
-                //
-                // 3. Otherwise, replace $0 with entire matched string
-                if pat.ends_with('*') {
-                    let prefix = &pat[..pat.len() - 1]; // Remove trailing *
-                    if local_name.starts_with(prefix) && self.replacement.is_empty() {
-                        // Prefix stripping: from="prefix_*", to="" -> return suffix after prefix
+                // Anchored glob handling. A glob with a trailing "*" (e.g.
+                // "prefix_*") matches only at the start of the name, and a glob
+                // with a leading "*" (e.g. "*_suffix") matches only at the end.
+                // A bare "*" matches the entire name. Other shapes (middle "*",
+                // or no "*") fall back to $0 substitution of the whole match.
+                if pat.ends_with('*') && !pat.starts_with('*') {
+                    let literal = &pat[..pat.len() - 1]; // strip trailing *
+                    if local_name.starts_with(literal) && self.replacement.is_empty() {
+                        // Prefix stripping: from="prefix_*", to="" -> drop the leading literal
                         return local_name
-                            .strip_prefix(prefix)
+                            .strip_prefix(literal)
                             .map(|s| s.to_string())
                             .unwrap_or_default();
                     }
-                    // For replacement with $0, $0 = entire matched string (local_name)
-                    // Fall through to default handling below
+                    // $0 is the entire matched name
+                    return self.replacement.replace("$0", local_name);
+                }
+                if pat.starts_with('*') && !pat.ends_with('*') {
+                    let literal = &pat[1..]; // strip leading *
+                    if local_name.ends_with(literal) && self.replacement.is_empty() {
+                        // Suffix stripping: from="*_suffix", to="" -> drop the trailing literal
+                        return local_name
+                            .strip_suffix(literal)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                    }
+                    // $0 is the entire matched name
+                    return self.replacement.replace("$0", local_name);
                 }
                 // Default: $0 is the entire matched string
                 self.replacement.replace("$0", local_name)
@@ -256,23 +253,17 @@ impl RenameRule {
     /// Given a glob pattern like "tavily_*" and replacement like "search_$0",
     /// and an aliased name like "search_web", try to reconstruct "tavily_web".
     fn reverse_glob_match(&self, pat: &str, aliased: &str) -> Option<String> {
-        // Simple case: pattern is "prefix_*" and replacement is "newprefix_$0"
-        // or pattern is "*" and replacement is "prefix_$0"
-        // or pattern is "prefix_*" and replacement is ""
-
-        // For now, handle the common cases:
-        if let Some(prefix) = pat.strip_suffix('*') {
+        // Prefix glob: "prefix_*" (anchored at start)
+        if pat.ends_with('*') && !pat.starts_with('*') {
+            let literal = &pat[..pat.len() - 1];
             if self.replacement.is_empty() {
-                // Prefix stripping case: from="prefix_*", to=""
-                // The aliased name is the suffix (without prefix), so prepend prefix back
-                Some(format!("{}{}", prefix, aliased))
+                // Prefix stripping: from="prefix_*", to="" -> prepend literal back
+                Some(format!("{}{}", literal, aliased))
             } else if self.replacement == "$0" {
-                // Keep original case: from="prefix_*", to="$0"
-                // The aliased name IS the original name, so return as-is
+                // Keep original: from="prefix_*", to="$0" -> aliased IS the original
                 Some(aliased.to_string())
             } else if self.replacement.contains("$0") {
-                // Replacement uses $0 with prefix - e.g., from="*", to="prefix_$0"
-                // Aliased name is "prefix_original", so original is aliased without "prefix_"
+                // Replacement uses $0 with a prefix, e.g. from="*", to="prefix_$0"
                 let replacement_prefix = self.replacement.replace("$0", "");
                 aliased
                     .strip_prefix(&replacement_prefix)
@@ -280,11 +271,27 @@ impl RenameRule {
             } else {
                 None
             }
+        }
+        // Suffix glob: "*_suffix" (anchored at end)
+        else if pat.starts_with('*') && !pat.ends_with('*') {
+            let literal = &pat[1..];
+            if self.replacement.is_empty() {
+                // Suffix stripping: from="*_suffix", to="" -> append literal back
+                Some(format!("{}{}", aliased, literal))
+            } else if self.replacement == "$0" {
+                // Keep original: from="*_suffix", to="$0" -> aliased IS the original
+                Some(aliased.to_string())
+            } else if self.replacement.contains("$0") {
+                // Replacement uses $0 with a suffix, e.g. from="*", to="$0_suffix"
+                let replacement_suffix = self.replacement.replace("$0", "");
+                aliased
+                    .strip_suffix(&replacement_suffix)
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
         } else if self.replacement.contains("$0") {
-            // Pattern doesn't end with *, but replacement uses $0
-            // This is a general case - $0 represents the entire match
-            // For reverse, we'd need to know what the original pattern matched
-            // which is complex. Return None for now.
+            // Non-anchored pattern with $0: cannot reliably reverse.
             None
         } else {
             None
@@ -615,31 +622,84 @@ mod tests {
 
     #[test]
     fn test_alias_map_with_rename_all_prefix_stripping() {
-        // Test the common case: from="tavily_*", to="" (strip prefix)
+        // Test the common case: from="tavily_*", to="" (strip prefix).
+        // Uses "_" separator so the backend namespace ("tavily_") collides
+        // with the server's own "tavily_" prefix. The rule must match the
+        // LOCAL name only and preserve the backend namespace.
         let aliases = AliasMap::new(
             vec![],
-            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
         )
         .unwrap();
 
-        // Forward: original -> aliased (strips prefix)
+        // Forward: original -> aliased (strips the server's own prefix only,
+        // backend namespace is preserved).
         assert_eq!(
-            aliases.apply_forward("tavily/tavily_search"),
-            Some("tavily/search".to_string())
+            aliases.apply_forward("tavily_tavily_search"),
+            Some("tavily_search".to_string())
         );
         assert_eq!(
-            aliases.apply_forward("tavily/tavily_extract"),
-            Some("tavily/extract".to_string())
+            aliases.apply_forward("tavily_tavily_extract"),
+            Some("tavily_extract".to_string())
         );
 
-        // Reverse: aliased -> original (adds prefix back)
+        // Reverse: aliased -> original (adds the server prefix back).
         assert_eq!(
-            aliases.apply_reverse("tavily/search"),
-            Some("tavily/tavily_search".to_string())
+            aliases.apply_reverse("tavily_search"),
+            Some("tavily_tavily_search".to_string())
         );
         assert_eq!(
-            aliases.apply_reverse("tavily/extract"),
-            Some("tavily/tavily_extract".to_string())
+            aliases.apply_reverse("tavily_extract"),
+            Some("tavily_tavily_extract".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_strips_server_prefix_preserves_backend_namespace() {
+        // Required test (1): from="tavily_*", to="" on the namespaced name
+        // "tavily_tavily_search" must yield "tavily_search" — the backend
+        // namespace is preserved and only the server's own "tavily_" prefix
+        // is stripped.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("tavily_tavily_search"),
+            Some("tavily_search".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_no_match_when_local_name_lacks_prefix() {
+        // Required test (2): from="roslyn_*", to="" on "roslyn_completion".
+        // The local name is "completion", which does NOT match "roslyn_*",
+        // so the rule does not apply and the name is unchanged (None).
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("roslyn_".into(), "roslyn_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(aliases.apply_forward("roslyn_completion"), None);
+    }
+
+    #[test]
+    fn test_rename_all_reverse_round_trips_to_original() {
+        // Required test (3): reverse of (1). Client sends aliased
+        // "tavily_search" and it maps back to the original
+        // "tavily_tavily_search".
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("tavily_search"),
+            Some("tavily_tavily_search".to_string())
         );
     }
 
@@ -724,12 +784,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_alias_rename_all_prefix_strip_in_list_tools() {
+        // "_" separator: backend namespace "tavily_" collides with the server's
+        // own "tavily_" prefix. The rule must strip only the server prefix and
+        // keep the backend namespace, yielding "tavily_search" (not bare "search").
         let mock =
-            MockService::with_tools(&["tavily/tavily_search", "tavily/tavily_extract", "db/query"]);
+            MockService::with_tools(&["tavily_tavily_search", "tavily_tavily_extract", "db_query"]);
 
         let aliases = AliasMap::new(
             vec![],
-            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
         )
         .unwrap();
 
@@ -739,10 +802,22 @@ mod tests {
         match resp.inner.unwrap() {
             McpResponse::ListTools(result) => {
                 let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
-                // Should see stripped names
-                assert!(names.contains(&"tavily/search"));
-                assert!(names.contains(&"tavily/extract"));
-                assert!(names.contains(&"db/query")); // unchanged
+                // Should see backend-prefixed, server-prefix-stripped names.
+                assert!(
+                    names.contains(&"tavily_search"),
+                    "Expected tavily_search, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"tavily_extract"),
+                    "Expected tavily_extract, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
+                    names
+                );
             }
             other => panic!("expected ListTools, got: {:?}", other),
         }
@@ -790,25 +865,26 @@ mod tests {
     }
 
     /// Test rename_all where backend tools DON'T include their own prefix.
-    /// E.g., Roslyn tools are `list_types` (not `roslyn_list_types`).
-    /// After namespace prefix, full name is `roslyn_list_types`.
-    /// Pattern `roslyn_*` should match the full namespaced name.
+    /// E.g., Roslyn tools are `completion` (not `roslyn_completion`).
+    /// After namespace prefix, full name is `roslyn_completion`.
+    /// Pattern `roslyn_*` must match the LOCAL name only (`completion`),
+    /// which does NOT match, so the backend namespace is preserved unchanged.
     #[tokio::test]
     async fn test_rename_all_backend_without_prefix() {
         let mock = MockService::with_tools(&[
-            "roslyn/list_types",
-            "roslyn/get_call_graph",
-            "roslyn/check_syntax",
-            "lsp/rename_symbol",
-            "lsp/find_references",
-            "db/query",
+            "roslyn_completion",
+            "roslyn_get_call_graph",
+            "roslyn_check_syntax",
+            "lsp_rename_symbol",
+            "lsp_find_references",
+            "db_query",
         ]);
 
         let aliases = AliasMap::new(
             vec![],
             vec![
-                ("roslyn/".into(), "roslyn_*".into(), "".into()),
-                ("lsp/".into(), "lsp_*".into(), "".into()),
+                ("roslyn_".into(), "roslyn_*".into(), "".into()),
+                ("lsp_".into(), "lsp_*".into(), "".into()),
             ],
         )
         .unwrap();
@@ -819,35 +895,36 @@ mod tests {
         match resp.inner.unwrap() {
             McpResponse::ListTools(result) => {
                 let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
-                // Should strip `roslyn_` and `lsp_` prefix
+                // Backend namespace must be preserved (rule does not apply to
+                // local names that don't carry the server's own prefix).
                 assert!(
-                    names.contains(&"roslyn/list_types"),
-                    "Expected roslyn/list_types, got: {:?}",
+                    names.contains(&"roslyn_completion"),
+                    "Expected roslyn_completion preserved, got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"roslyn/get_call_graph"),
-                    "Expected roslyn/get_call_graph, got: {:?}",
+                    names.contains(&"roslyn_get_call_graph"),
+                    "Expected roslyn_get_call_graph preserved, got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"roslyn/check_syntax"),
-                    "Expected roslyn/check_syntax, got: {:?}",
+                    names.contains(&"roslyn_check_syntax"),
+                    "Expected roslyn_check_syntax preserved, got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"lsp/rename_symbol"),
-                    "Expected lsp/rename_symbol, got: {:?}",
+                    names.contains(&"lsp_rename_symbol"),
+                    "Expected lsp_rename_symbol preserved, got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"lsp/find_references"),
-                    "Expected lsp/find_references, got: {:?}",
+                    names.contains(&"lsp_find_references"),
+                    "Expected lsp_find_references preserved, got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"db/query"),
-                    "Expected db/query unchanged, got: {:?}",
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
                     names
                 );
             }
@@ -858,15 +935,16 @@ mod tests {
     /// Test rename_all where backend tools DO include their own prefix.
     /// E.g., Tavily tools are `tavily_search` (already prefixed).
     /// After namespace prefix, full name is `tavily_tavily_search`.
-    /// Pattern `tavily_*` should match and strip to `tavily_search`.
+    /// Pattern `tavily_*` matches the LOCAL name `tavily_search`, strips the
+    /// server's own `tavily_` prefix, then re-namespaces -> `tavily_search`.
     #[tokio::test]
     async fn test_rename_all_backend_with_prefix() {
         let mock =
-            MockService::with_tools(&["tavily/tavily_search", "tavily/tavily_extract", "db/query"]);
+            MockService::with_tools(&["tavily_tavily_search", "tavily_tavily_extract", "db_query"]);
 
         let aliases = AliasMap::new(
             vec![],
-            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
         )
         .unwrap();
 
@@ -877,22 +955,79 @@ mod tests {
             McpResponse::ListTools(result) => {
                 let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
                 assert!(
-                    names.contains(&"tavily/search"),
-                    "Expected tavily/search, got: {:?}",
+                    names.contains(&"tavily_search"),
+                    "Expected tavily_search (backend prefix preserved), got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"tavily/extract"),
-                    "Expected tavily/extract, got: {:?}",
+                    names.contains(&"tavily_extract"),
+                    "Expected tavily_extract (backend prefix preserved), got: {:?}",
                     names
                 );
                 assert!(
-                    names.contains(&"db/query"),
-                    "Expected db/query unchanged, got: {:?}",
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
                     names
                 );
             }
             other => panic!("expected ListTools, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_rename_all_prefix_glob_strips_only_leading_occurrence() {
+        // A trailing-* glob ("prefix_*") must match only at the start of the
+        // name, stripping a single leading occurrence of the prefix.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        // Single prefix occurrence: stripped once.
+        assert_eq!(
+            aliases.apply_forward("tavily/tavily_search"),
+            Some("tavily/search".to_string())
+        );
+        // Double prefix occurrence: only the leading one is stripped.
+        assert_eq!(
+            aliases.apply_forward("tavily/tavily_tavily_search"),
+            Some("tavily/tavily_search".to_string())
+        );
+        // No prefix occurrence: not matched.
+        assert_eq!(aliases.apply_forward("tavily/search"), None);
+    }
+
+    #[test]
+    fn test_rename_all_suffix_glob_strips_only_trailing_occurrence() {
+        // A leading-* glob ("*_suffix") must match only at the end of the name,
+        // stripping a single trailing occurrence of the suffix.
+        let aliases =
+            AliasMap::new(vec![], vec![("exa/".into(), "*_exa".into(), "".into())]).unwrap();
+
+        // Single suffix occurrence: stripped once.
+        assert_eq!(
+            aliases.apply_forward("exa/web_search_exa"),
+            Some("exa/web_search".to_string())
+        );
+        // Double suffix occurrence: only the trailing one is stripped.
+        assert_eq!(
+            aliases.apply_forward("exa/web_search_exa_exa"),
+            Some("exa/web_search_exa".to_string())
+        );
+        // No suffix occurrence: not matched.
+        assert_eq!(aliases.apply_forward("exa/web_search"), None);
+    }
+
+    #[test]
+    fn test_rename_all_suffix_glob_reverse_restores_trailing_occurrence() {
+        // Reverse of a suffix glob must re-append the stripped suffix.
+        let aliases =
+            AliasMap::new(vec![], vec![("exa/".into(), "*_exa".into(), "".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("exa/web_search"),
+            Some("exa/web_search_exa".to_string())
+        );
     }
 }

@@ -229,7 +229,7 @@ fn print_config_summary(config: &ProxyConfig) -> Result<()> {
 
 fn init_logging(config: &ProxyConfig) {
     let config_filter = format!(
-        "tower_mcp={level},mcp_proxy={level}",
+        "tower_mcp={level},mcp_proxy={level},mcp::access={level}",
         level = config.observability.log_level
     );
 

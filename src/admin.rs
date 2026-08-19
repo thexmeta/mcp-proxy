@@ -946,17 +946,25 @@ async fn handle_circuit_breakers(
 /// Handler for listing all endpoint groups.
 async fn handle_endpoint_groups(
     Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+    Extension(group_backends): Extension<
+        std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    >,
 ) -> Json<EndpointGroupListResponse> {
     let groups = endpoint_groups
         .iter()
-        .map(|g| EndpointGroupInfo {
-            name: g.name.clone(),
-            path: g.path.clone(),
-            backends: g.backends.clone(),
-            tools: g.tools.clone(),
-            description: g.description.clone(),
-            tool_discovery: g.tool_discovery,
-            mcp_endpoint: format!("{}/mcp", g.path.trim_start_matches('/')),
+        .map(|g| {
+            let mut backends = group_backends.get(&g.name).cloned().unwrap_or_default();
+            backends.sort();
+            backends.dedup();
+            EndpointGroupInfo {
+                name: g.name.clone(),
+                path: g.path.clone(),
+                backends,
+                tools: g.tools.clone(),
+                description: g.description.clone(),
+                tool_discovery: g.tool_discovery,
+                mcp_endpoint: format!("{}/mcp", g.path.trim_start_matches('/')),
+            }
         })
         .collect();
     Json(EndpointGroupListResponse {
@@ -967,6 +975,9 @@ async fn handle_endpoint_groups(
 /// Handler for getting a single endpoint group by name.
 async fn handle_endpoint_group(
     Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+    Extension(group_backends): Extension<
+        std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    >,
     Path(name): Path<String>,
 ) -> Result<Json<EndpointGroupInfo>, StatusCode> {
     let group = endpoint_groups
@@ -974,10 +985,14 @@ async fn handle_endpoint_group(
         .find(|g| g.name == name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let mut backends = group_backends.get(&name).cloned().unwrap_or_default();
+    backends.sort();
+    backends.dedup();
+
     Ok(Json(EndpointGroupInfo {
         name: group.name.clone(),
         path: group.path.clone(),
-        backends: group.backends.clone(),
+        backends,
         tools: group.tools.clone(),
         description: group.description.clone(),
         tool_discovery: group.tool_discovery,
@@ -1076,8 +1091,25 @@ pub fn admin_router(
 ) -> Router {
     let config_toml = std::sync::Arc::new(toml::to_string_pretty(config).unwrap_or_default());
 
-    // Extract only the data needed for endpoint/tool group handlers
+    // Extract only the data needed for endpoint/tool group handlers.
+    // `group_backends` precomputes effective group membership (UNION of
+    // explicit + reverse-referenced backends) so handlers need no Clone.
+    let group_backends: std::collections::HashMap<String, Vec<String>> = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .map(|g| {
+            let members: Vec<String> = config
+                .backends
+                .iter()
+                .filter(|b| g.backends.contains(&b.name) || b.endpoint_groups.contains(&g.name))
+                .map(|b| b.name.clone())
+                .collect();
+            (g.name.clone(), members)
+        })
+        .collect();
     let endpoint_groups = std::sync::Arc::new(config.proxy.endpoint_groups.clone());
+    let group_backends = std::sync::Arc::new(group_backends);
     let tool_groups = std::sync::Arc::new(config.proxy.tool_groups.clone());
 
     let router = Router::new()
@@ -1120,6 +1152,7 @@ pub fn admin_router(
         .layer(Extension(proxy))
         .layer(Extension(config_toml))
         .layer(Extension(endpoint_groups))
+        .layer(Extension(group_backends))
         .layer(Extension(tool_groups))
         .layer(Extension(config_path))
         .layer(Extension(Arc::new(cb_handles)));
@@ -1747,6 +1780,186 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint group tests (union membership)
+    // -----------------------------------------------------------------------
+
+    /// Create a config with a group having empty backends list, plus a backend
+    /// that refs the group via endpoint_groups. The admin API should show
+    /// the reverse-referenced backend.
+    #[tokio::test]
+    async fn test_admin_endpoint_groups_union() {
+        let config = crate::config::ProxyConfig::parse(
+            r#"
+            [proxy]
+            name = "test"
+            [proxy.listen]
+
+            [[proxy.endpoint_groups]]
+            name = "search"
+            path = "/search"
+
+            [[backends]]
+            name = "tavily"
+            transport = "http"
+            url = "http://localhost:1"
+            endpoint_groups = ["search"]
+            "#,
+        )
+        .expect("failed to parse config");
+
+        let state = make_state(vec![]);
+        let session_handle = make_session_handle();
+        let router = admin_router(
+            state,
+            None,
+            session_handle,
+            None,
+            make_test_proxy().await,
+            &config,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let json = get_json(&router, "/endpoint-groups").await;
+        let groups = json["endpoint_groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "search");
+        let backends = groups[0]["backends"].as_array().unwrap();
+        assert!(
+            backends.iter().any(|b| b == "tavily"),
+            "tavily must appear in search group's backends, got {:?}",
+            backends
+        );
+    }
+
+    /// Hit `/endpoint-groups/{name}` with the same config. Assert correct
+    /// members returned for the single group.
+    #[tokio::test]
+    async fn test_admin_endpoint_group_by_name() {
+        let config = crate::config::ProxyConfig::parse(
+            r#"
+            [proxy]
+            name = "test"
+            [proxy.listen]
+
+            [[proxy.endpoint_groups]]
+            name = "search"
+            path = "/search"
+
+            [[backends]]
+            name = "tavily"
+            transport = "http"
+            url = "http://localhost:1"
+            endpoint_groups = ["search"]
+            "#,
+        )
+        .expect("failed to parse config");
+
+        let state = make_state(vec![]);
+        let session_handle = make_session_handle();
+        let router = admin_router(
+            state,
+            None,
+            session_handle,
+            None,
+            make_test_proxy().await,
+            &config,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let json = get_json(&router, "/endpoint-groups/search").await;
+        assert_eq!(json["name"], "search");
+        assert_eq!(json["path"], "/search");
+        let backends = json["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0], "tavily");
+    }
+
+    /// Config with no endpoint groups. Hit `/endpoint-groups`. Assert empty list.
+    #[tokio::test]
+    async fn test_admin_endpoint_groups_empty() {
+        let config = crate::config::ProxyConfig::parse(
+            r#"
+            [proxy]
+            name = "test"
+            [proxy.listen]
+
+            [[backends]]
+            name = "echo"
+            transport = "stdio"
+            command = "echo"
+            "#,
+        )
+        .expect("failed to parse config");
+
+        let state = make_state(vec![]);
+        let session_handle = make_session_handle();
+        let router = admin_router(
+            state,
+            None,
+            session_handle,
+            None,
+            make_test_proxy().await,
+            &config,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let json = get_json(&router, "/endpoint-groups").await;
+        let groups = json["endpoint_groups"].as_array().unwrap();
+        assert!(groups.is_empty(), "expected empty endpoint groups list");
+    }
+
+    /// Hit `/endpoint-groups/nonexistent`. Assert 404.
+    #[tokio::test]
+    async fn test_admin_endpoint_group_not_found() {
+        let config = crate::config::ProxyConfig::parse(
+            r#"
+            [proxy]
+            name = "test"
+            [proxy.listen]
+
+            [[proxy.endpoint_groups]]
+            name = "search"
+            path = "/search"
+
+            [[backends]]
+            name = "tavily"
+            transport = "http"
+            url = "http://localhost:1"
+            endpoint_groups = ["search"]
+            "#,
+        )
+        .expect("failed to parse config");
+
+        let state = make_state(vec![]);
+        let session_handle = make_session_handle();
+        let router = admin_router(
+            state,
+            None,
+            session_handle,
+            None,
+            make_test_proxy().await,
+            &config,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/endpoint-groups/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )

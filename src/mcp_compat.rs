@@ -6,13 +6,8 @@
 //! HTTP headers if the client omitted them.
 
 use axum::{
-    body::Body,
-    extract::Request,
-    http::header::HeaderName,
-    http::HeaderValue,
-    http::Method,
-    middleware::Next,
-    response::Response,
+    body::Body, extract::Request, http::HeaderValue, http::Method, http::header::HeaderName,
+    middleware::Next, response::Response,
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -51,32 +46,37 @@ pub async fn inject_mcp_compat_headers(req: Request, next: Next) -> Response {
     let json: Option<Value> = serde_json::from_slice(&bytes).ok();
 
     // Extract method and protocol version from JSON-RPC body
-    let mcp_method = json.as_ref()
+    let mcp_method = json
+        .as_ref()
         .and_then(|v| v.get("method")?.as_str().map(String::from));
 
-    let protocol_version = json.as_ref()
-        .and_then(|v| v.get("params")?.get("protocolVersion")?.as_str().map(String::from));
+    let protocol_version = json.as_ref().and_then(|v| {
+        v.get("params")?
+            .get("protocolVersion")?
+            .as_str()
+            .map(String::from)
+    });
 
     // Reconstruct request with injected headers
     let mut req = Request::from_parts(parts, Body::from(bytes));
 
-    if !has_method
-        && let Some(method) = mcp_method
-    {
+    if !has_method && let Some(method) = mcp_method {
         tracing::debug!(method = %method, "Injecting missing Mcp-Method header");
         req.headers_mut().insert(
             HeaderName::from_static(MCP_METHOD_HEADER),
-            method.parse().unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+            method
+                .parse()
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
         );
     }
 
-    if !has_version
-        && let Some(version) = protocol_version
-    {
+    if !has_version && let Some(version) = protocol_version {
         tracing::debug!(version = %version, "Injecting missing MCP-Protocol-Version header");
         req.headers_mut().insert(
             HeaderName::from_static(MCP_PROTOCOL_VERSION_HEADER),
-            version.parse().unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+            version
+                .parse()
+                .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
         );
     }
 
@@ -86,20 +86,27 @@ pub async fn inject_mcp_compat_headers(req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::StatusCode, Router};
+    use axum::{Router, body::Body, http::StatusCode};
     use tower::ServiceExt;
 
     #[tokio::test]
     async fn test_injects_method_header_when_missing() {
         let app = Router::new()
-            .route("/", axum::routing::post(|req: Request| async move {
-                let has_header = req.headers().contains_key(MCP_METHOD_HEADER);
-                let method = req.headers()
-                    .get(MCP_METHOD_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                (StatusCode::OK, format!("has_header={}, method={:?}", has_header, method))
-            }))
+            .route(
+                "/",
+                axum::routing::post(|req: Request| async move {
+                    let has_header = req.headers().contains_key(MCP_METHOD_HEADER);
+                    let method = req
+                        .headers()
+                        .get(MCP_METHOD_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    (
+                        StatusCode::OK,
+                        format!("has_header={}, method={:?}", has_header, method),
+                    )
+                }),
+            )
             .layer(axum::middleware::from_fn(inject_mcp_compat_headers));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}"#;
@@ -112,20 +119,26 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body, "has_header=true, method=Some(\"initialize\")");
     }
 
     #[tokio::test]
     async fn test_injects_protocol_version_header() {
         let app = Router::new()
-            .route("/", axum::routing::post(|req: Request| async move {
-                let version = req.headers()
-                    .get(MCP_PROTOCOL_VERSION_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                (StatusCode::OK, format!("version={:?}", version))
-            }))
+            .route(
+                "/",
+                axum::routing::post(|req: Request| async move {
+                    let version = req
+                        .headers()
+                        .get(MCP_PROTOCOL_VERSION_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    (StatusCode::OK, format!("version={:?}", version))
+                }),
+            )
             .layer(axum::middleware::from_fn(inject_mcp_compat_headers));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}"#;
@@ -138,24 +151,34 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body, "version=Some(\"2026-07-28\")");
     }
 
     #[tokio::test]
     async fn test_preserves_existing_headers() {
         let app = Router::new()
-            .route("/", axum::routing::post(|req: Request| async move {
-                let method = req.headers()
-                    .get(MCP_METHOD_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                let version = req.headers()
-                    .get(MCP_PROTOCOL_VERSION_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                (StatusCode::OK, format!("method={:?}, version={:?}", method, version))
-            }))
+            .route(
+                "/",
+                axum::routing::post(|req: Request| async move {
+                    let method = req
+                        .headers()
+                        .get(MCP_METHOD_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    let version = req
+                        .headers()
+                        .get(MCP_PROTOCOL_VERSION_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    (
+                        StatusCode::OK,
+                        format!("method={:?}, version={:?}", method, version),
+                    )
+                }),
+            )
             .layer(axum::middleware::from_fn(inject_mcp_compat_headers));
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}"#;
@@ -170,16 +193,22 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, "method=Some(\"custom-method\"), version=Some(\"custom-version\")");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            "method=Some(\"custom-method\"), version=Some(\"custom-version\")"
+        );
     }
 
     #[tokio::test]
     async fn test_skips_non_post_requests() {
         let app = Router::new()
-            .route("/", axum::routing::get(|| async {
-                (StatusCode::OK, "no header injected")
-            }))
+            .route(
+                "/",
+                axum::routing::get(|| async { (StatusCode::OK, "no header injected") }),
+            )
             .layer(axum::middleware::from_fn(inject_mcp_compat_headers));
 
         let req = axum::http::Request::builder()
