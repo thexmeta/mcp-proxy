@@ -446,18 +446,9 @@ impl Proxy {
         let (service, cache_handle, alias_map) =
             build_middleware_stack(&config, shared_proxy.clone())?;
 
-        // Configure protocol version support for the HTTP transport
-        let protocol_support = {
-            let versions = &config.proxy.protocol_support.versions;
-            if versions.is_empty() {
-                // Default to both 2026-07-28 and 2025-11-25 for backward compatibility
-                tower_mcp::ProtocolSupport::try_new(["2026-07-28", "2025-11-25"])
-                    .expect("default protocol versions are valid")
-            } else {
-                tower_mcp::ProtocolSupport::try_new(versions.iter().map(|s| s.as_str()))
-                    .context("invalid protocol versions")?
-            }
-        };
+        // Configure protocol version support for the HTTP transport.
+        // Shared with endpoint-group routes via `build_protocol_support`.
+        let protocol_support = build_protocol_support(&config)?;
 
         // Validate default_protocol_version if specified
         if let Some(ref default_pv) = config.proxy.protocol_support.default_protocol_version {
@@ -717,6 +708,59 @@ pub(crate) fn build_alias_map(config: &ProxyConfig) -> Option<Arc<RwLock<crate::
         .map(|m| Arc::new(RwLock::new(m)))
 }
 
+/// Build the [`tower_mcp::ProtocolSupport`] advertised by the HTTP transport.
+///
+/// This is the single source of truth for protocol-version negotiation used by
+/// both the root `/` route and every endpoint-group route, so they never drift
+/// apart. Semantics match the historical root behavior exactly:
+///
+/// - When `config.proxy.protocol_support.versions` is non-empty, those versions
+///   are used verbatim.
+/// - When the list is empty, it falls back to `["2026-07-28", "2025-11-25"]` for
+///   backward compatibility.
+///
+/// Returns an error if a configured version string is invalid. The empty-list
+/// fallback uses a statically known-valid set and cannot fail. Note that
+/// `ProxyConfig::validate()` does not check `protocol_support.versions`, so an
+/// invalid configured version is surfaced here as a graceful startup error
+/// rather than a panic.
+pub fn build_protocol_support(config: &ProxyConfig) -> Result<tower_mcp::ProtocolSupport> {
+    let versions = &config.proxy.protocol_support.versions;
+    if versions.is_empty() {
+        // Default to both 2026-07-28 and 2025-11-25 for backward compatibility.
+        // This set is statically known to be valid, so the expect is safe.
+        Ok(
+            tower_mcp::ProtocolSupport::try_new(["2026-07-28", "2025-11-25"])
+                .expect("default protocol versions are valid"),
+        )
+    } else {
+        tower_mcp::ProtocolSupport::try_new(versions.iter().map(|s| s.as_str()))
+            .context("invalid protocol versions")
+    }
+}
+
+/// Apply the three innermost 2026-07-28 layers to a service, in the same order
+/// as the root middleware stack: SubscriptionsListen → Discover → MetaValidation.
+///
+/// This is the single source of truth for the 2026 layer trio so that
+/// endpoint-group routes stay at parity with the root `/` route. It does not
+/// change the observable behavior of the root stack — it only extracts the
+/// existing construction into a reusable helper.
+pub fn apply_2026_layers(
+    service: BoxCloneService<RouterRequest, RouterResponse, Infallible>,
+    config: &ProxyConfig,
+) -> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    // Subscriptions/listen handler (innermost - intercepts before McpProxy for 2026-07-28)
+    let service =
+        BoxCloneService::new(crate::subscriptions::SubscriptionsListenLayer.layer(service));
+
+    // Discover middleware (innermost - handles server/discover RPC for all transports)
+    let service = BoxCloneService::new(discover::DiscoverLayer::new(config).layer(service));
+
+    // Meta validation middleware (validates per-request _meta for 2026-07-28)
+    BoxCloneService::new(meta_validation::MetaValidationLayer::new().layer(service))
+}
+
 /// Return type for [`build_middleware_stack`].
 type MiddlewareStack = (
     BoxCloneService<RouterRequest, RouterResponse, Infallible>,
@@ -729,17 +773,10 @@ fn build_middleware_stack(config: &ProxyConfig, proxy: McpProxy) -> Result<Middl
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
 
-    // Subscriptions/listen handler (innermost - intercepts before McpProxy for 2026-07-28)
-    tracing::info!("Applying SubscriptionsListen middleware");
-    service = BoxCloneService::new(crate::subscriptions::SubscriptionsListenLayer.layer(service));
-
-    // Discover middleware (innermost - handles server/discover RPC for all transports)
-    tracing::info!("Applying Discover middleware");
-    service = BoxCloneService::new(discover::DiscoverLayer::new(config).layer(service));
-
-    // Meta validation middleware (validates per-request _meta for 2026-07-28)
-    tracing::info!("Applying MetaValidation middleware");
-    service = BoxCloneService::new(meta_validation::MetaValidationLayer::new().layer(service));
+    // Innermost 2026-07-28 layers (SubscriptionsListen → Discover → MetaValidation).
+    // Shared with endpoint-group routes via `apply_2026_layers` to prevent drift.
+    tracing::info!("Applying 2026-07-28 layers (SubscriptionsListen, Discover, MetaValidation)");
+    service = apply_2026_layers(service, config);
 
     let mut cache_handle: Option<cache::CacheHandle> = None;
 
@@ -1433,6 +1470,79 @@ mod scope_enforcement_tests {
         assert!(
             resp.inner.is_ok(),
             "token carrying all required scopes should be allowed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod protocol_support_tests {
+    use tower::util::BoxCloneService;
+    use tower_mcp::{McpRequest, McpResponse, RouterRequest, RouterResponse};
+
+    use super::{apply_2026_layers, build_protocol_support};
+    use crate::config::ProxyConfig;
+    use crate::test_util::{MockService, call_service};
+    use std::convert::Infallible;
+
+    /// `build_protocol_support` falls back to both versions when the config list is empty.
+    #[test]
+    fn build_protocol_support_uses_default_when_empty() {
+        let config = ProxyConfig::parse(
+            "[proxy]\nname = \"t\"\nversion = \"1.0.0\"\n[proxy.listen]\nhost = \"127.0.0.1\"\nport = 8080\n[[backends]]\nname = \"b\"\ntransport = \"stdio\"\ncommand = \"echo\"\n",
+        )
+        .unwrap();
+        let support = build_protocol_support(&config).unwrap();
+        assert!(support.contains("2026-07-28"));
+        assert!(support.contains("2025-11-25"));
+        assert_eq!(support.versions().len(), 2);
+    }
+
+    /// `build_protocol_support` honors an explicit configured version set.
+    #[test]
+    fn build_protocol_support_uses_configured_versions() {
+        let config = ProxyConfig::parse(
+            "[proxy]\nname = \"t\"\nversion = \"1.0.0\"\n[proxy.listen]\nhost = \"127.0.0.1\"\nport = 8080\n[[backends]]\nname = \"b\"\ntransport = \"stdio\"\ncommand = \"echo\"\n[proxy.protocol_support]\nversions = [\"2026-07-28\"]\n",
+        )
+        .unwrap();
+        let support = build_protocol_support(&config).unwrap();
+        assert!(support.contains("2026-07-28"));
+        assert!(!support.contains("2025-11-25"));
+        assert_eq!(support.versions().len(), 1);
+    }
+
+    /// `apply_2026_layers` intercepts `server/discover` via the Discover layer
+    /// while still passing normal traffic (e.g. `ListTools`) through to the
+    /// inner service. This guards against the trio swallowing or mis-ordering
+    /// requests.
+    #[tokio::test]
+    async fn apply_2026_layers_intercepts_discover_and_passes_through_tools() {
+        let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+            BoxCloneService::new(MockService::with_tools(&["fs/read"]));
+        let config = ProxyConfig::parse(
+            "[proxy]\nname = \"t\"\nversion = \"1.0.0\"\n[proxy.listen]\nhost = \"127.0.0.1\"\nport = 8080\n[[backends]]\nname = \"b\"\ntransport = \"stdio\"\ncommand = \"echo\"\n",
+        )
+        .unwrap();
+        let mut wrapped = apply_2026_layers(service, &config);
+
+        // Discover must be intercepted by the Discover layer, not fall through
+        // to the inner service (which would produce a -32601 / Pong).
+        let discover_resp = call_service(
+            &mut wrapped,
+            McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        )
+        .await;
+        assert!(
+            matches!(discover_resp.inner, Ok(McpResponse::Discover(_))),
+            "server/discover should be intercepted by the Discover layer, got: {:?}",
+            discover_resp.inner
+        );
+
+        // ListTools must reach the inner MockService unchanged.
+        let list_resp = call_service(&mut wrapped, McpRequest::ListTools(Default::default())).await;
+        assert!(
+            matches!(list_resp.inner, Ok(McpResponse::ListTools(_))),
+            "ListTools should pass through to the inner service, got: {:?}",
+            list_resp.inner
         );
     }
 }

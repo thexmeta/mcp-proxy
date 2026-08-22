@@ -82,6 +82,36 @@ Retry -> Hedge -> Concurrency Limit -> Rate Limit
   -> Timeout -> Circuit Breaker -> Outlier Detection -> Backend
 ```
 
+### Endpoint-group middleware stacks
+
+Endpoint-group routes (e.g. `/os/mcp`) build their OWN middleware stack in
+`src/endpoint_router.rs::build_endpoint_group_middleware_stack`, SEPARATE from
+the root stack in `src/proxy.rs::build_middleware_stack`. Both stacks must stay
+at protocol parity.
+
+**Convention (drift-proofing):** any protocol-level layer (2026-07-28 and later)
+MUST be added via the shared `crate::proxy::apply_2026_layers` helper, and any
+transport-level protocol configuration MUST go through
+`crate::proxy::build_protocol_support`. Never add a protocol layer to only one
+stack -- `apply_2026_layers` and `build_protocol_support` are the single source
+of truth for both root and group routes.
+
+Effective order (outer→inner) for an endpoint-group route:
+
+    MetaValidation -> Discover -> SubscriptionsListen -> [GroupFilter] -> McpProxy
+
+`GroupFilter` stays innermost-effective so group tool scoping is preserved; the
+2026 layers sit immediately outside it, in the same relative position as in the
+root stack (where they sit immediately outside `McpProxy`).
+
+Endpoint groups intentionally do NOT mirror the following root-only layers
+(out of scope for protocol parity): `SearchModeFilter`, `ToolGroup`,
+`GlobalRateLimit`, `ClientRateLimit`. This asymmetry is deliberate, not a bug.
+
+Hot reload inherits group fixes automatically: `src/reload.rs` builds group
+routes via `build_single_endpoint_group`, which calls the same
+`build_endpoint_group_middleware_stack` and `build_protocol_support`.
+
 ### Key design pattern: Error = Infallible
 
 All services use `Error = Infallible`. Errors are represented inside the response:
@@ -112,6 +142,10 @@ Every middleware follows the same tower Service pattern. Use `inject.rs` as a te
 3. Wire it into the stack in `proxy.rs::build_middleware_stack()`:
    - For global middleware: wrap the `BoxCloneService` at the appropriate position
    - For per-backend: use `builder.backend_layer(layer)` in the backend loop
+   - For protocol-level layers (2026-07-28 and later): wire through
+     `crate::proxy::apply_2026_layers` so BOTH the root and endpoint-group
+     stacks receive it. Never add a protocol layer to only one stack. Endpoint
+     groups inherit the fix automatically via `reload.rs::build_single_endpoint_group`.
 
 4. Add config fields to `config.rs` (with `#[serde(default)]` for optional fields)
 

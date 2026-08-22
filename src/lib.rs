@@ -211,4 +211,6 @@ mod proxy;
 pub use builder::ProxyBuilder;
 pub use config::ProxyConfig;
 pub use proxy::Proxy;
+pub use proxy::apply_2026_layers;
 pub use proxy::build_dynamic_endpoint_group_router;
+pub use proxy::build_protocol_support;

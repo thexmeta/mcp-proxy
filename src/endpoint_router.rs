@@ -12,6 +12,7 @@ use tower_mcp::proxy::McpProxy;
 use tower_mcp::{RouterRequest, RouterResponse};
 
 use crate::config::{BackendConfig, EndpointGroupConfig, ProxyConfig};
+use crate::proxy::{apply_2026_layers, build_protocol_support};
 
 /// Shared registry for endpoint groups that supports hot reload.
 /// This allows dynamic addition/removal/update of endpoint groups without restarting the proxy.
@@ -102,6 +103,17 @@ fn build_endpoint_group_middleware_stack(
         );
         service = BoxCloneService::new(crate::filter::GroupFilterService::new(service, namespaces));
     }
+
+    // Innermost 2026-07-28 layers (SubscriptionsListen → Discover → MetaValidation).
+    // Mirrors the root `/` stack via the shared `apply_2026_layers` helper so
+    // group routes stay at protocol parity (e.g. `server/discover` works).
+    // GroupFilter remains innermost-effective for tool scoping; these layers sit
+    // immediately outside it and operate on the already-group-scoped request.
+    tracing::info!(
+        "Applying 2026-07-28 layers (SubscriptionsListen, Discover, MetaValidation) (endpoint group: {})",
+        group.name
+    );
+    service = apply_2026_layers(service, config);
 
     // Filter backends to only those in this group for middleware that needs backend-specific config
     let group_backends: Vec<_> = config
@@ -666,9 +678,12 @@ pub async fn build_single_endpoint_group(
         group_namespaces,
     )?;
 
-    // Create HTTP router for this group
-    let (router, session_handle) =
-        tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
+    // Create HTTP router for this group. Protocol version support mirrors the
+    // root `/` route via the shared `build_protocol_support` helper so group
+    // routes honor `[proxy.protocol_support]` instead of the tower_mcp default.
+    let (router, session_handle) = tower_mcp::transport::http::HttpTransport::from_service(service)
+        .protocol_support(build_protocol_support(config)?)
+        .into_router_with_handle();
 
     // Auto-inject Mcp-Method and MCP-Protocol-Version headers for backward compatibility
     let router = router.layer(axum::middleware::from_fn(
