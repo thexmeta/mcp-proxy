@@ -228,6 +228,103 @@ expose_tools = ["read_file", "list_directory"]
 # hide_tools = ["write_file", "delete_file"]
 ```
 
+### Endpoint Groups
+
+Endpoint groups create separate MCP endpoints (`/{path}/mcp`) that expose a subset of backends. Useful for role-based tool access, team-specific tool sets, or logical organization.
+
+```toml
+# Declare backends with group membership
+[[backends]]
+name = "context7"
+transport = "http"
+url = "http://localhost:3001/mcp"
+endpoint_groups = ["search", "coding"]   # reverse reference
+
+[[backends]]
+name = "tavily"
+transport = "http"
+url = "http://localhost:3003/mcp"
+endpoint_groups = ["search"]
+
+[[backends]]
+name = "github"
+transport = "http"
+url = "http://localhost:3005/mcp"
+endpoint_groups = ["coding"]
+
+# Declare endpoint groups
+[[proxy.endpoint_groups]]
+name = "search"
+path = "/search"
+backends = ["context7", "tavily"]
+description = "Search tools"
+
+[[proxy.endpoint_groups]]
+name = "coding"
+path = "/coding"
+backends = ["context7", "github"]
+description = "Coding tools"
+```
+
+This creates:
+- `/search/mcp` -- context7 + tavily tools
+- `/coding/mcp` -- context7 + github tools
+- `/mcp` -- all backends (by default)
+
+#### Shorthand syntax
+
+For simple cases where every group should expose all backends, use the array shorthand:
+
+```toml
+proxy.endpoint_group_list = ["os", "web"]
+```
+
+This auto-creates groups at `/os/mcp` and `/web/mcp` with all enabled backends. Explicit `[[proxy.endpoint_groups]]` entries with the same name override these.
+
+### Shared Backend Pool
+
+Each backend process is spawned exactly **once**, regardless of how many endpoint groups reference it. The proxy builds a single `McpProxy` with all backends, then each endpoint group applies its own middleware stack and namespace filter on top.
+
+```
+Client A --> /search/mcp --> [GroupFilter: search, coding] --> McpProxy --> context7 (1 process)
+Client B --> /coding/mcp --> [GroupFilter: coding]        --> McpProxy --> tavily   (1 process)
+                                                                    --> github  (1 process)
+```
+
+This means a backend like `context7` shared between `search` and `coding` groups runs only one process, saving resources and simplifying management.
+
+### Global Backend Configuration
+
+Reduce config duplication with global defaults applied to all backends:
+
+```toml
+[proxy]
+name = "my-proxy"
+
+# Global env vars merged into ALL stdio backends
+# (per-backend [backends.env] values take precedence)
+[proxy.backend_env]
+LOG_LEVEL = "ERROR"
+MCP_LOG_LEVEL = "ERROR"
+
+# Global timeout applied to all backends
+# (per-backend [backends.timeout] overrides this)
+[proxy.timeout]
+seconds = 30
+
+# Global circuit breaker
+[proxy.circuit_breaker]
+failure_rate_threshold = 0.5
+minimum_calls = 5
+wait_duration_seconds = 30
+
+# Global retry policy
+[proxy.retry]
+max_retries = 3
+initial_backoff_ms = 100
+max_backoff_ms = 5000
+```
+
 ### Protocol version support
 
 mcp-proxy supports both MCP 2026-07-28 (stateless) and 2025-11-25 (session-based) protocols simultaneously. Clients auto-negotiate via HTTP headers or WebSocket subprotocol negotiation.
@@ -292,22 +389,23 @@ MCP tools (under `proxy/` namespace):
 
 ## Architecture
 
+### Middleware stack
+
 ```
-Client
-  |
-  v
-[Auth] -> [Audit] -> [Metrics] -> [Token Passthrough] -> [RBAC]
-  -> [Alias] -> [Filter] -> [Validation] -> [Coalesce] -> [Cache]
-  -> [Mirror] -> [Inject Args]
-  -> McpProxy
-       |
-       v  (per-backend)
-     [Retry] -> [Hedge] -> [Concurrency] -> [Rate Limit]
-       -> [Timeout] -> [Circuit Breaker] -> [Outlier Detection]
-       -> Backend
+Global (wraps entire proxy):
+  Auth -> Audit -> Access Log -> Metrics -> Token Passthrough -> RBAC
+  -> Client Rate Limit -> Alias -> Filter -> Validation -> Coalesce -> Cache
+  -> Mirror -> Inject Args -> Discover -> MetaValidation -> McpProxy
+
+Per-backend (applied individually):
+  Retry -> Hedge -> Concurrency -> Rate Limit
+  -> Timeout -> Circuit Breaker -> Outlier Detection -> Backend
+
+Per-endpoint-group (on top of shared McpProxy):
+  GroupFilter -> [group-level middleware] -> GroupRouter
 ```
 
-Global middleware wraps the entire proxy. Per-backend middleware is applied individually to each backend connection. All middleware is built with tower `Service` layers.
+Global middleware wraps the entire proxy. Per-backend middleware is applied individually to each backend connection. Endpoint group middleware adds a namespace filter so each group only sees its member backends' tools. All middleware is built with tower `Service` layers.
 
 ## Feature Flags
 

@@ -1073,6 +1073,11 @@ fn make_proxy_config(protocol_versions: Vec<&str>) -> ProxyConfig {
             endpoint_groups: vec![],
             tool_groups: vec![],
             watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
             protocol_support: ProtocolSupportConfig {
                 versions: protocol_versions.into_iter().map(String::from).collect(),
                 default_protocol_version: None,

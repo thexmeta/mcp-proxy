@@ -3,19 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use tokio::process::Command;
-use tower::timeout::TimeoutLayer;
 use tower::util::BoxCloneService;
 use tower_mcp::SessionHandle;
-use tower_mcp::client::StdioClientTransport;
 use tower_mcp::proxy::McpProxy;
 use tower_mcp::{RouterRequest, RouterResponse};
 
-use crate::config::{BackendConfig, EndpointGroupConfig, ProxyConfig, TransportType};
+use crate::config::{BackendConfig, EndpointGroupConfig, ProxyConfig};
 
 /// Shared registry for endpoint groups that supports hot reload.
 /// This allows dynamic addition/removal/update of endpoint groups without restarting the proxy.
@@ -78,256 +74,34 @@ pub struct EndpointGroupRouter {
     pub inner: McpProxy,
 }
 
-/// Build an McpProxy for a specific set of backend configurations.
-/// This is a variant of `build_mcp_proxy` that takes a pre-filtered list of backends.
-async fn build_mcp_proxy_for_backends(
-    proxy_name: &str,
-    proxy_version: &str,
-    separator: &str,
-    proxy_instructions: Option<&String>,
-    backends: &[&crate::config::BackendConfig],
-) -> Result<(McpProxy, HashMap<String, crate::proxy::CbHandle>)> {
-    let mut builder = McpProxy::builder(proxy_name, proxy_version).separator(separator);
-    let cb_handles: HashMap<String, crate::proxy::CbHandle> = HashMap::new();
-
-    if let Some(instructions) = proxy_instructions {
-        builder = builder.instructions(instructions);
-    }
-
-    // Create shared outlier detector if any backend has outlier_detection configured.
-    let outlier_detector = {
-        let max_pct = backends
-            .iter()
-            .filter_map(|b| b.outlier_detection.as_ref())
-            .map(|od| od.max_ejection_percent)
-            .max();
-        max_pct.map(crate::outlier::OutlierDetector::new)
-    };
-
-    for backend in backends {
-        // Skip disabled backends
-        if !backend.enabled {
-            tracing::info!(name = %backend.name, "Skipping disabled backend");
-            continue;
-        }
-
-        tracing::info!(name = %backend.name, transport = ?backend.transport, "Adding backend to endpoint group");
-
-        match backend.transport {
-            TransportType::Stdio => {
-                let command = backend.command.as_deref().unwrap();
-                let args: Vec<&str> = backend.args.iter().map(|s| s.as_str()).collect();
-
-                let mut cmd = Command::new(command);
-                cmd.args(&args);
-
-                for (key, value) in &backend.env {
-                    cmd.env(key, value);
-                }
-
-                if let Some(ref working_dir) = backend.working_dir {
-                    cmd.current_dir(working_dir);
-                }
-
-                let transport = StdioClientTransport::spawn_command(&mut cmd)
-                    .await
-                    .with_context(|| format!("spawning backend '{}'", backend.name))?;
-
-                builder = builder.backend(&backend.name, transport).await;
-            }
-            TransportType::Http => {
-                let url = backend.url.as_deref().unwrap();
-                let mut transport = tower_mcp::client::HttpClientTransport::new(url);
-                if let Some(token) = &backend.bearer_token {
-                    transport = transport.bearer_token(token);
-                }
-
-                builder = builder.backend(&backend.name, transport).await;
-            }
-            #[cfg(feature = "websocket")]
-            TransportType::Websocket => {
-                let url = backend.url.as_deref().unwrap();
-                tracing::info!(url = %url, "Connecting to WebSocket backend");
-                let transport = if let Some(token) = &backend.bearer_token {
-                    crate::ws_transport::WebSocketClientTransport::connect_with_bearer_token(
-                        url,
-                        token,
-                        backend.protocol_version.as_deref(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("connecting to WebSocket backend '{}'", backend.name)
-                    })?
-                } else {
-                    crate::ws_transport::WebSocketClientTransport::connect_with_protocol_version(
-                        url,
-                        backend.protocol_version.as_deref(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("connecting to WebSocket backend '{}'", backend.name)
-                    })?
-                };
-
-                builder = builder.backend(&backend.name, transport).await;
-            }
-            #[cfg(not(feature = "websocket"))]
-            TransportType::Websocket => {
-                anyhow::bail!(
-                    "WebSocket transport requires the 'websocket' feature. \
-                     Rebuild with: cargo install mcp-proxy --features websocket"
-                );
-            }
-        }
-
-        // Per-backend middleware stack (applied in order: inner -> outer)
-        builder = apply_backend_middleware(builder, backend, &outlier_detector);
-    }
-
-    let result = builder.build().await?;
-
-    if !result.skipped.is_empty() {
-        for s in &result.skipped {
-            tracing::warn!("Skipped backend: {s}");
-        }
-    }
-
-    Ok((result.proxy, cb_handles))
-}
-
-/// Apply per-backend middleware layers to the builder.
-fn apply_backend_middleware(
-    mut builder: tower_mcp::proxy::McpProxyBuilder,
-    backend: &crate::config::BackendConfig,
-    outlier_detector: &Option<crate::outlier::OutlierDetector>,
-) -> tower_mcp::proxy::McpProxyBuilder {
-    // Retry (innermost -- retries happen before other middleware)
-    if let Some(retry_cfg) = &backend.retry {
-        tracing::info!(
-            backend = %backend.name,
-            max_retries = retry_cfg.max_retries,
-            initial_backoff_ms = retry_cfg.initial_backoff_ms,
-            max_backoff_ms = retry_cfg.max_backoff_ms,
-            "Applying retry policy"
-        );
-        let layer = crate::retry::build_retry_layer(retry_cfg, &backend.name);
-        builder = builder.backend_layer(layer);
-    }
-
-    // Hedging (after retry, before concurrency -- hedges are separate requests)
-    if let Some(hedge_cfg) = &backend.hedging {
-        let delay = Duration::from_millis(hedge_cfg.delay_ms);
-        let max_attempts = hedge_cfg.max_hedges + 1; // +1 for the primary request
-        tracing::info!(
-            backend = %backend.name,
-            delay_ms = hedge_cfg.delay_ms,
-            max_hedges = hedge_cfg.max_hedges,
-            "Applying request hedging"
-        );
-        let layer = if delay.is_zero() {
-            tower_resilience::hedge::HedgeLayer::builder()
-                .no_delay()
-                .max_hedged_attempts(max_attempts)
-                .name(format!("{}-hedge", backend.name))
-                .build()
-        } else {
-            tower_resilience::hedge::HedgeLayer::builder()
-                .delay(delay)
-                .max_hedged_attempts(max_attempts)
-                .name(format!("{}-hedge", backend.name))
-                .build()
-        };
-        builder = builder.backend_layer(layer);
-    }
-
-    // Concurrency limit
-    if let Some(cc) = &backend.concurrency {
-        tracing::info!(
-            backend = %backend.name,
-            max = cc.max_concurrent,
-            "Applying concurrency limit"
-        );
-        builder =
-            builder.backend_layer(tower::limit::ConcurrencyLimitLayer::new(cc.max_concurrent));
-    }
-
-    // Rate limit
-    if let Some(rl) = &backend.rate_limit {
-        tracing::info!(
-            backend = %backend.name,
-            requests = rl.requests,
-            period_seconds = rl.period_seconds,
-            "Applying rate limit"
-        );
-        let layer = tower_resilience::ratelimiter::RateLimiterLayer::builder()
-            .limit_for_period(rl.requests)
-            .refresh_period(Duration::from_secs(rl.period_seconds))
-            .name(format!("{}-ratelimit", backend.name))
-            .build();
-        builder = builder.backend_layer(layer);
-    }
-
-    // Timeout
-    if let Some(timeout) = &backend.timeout {
-        tracing::info!(
-            backend = %backend.name,
-            seconds = timeout.seconds,
-            "Applying timeout"
-        );
-        builder = builder.backend_layer(TimeoutLayer::new(Duration::from_secs(timeout.seconds)));
-    }
-
-    // Circuit breaker
-    if let Some(cb) = &backend.circuit_breaker {
-        tracing::info!(
-            backend = %backend.name,
-            failure_rate = cb.failure_rate_threshold,
-            wait_seconds = cb.wait_duration_seconds,
-            "Applying circuit breaker"
-        );
-        let (layer, _handle) = tower_resilience::circuitbreaker::CircuitBreakerLayer::builder()
-            .failure_rate_threshold(cb.failure_rate_threshold)
-            .minimum_number_of_calls(cb.minimum_calls)
-            .wait_duration_in_open(Duration::from_secs(cb.wait_duration_seconds))
-            .permitted_calls_in_half_open(cb.permitted_calls_in_half_open)
-            .name(format!("{}-cb", backend.name))
-            .build_with_handle();
-        // Note: cb_handles not tracked here for endpoint groups - could be added if needed
-        builder = builder.backend_layer(layer);
-    }
-
-    // Outlier detection (outermost -- observes errors after all other middleware)
-    if let Some(od) = &backend.outlier_detection
-        && let Some(detector) = outlier_detector
-    {
-        tracing::info!(
-            backend = %backend.name,
-            consecutive_errors = od.consecutive_errors,
-            base_ejection_seconds = od.base_ejection_seconds,
-            max_ejection_percent = od.max_ejection_percent,
-            "Applying outlier detection"
-        );
-        let layer = crate::outlier::OutlierDetectionLayer::new(
-            backend.name.clone(),
-            od.clone(),
-            detector.clone(),
-        );
-        builder = builder.backend_layer(layer);
-    }
-
-    builder
-}
-
 /// Build the middleware stack around an McpProxy for an endpoint group.
 /// This mirrors `build_middleware_stack` but for a specific group's config.
+///
+/// When `group_namespaces` is `Some`, a [`GroupFilterService`] is inserted as
+/// the innermost layer so that only tools/resources/prompts from the group's
+/// member backends are visible. Per-backend capability filtering runs on top
+/// of this, applying finer-grained allow/deny rules within the allowed set.
 fn build_endpoint_group_middleware_stack(
     config: &ProxyConfig,
     group: &EndpointGroupConfig,
     proxy: McpProxy,
     group_backend_names: &HashSet<String>,
+    group_namespaces: Option<HashSet<String>>,
 ) -> Result<BoxCloneService<RouterRequest, RouterResponse, Infallible>> {
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
+
+    // Group filter (innermost): restrict to member backend namespaces
+    if let Some(namespaces) = group_namespaces
+        && !namespaces.is_empty()
+    {
+        tracing::info!(
+            namespaces = ?namespaces,
+            "Applying group namespace filter (endpoint group: {})",
+            group.name
+        );
+        service = BoxCloneService::new(crate::filter::GroupFilterService::new(service, namespaces));
+    }
 
     // Filter backends to only those in this group for middleware that needs backend-specific config
     let group_backends: Vec<_> = config
@@ -780,15 +554,19 @@ pub fn resolve_group_backends<'a>(
 
 /// Build endpoint group routers from the configuration.
 /// Returns a vector of EndpointGroupRouter and the set of backend names used in groups.
+///
+/// When `shared_proxy` is provided, each group reuses it (no duplicate process
+/// spawning). When `None`, each group builds its own McpProxy (legacy mode).
 pub async fn build_endpoint_group_routers(
     config: &ProxyConfig,
     registry: Option<&EndpointGroupRegistry>,
+    shared_proxy: Option<&McpProxy>,
 ) -> Result<(Vec<EndpointGroupRouter>, HashSet<String>)> {
     let mut endpoint_group_routers = Vec::new();
     let mut grouped_backend_names = HashSet::new();
 
     for group in &config.proxy.endpoint_groups {
-        let router = build_single_endpoint_group(config, group).await?;
+        let router = build_single_endpoint_group(config, group, shared_proxy).await?;
         endpoint_group_routers.push(router.clone());
         grouped_backend_names.extend(
             resolve_group_backends(&config.backends, &config.proxy.endpoint_groups, group)
@@ -807,9 +585,14 @@ pub async fn build_endpoint_group_routers(
 
 /// Build a single endpoint group router from configuration.
 /// This can be called for hot reload to rebuild individual groups.
+///
+/// When `shared_proxy` is provided, it is used directly (the group shares the
+/// proxy with all other groups — each backend was spawned exactly once). When
+/// `None`, a new McpProxy is built for this group only (legacy behavior).
 pub async fn build_single_endpoint_group(
     config: &ProxyConfig,
     group: &EndpointGroupConfig,
+    shared_proxy: Option<&McpProxy>,
 ) -> Result<EndpointGroupRouter> {
     // Validate path
     if !group.path.starts_with('/') {
@@ -831,25 +614,56 @@ pub async fn build_single_endpoint_group(
         anyhow::bail!("Endpoint group '{}' has no valid backends", group.name);
     }
 
-    // Build MCP proxy for this group
-    let proxy_name = format!("{}-{}", config.proxy.name, group.name);
-    let (mcp_proxy, _cb_handles) = build_mcp_proxy_for_backends(
-        &proxy_name,
-        &config.proxy.version,
-        &config.proxy.separator,
-        config.proxy.instructions.as_ref(),
-        &group_backends,
-    )
-    .await?;
+    // Use the shared McpProxy (all backends already spawned) or build a new one
+    let mcp_proxy = match shared_proxy {
+        Some(proxy) => {
+            tracing::info!(
+                group = %group.name,
+                "Using shared McpProxy (no duplicate process spawning)"
+            );
+            proxy.clone()
+        }
+        None => {
+            tracing::info!(
+                group = %group.name,
+                "Building dedicated McpProxy for endpoint group (legacy mode)"
+            );
+            let proxy_name = format!("{}-{}", config.proxy.name, group.name);
+            let (proxy, _cb_handles) = crate::proxy::build_mcp_proxy_for_backends(
+                &proxy_name,
+                &config.proxy.version,
+                &config.proxy.separator,
+                config.proxy.instructions.as_ref(),
+                &group_backends,
+            )
+            .await?;
+            proxy
+        }
+    };
 
     // Build middleware stack for this group
     let group_backend_names: HashSet<String> =
         group_backends.iter().map(|b| b.name.clone()).collect();
+
+    // When using a shared proxy, build namespace allowlist so the group only
+    // sees tools from its member backends. Legacy (dedicated) proxies already
+    // have only the relevant backends, so no group filter is needed.
+    let group_namespaces = if shared_proxy.is_some() {
+        let namespaces: HashSet<String> = group_backend_names
+            .iter()
+            .map(|name| format!("{}{}", name, config.proxy.separator))
+            .collect();
+        Some(namespaces)
+    } else {
+        None
+    };
+
     let service = build_endpoint_group_middleware_stack(
         config,
         group,
         mcp_proxy.clone(),
         &group_backend_names,
+        group_namespaces,
     )?;
 
     // Create HTTP router for this group
@@ -1085,6 +899,7 @@ async fn apply_auth(config: &ProxyConfig, router: Router) -> Result<Router> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TransportType;
 
     fn backend(name: &str, endpoint_groups: Vec<&str>) -> BackendConfig {
         BackendConfig {

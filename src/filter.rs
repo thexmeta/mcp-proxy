@@ -99,6 +99,7 @@
 //! to invoke them. Only `ListTools` responses are filtered; all other
 //! request types (including `CallTool`) pass through unchanged.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -329,6 +330,174 @@ fn check_prompt_denied(filters: &[BackendFilter], namespaced_name: &str) -> Opti
         }
     }
     None
+}
+
+/// Tower layer that produces a [`GroupFilterService`].
+///
+/// Restricts which backend namespaces are visible within an endpoint group.
+/// Only tools, resources, and prompts from the specified namespace prefixes
+/// are shown; everything else is hidden and blocked.
+///
+/// This is used when a shared `McpProxy` is cloned for an endpoint group:
+/// the group filter wraps the clone so that only its member backends'
+/// capabilities are exposed.
+#[derive(Clone)]
+pub struct GroupFilterLayer {
+    allowed_namespaces: HashSet<String>,
+}
+
+impl GroupFilterLayer {
+    /// Create a new group filter layer that only allows the specified namespaces.
+    ///
+    /// Each namespace should include the separator suffix (e.g., `"fs/"`).
+    pub fn new(allowed_namespaces: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            allowed_namespaces: allowed_namespaces.into_iter().collect(),
+        }
+    }
+}
+
+impl<S> Layer<S> for GroupFilterLayer {
+    type Service = GroupFilterService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GroupFilterService::new(inner, self.allowed_namespaces.clone())
+    }
+}
+
+/// Middleware that restricts capabilities to specific backend namespaces.
+///
+/// Only tools, resources, and prompts whose namespaced prefix is in the
+/// allowed set are visible. Items from other backends are stripped from
+/// list responses and blocked on call/read/get requests.
+///
+/// This middleware should be applied **before** [`CapabilityFilterService`]
+/// (outermost in the stack) so that the group filter operates on the full
+/// set of capabilities, and per-backend filtering runs on the already-scoped
+/// result.
+#[derive(Clone)]
+pub struct GroupFilterService<S> {
+    inner: S,
+    allowed_namespaces: Arc<HashSet<String>>,
+}
+
+impl<S> GroupFilterService<S> {
+    /// Create a new group filter service.
+    pub fn new(inner: S, allowed_namespaces: HashSet<String>) -> Self {
+        Self {
+            inner,
+            allowed_namespaces: Arc::new(allowed_namespaces),
+        }
+    }
+}
+
+impl<S> Service<RouterRequest> for GroupFilterService<S>
+where
+    S: Service<RouterRequest, Response = RouterResponse, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    type Response = RouterResponse;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<RouterResponse, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: RouterRequest) -> Self::Future {
+        let namespaces = Arc::clone(&self.allowed_namespaces);
+        let request_id = req.id.clone();
+
+        // Check for blocked call/read/get before passing to inner service.
+        // Extract the name/uri early so we don't borrow req.inner across the call.
+        let blocked = match &req.inner {
+            McpRequest::CallTool(params) => {
+                if !is_in_allowed_namespace(&namespaces, &params.name) {
+                    Some(format!(
+                        "Tool not available in this endpoint group: {}",
+                        params.name
+                    ))
+                } else {
+                    None
+                }
+            }
+            McpRequest::ReadResource(params) => {
+                if !is_in_allowed_namespace(&namespaces, &params.uri) {
+                    Some(format!(
+                        "Resource not available in this endpoint group: {}",
+                        params.uri
+                    ))
+                } else {
+                    None
+                }
+            }
+            McpRequest::GetPrompt(params) => {
+                if !is_in_allowed_namespace(&namespaces, &params.name) {
+                    Some(format!(
+                        "Prompt not available in this endpoint group: {}",
+                        params.name
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(reason) = blocked {
+            return Box::pin(async move {
+                Ok(RouterResponse {
+                    id: request_id,
+                    inner: Err(JsonRpcError::invalid_params(reason)),
+                })
+            });
+        }
+
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            let mut resp = fut.await?;
+
+            // Filter list responses to only show allowed namespaces
+            if let Ok(ref mut mcp_resp) = resp.inner {
+                match mcp_resp {
+                    McpResponse::ListTools(result) => {
+                        result
+                            .tools
+                            .retain(|tool| is_in_allowed_namespace(&namespaces, &tool.name));
+                    }
+                    McpResponse::ListResources(result) => {
+                        result
+                            .resources
+                            .retain(|r| is_in_allowed_namespace(&namespaces, &r.uri));
+                    }
+                    McpResponse::ListResourceTemplates(result) => {
+                        result
+                            .resource_templates
+                            .retain(|t| is_in_allowed_namespace(&namespaces, &t.uri_template));
+                    }
+                    McpResponse::ListPrompts(result) => {
+                        result
+                            .prompts
+                            .retain(|p| is_in_allowed_namespace(&namespaces, &p.name));
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(resp)
+        })
+    }
+}
+
+/// Check if a namespaced name starts with any of the allowed namespaces.
+fn is_in_allowed_namespace(namespaces: &HashSet<String>, namespaced_name: &str) -> bool {
+    namespaces
+        .iter()
+        .any(|ns| namespaced_name.starts_with(ns.as_str()))
 }
 
 /// Tower layer that produces a [`SearchModeFilterService`].
@@ -747,6 +916,131 @@ mod tests {
         match resp.inner.unwrap() {
             McpResponse::ListTools(result) => {
                 assert!(result.tools.is_empty(), "no proxy/ tools means empty list");
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    // --- Group filter tests ---
+
+    use super::{GroupFilterLayer, GroupFilterService};
+    use std::collections::HashSet;
+
+    fn group_filter(svc: MockService, allowed: &[&str]) -> GroupFilterService<MockService> {
+        let namespaces: HashSet<String> = allowed.iter().map(|s| s.to_string()).collect();
+        GroupFilterService::new(svc, namespaces)
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_only_shows_member_namespaces() {
+        let mock = MockService::with_tools(&["fs/read", "fs/write", "db/query", "db/schema"]);
+        let mut svc = group_filter(mock, &["fs/"]);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names.len(), 2);
+                assert!(names.contains(&"fs/read"));
+                assert!(names.contains(&"fs/write"));
+                assert!(!names.contains(&"db/query"), "db/ tools should be hidden");
+                assert!(!names.contains(&"db/schema"), "db/ tools should be hidden");
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_multiple_namespaces() {
+        let mock = MockService::with_tools(&["fs/read", "db/query", "api/call", "ws/send"]);
+        let mut svc = group_filter(mock, &["fs/", "db/"]);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names.len(), 2);
+                assert!(names.contains(&"fs/read"));
+                assert!(names.contains(&"db/query"));
+                assert!(!names.contains(&"api/call"));
+                assert!(!names.contains(&"ws/send"));
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_blocks_call_for_non_member() {
+        let mock = MockService::with_tools(&["fs/read", "db/query"]);
+        let mut svc = group_filter(mock, &["fs/"]);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
+                name: "db/query".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        let err = resp.inner.unwrap_err();
+        assert!(
+            err.message.contains("not available in this endpoint group"),
+            "should deny non-member: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_allows_call_for_member() {
+        let mock = MockService::with_tools(&["fs/read", "db/query"]);
+        let mut svc = group_filter(mock, &["fs/"]);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
+                name: "fs/read".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        assert!(resp.inner.is_ok(), "member tool should be callable");
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_empty_namespaces_hides_all() {
+        let mock = MockService::with_tools(&["fs/read", "db/query"]);
+        let mut svc = group_filter(mock, &[]);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                assert!(result.tools.is_empty(), "no allowed namespaces = no tools");
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_filter_layer_wraps_service() {
+        let mock = MockService::with_tools(&["fs/read", "db/query"]);
+        let layer = GroupFilterLayer::new(vec!["fs/".to_string()]);
+        let mut svc = tower::ServiceBuilder::new().layer(layer).service(mock);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["fs/read"]);
             }
             other => panic!("expected ListTools, got: {:?}", other),
         }

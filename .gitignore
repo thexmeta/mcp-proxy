@@ -4,3 +4,5 @@ proxy*.toml
 !config.example.toml
 !examples/docker-compose/proxy.toml
 dist/
+.qartez/
+docs/plan/

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- **Shared backend pool**: each backend spawns exactly once regardless of how many endpoint groups reference it
+- Global backend environment variables via `[proxy.backend_env]` (merged into all stdio backends)
+- Global middleware defaults (`[proxy.timeout]`, `[proxy.circuit_breaker]`, `[proxy.retry]`) applied to all backends
+- Endpoint group shorthand syntax: `proxy.endpoint_group_list = ["os", "web"]`
+- Group-aware capability filtering (GroupFilterService) for endpoint group namespace isolation
+- 14 new integration tests for shared proxy, endpoint groups, and group filtering
 - MCP 2026-07-28 protocol support (stateless, per-request `_meta`, `server/discover`, `subscriptions/listen`)
 - Per-client-identity rate limiting based on `_meta.clientInfo.name`
 - `proxy/protocol_info` admin tool for dual-protocol introspection

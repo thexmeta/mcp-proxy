@@ -78,6 +78,59 @@ url = "http://mcp-server:8080"
 # # Or secure WebSocket:
 # # url = "wss://mcp.example.com/ws"
 # # bearer_token = "${WS_TOKEN}"
+# # Group membership (reverse reference -- alternative to listing in endpoint_groups)
+# endpoint_groups = ["web"]
+
+# =============================================================================
+# Global Backend Configuration
+# =============================================================================
+# These defaults apply to ALL backends. Per-backend values override them.
+
+# Global environment variables merged into every stdio backend process.
+# Per-backend [backends.env] values take precedence.
+# [proxy.backend_env]
+# LOG_LEVEL = "ERROR"
+# MCP_LOG_LEVEL = "ERROR"
+
+# Global timeout (per-backend [backends.timeout] overrides)
+# [proxy.timeout]
+# seconds = 30
+
+# Global circuit breaker (per-backend [backends.circuit_breaker] overrides)
+# [proxy.circuit_breaker]
+# failure_rate_threshold = 0.5
+# minimum_calls = 5
+# wait_duration_seconds = 30
+
+# Global retry policy (per-backend [backends.retry] overrides)
+# [proxy.retry]
+# max_retries = 3
+# initial_backoff_ms = 100
+# max_backoff_ms = 5000
+
+# =============================================================================
+# Endpoint Groups
+# =============================================================================
+# Create separate MCP endpoints at {path}/mcp exposing subsets of backends.
+# Each backend is spawned exactly once -- groups share the same process pool.
+#
+# Shorthand: auto-create groups at /{name}/mcp with all enabled backends.
+# proxy.endpoint_group_list = ["search", "coding"]
+#
+# Detailed: declare groups explicitly.
+# [[proxy.endpoint_groups]]
+# name = "search"
+# path = "/search"
+# backends = ["context7", "tavily"]
+# description = "Unified search tools"
+# tool_discovery = true
+#
+# Backends can also reference groups via endpoint_groups field (reverse reference):
+# [[backends]]
+# name = "context7"
+# transport = "http"
+# url = "http://localhost:3001/mcp"
+# endpoint_groups = ["search", "coding"]
 
 # =============================================================================
 # Per-Backend Middleware

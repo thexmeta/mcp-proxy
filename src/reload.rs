@@ -146,6 +146,7 @@ fn build_watcher(config: &WatcherConfig) -> Box<dyn ConfigWatcher> {
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     proxy: McpProxy,
+    shared_proxy: McpProxy,
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
@@ -157,6 +158,7 @@ pub fn spawn_config_watcher(
         watch_loop(
             config_path,
             proxy,
+            shared_proxy,
             endpoint_group_registry,
             watchers,
             #[cfg(feature = "discovery")]
@@ -169,6 +171,7 @@ pub fn spawn_config_watcher(
 async fn watch_loop(
     config_path: PathBuf,
     proxy: McpProxy,
+    shared_proxy: McpProxy,
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
@@ -414,6 +417,7 @@ async fn watch_loop(
                     // Rebuild the endpoint group
                     if let Err(e) = rebuild_endpoint_group(
                         &endpoint_group_registry,
+                        &shared_proxy,
                         &new_config,
                         endpoint_group,
                     )
@@ -438,8 +442,13 @@ async fn watch_loop(
                 "Adding new endpoint group via hot reload"
             );
 
-            if let Err(e) =
-                build_endpoint_group(&endpoint_group_registry, &new_config, endpoint_group).await
+            if let Err(e) = build_endpoint_group(
+                &endpoint_group_registry,
+                &shared_proxy,
+                &new_config,
+                endpoint_group,
+            )
+            .await
             {
                 tracing::error!(
                     endpoint_group = %endpoint_group.name,
@@ -601,12 +610,17 @@ fn strip_nulls(val: &serde_json::Value) -> serde_json::Value {
 /// Build and register an endpoint group MCP proxy and router.
 async fn build_endpoint_group(
     registry: &EndpointGroupRegistry,
+    shared_proxy: &McpProxy,
     config: &ProxyConfig,
     endpoint_group: &crate::config::EndpointGroupConfig,
 ) -> anyhow::Result<()> {
-    // Use the existing build_single_endpoint_group function which handles everything
-    let group_router =
-        crate::endpoint_router::build_single_endpoint_group(config, endpoint_group).await?;
+    // Use the shared McpProxy — no duplicate process spawning.
+    let group_router = crate::endpoint_router::build_single_endpoint_group(
+        config,
+        endpoint_group,
+        Some(shared_proxy),
+    )
+    .await?;
 
     // Register the endpoint group
     registry.insert(group_router);
@@ -617,14 +631,15 @@ async fn build_endpoint_group(
 /// Rebuild an existing endpoint group (replace with new config).
 async fn rebuild_endpoint_group(
     registry: &EndpointGroupRegistry,
+    shared_proxy: &McpProxy,
     config: &ProxyConfig,
     endpoint_group: &crate::config::EndpointGroupConfig,
 ) -> anyhow::Result<()> {
     // Remove the old endpoint group first
     registry.remove(&endpoint_group.name);
 
-    // Build and register the new one
-    build_endpoint_group(registry, config, endpoint_group).await
+    // Build and register the new one using the shared proxy
+    build_endpoint_group(registry, shared_proxy, config, endpoint_group).await
 }
 
 /// Connect and add a single backend to the proxy, including per-backend middleware.

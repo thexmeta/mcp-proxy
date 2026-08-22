@@ -259,6 +259,100 @@ pub struct ProxyConfig {
     pub source_path: Option<std::path::PathBuf>,
 }
 
+impl ProxyConfig {
+    /// Expand shorthand `endpoint_group_list` entries into full `EndpointGroupConfig` structs.
+    ///
+    /// Each string entry becomes an endpoint group with:
+    /// - `name` = the entry string
+    /// - `path` = `/{entry}`
+    /// - `backends` = all enabled backend names
+    ///
+    /// Explicit `[[proxy.endpoint_groups]]` entries with the same name override
+    /// the shorthand-generated ones. A warning is logged for each override.
+    pub fn expand_endpoint_group_list(&mut self) {
+        if self.proxy.endpoint_group_list.is_empty() {
+            return;
+        }
+
+        let all_backend_names: Vec<String> = self
+            .backends
+            .iter()
+            .filter(|b| b.enabled)
+            .map(|b| b.name.clone())
+            .collect();
+
+        let existing_names: HashSet<String> = self
+            .proxy
+            .endpoint_groups
+            .iter()
+            .map(|g| g.name.clone())
+            .collect();
+
+        for entry in &self.proxy.endpoint_group_list {
+            if existing_names.contains(entry.as_str()) {
+                tracing::warn!(
+                    endpoint_group = %entry,
+                    "endpoint_group_list entry '{}' overridden by explicit [[proxy.endpoint_groups]]",
+                    entry
+                );
+                continue;
+            }
+
+            let group = EndpointGroupConfig {
+                name: entry.clone(),
+                path: format!("/{entry}"),
+                backends: all_backend_names.clone(),
+                tools: Vec::new(),
+                description: Some("Auto-generated endpoint group from shorthand".to_string()),
+                tool_discovery: false,
+            };
+
+            tracing::info!(
+                endpoint_group = %entry,
+                path = %group.path,
+                backends = ?group.backends,
+                "Expanding endpoint_group_list shorthand into endpoint group"
+            );
+
+            self.proxy.endpoint_groups.push(group);
+        }
+    }
+
+    /// Merge global proxy-level middleware defaults into per-backend configs.
+    ///
+    /// For each backend, if a per-backend field is `None`, the global default
+    /// from `[proxy]` is applied. Per-backend values always take precedence.
+    ///
+    /// Also merges `[proxy.backend_env]` into each backend's `env` map
+    /// (per-backend env vars override global ones).
+    pub fn apply_global_defaults(&mut self) {
+        for backend in &mut self.backends {
+            // Merge global env vars (per-backend takes precedence)
+            for (key, value) in &self.proxy.backend_env {
+                backend
+                    .env
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+
+            // Global timeout (per-backend overrides)
+            if backend.timeout.is_none() {
+                backend.timeout = self.proxy.timeout.clone();
+            }
+
+            // Global circuit breaker (per-backend overrides)
+            if backend.circuit_breaker.is_none() {
+                backend.circuit_breaker = self.proxy.circuit_breaker.clone();
+            }
+
+            // Global retry (per-backend overrides)
+            if backend.retry.is_none() {
+                backend.retry = self.proxy.retry.clone();
+            }
+        }
+    }
+}
+
 /// Fan-out strategy for composite tools.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -431,6 +525,40 @@ pub struct ProxySettings {
     /// Groups organize tools under a common prefix in ListTools responses.
     #[serde(default)]
     pub tool_groups: Vec<ToolGroupConfig>,
+
+    /// Global environment variables passed to ALL stdio backend processes.
+    /// Per-backend `[backends.env]` values take precedence over these.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [proxy.backend_env]
+    /// LOG_LEVEL = "ERROR"
+    /// MCP_LOG_LEVEL = "ERROR"
+    /// ```
+    #[serde(default)]
+    pub backend_env: HashMap<String, String>,
+
+    /// Global timeout applied to ALL backends. Per-backend `[backends.timeout]`
+    /// overrides this for that specific backend.
+    #[serde(default)]
+    pub timeout: Option<TimeoutConfig>,
+
+    /// Global circuit breaker applied to ALL backends. Per-backend
+    /// `[backends.circuit_breaker]` overrides this for that specific backend.
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+
+    /// Global retry policy applied to ALL backends. Per-backend
+    /// `[backends.retry]` overrides this for that specific backend.
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+
+    /// Shorthand for endpoint groups: auto-creates groups at `/{name}/mcp`.
+    /// Each entry creates an endpoint group with all enabled backends visible.
+    /// Detailed `[[proxy.endpoint_groups]]` entries override these by name.
+    #[serde(default)]
+    pub endpoint_group_list: Vec<String>,
 
     /// File watcher configuration for hot reload. Tried in order until one works.
     /// Default: [Inotify, Mtime { interval_seconds: 30 }, Signal]
@@ -1578,6 +1706,7 @@ impl ProxyConfig {
         }
 
         config.source_path = Some(path.to_path_buf());
+        config.expand_endpoint_group_list();
         config.validate()?;
         Ok(config)
     }
@@ -1610,7 +1739,7 @@ impl ProxyConfig {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "mcp-proxy".to_string());
 
-        let config = Self {
+        let mut config = Self {
             proxy: ProxySettings {
                 name,
                 version: default_version(),
@@ -1630,6 +1759,11 @@ impl ProxyConfig {
                 expose_grouped_in_default: true,
                 endpoint_groups: Vec::new(),
                 tool_groups: Vec::new(),
+                backend_env: std::collections::HashMap::new(),
+                timeout: None,
+                circuit_breaker: None,
+                retry: None,
+                endpoint_group_list: Vec::new(),
                 watchers: default_watchers(),
                 protocol_support: ProtocolSupportConfig::default(),
             },
@@ -1643,6 +1777,7 @@ impl ProxyConfig {
             source_path: Some(path.to_path_buf()),
         };
 
+        config.expand_endpoint_group_list();
         config.validate()?;
         Ok(config)
     }
@@ -1669,7 +1804,8 @@ impl ProxyConfig {
     /// assert_eq!(config.backends.len(), 1);
     /// ```
     pub fn parse(toml: &str) -> Result<Self> {
-        let config: Self = toml::from_str(toml).context("parsing config")?;
+        let mut config: Self = toml::from_str(toml).context("parsing config")?;
+        config.expand_endpoint_group_list();
         config.validate()?;
         Ok(config)
     }
@@ -1697,7 +1833,8 @@ impl ProxyConfig {
     /// ```
     #[cfg(feature = "yaml")]
     pub fn parse_yaml(yaml: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml).context("parsing YAML config")?;
+        let mut config: Self = serde_yaml::from_str(yaml).context("parsing YAML config")?;
+        config.expand_endpoint_group_list();
         config.validate()?;
         Ok(config)
     }
@@ -3046,6 +3183,107 @@ mod tests {
         assert!(filter.tool_filter.allows("read"));
         assert!(!filter.tool_filter.allows("delete"));
         assert!(!filter.tool_filter.allows("write"));
+    }
+
+    // ========================================================================
+    // Endpoint group shorthand expansion
+    // ========================================================================
+
+    #[test]
+    fn test_endpoint_group_list_expands_to_groups() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        endpoint_group_list = ["os", "web"]
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+
+        [[backends]]
+        name = "browser"
+        transport = "http"
+        url = "http://localhost:9222"
+        "#;
+
+        let config = ProxyConfig::parse(toml).unwrap();
+        // Shorthand expansion should create 2 endpoint groups
+        assert_eq!(config.proxy.endpoint_groups.len(), 2);
+
+        let os_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "os")
+            .unwrap();
+        assert_eq!(os_group.path, "/os");
+        assert_eq!(os_group.backends, vec!["files", "browser"]);
+
+        let web_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "web")
+            .unwrap();
+        assert_eq!(web_group.path, "/web");
+        assert_eq!(web_group.backends, vec!["files", "browser"]);
+    }
+
+    #[test]
+    fn test_endpoint_group_list_merges_with_explicit_groups() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        endpoint_group_list = ["os", "web"]
+        [proxy.listen]
+
+        [[proxy.endpoint_groups]]
+        name = "os"
+        path = "/custom-os"
+        backends = ["files"]
+        description = "Custom OS group"
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+
+        [[backends]]
+        name = "browser"
+        transport = "http"
+        url = "http://localhost:9222"
+        "#;
+
+        let config = ProxyConfig::parse(toml).unwrap();
+        // Explicit "os" should override the shorthand "os"
+        let os_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "os")
+            .unwrap();
+        assert_eq!(os_group.path, "/custom-os");
+        assert_eq!(os_group.backends, vec!["files"]);
+        assert_eq!(os_group.description.as_deref(), Some("Custom OS group"));
+
+        // Shorthand "web" should still be present
+        let web_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "web")
+            .unwrap();
+        assert_eq!(web_group.path, "/web");
+        assert_eq!(web_group.backends, vec!["files", "browser"]);
+    }
+
+    #[test]
+    fn test_endpoint_group_list_empty_is_noop() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        assert!(config.proxy.endpoint_group_list.is_empty());
+        assert!(config.proxy.endpoint_groups.is_empty());
     }
 
     #[test]
