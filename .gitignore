@@ -4,5 +4,6 @@ proxy*.toml
 !config.example.toml
 !examples/docker-compose/proxy.toml
 dist/
+nfpm.generated.yaml
 .qartez/
 docs/plan/

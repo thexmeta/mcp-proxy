@@ -89,17 +89,18 @@ EOF
 
 chmod +x "${PROJECT_ROOT}/scripts/deb/"*.sh
 
-# Update nfpm.yaml with correct version from Cargo.toml
+# Extract version from Cargo.toml and generate nfpm.yaml from template
 VERSION=$(grep '^version = ' "${PROJECT_ROOT}/Cargo.toml" | head -1 | sed 's/version = "\(.*\)"/\1/')
+export VERSION
 echo "=== Package version: ${VERSION} ==="
 
-# Update nfpm.yaml version
-sed -i "s/^version: \".*\"/version: \"${VERSION}\"/" "${PROJECT_ROOT}/nfpm.yaml"
+# Generate nfpm.yaml from template (nfpm.yaml uses ${VERSION} placeholder)
+envsubst '${VERSION}' < "${PROJECT_ROOT}/nfpm.yaml" > "${PROJECT_ROOT}/nfpm.generated.yaml"
 
 # Build the Debian package using nfpm
 echo "=== Building Debian package with nfpm ==="
 cd "${PROJECT_ROOT}"
-nfpm package --packager deb --target "${DIST_DIR}"
+nfpm package --packager deb --target "${DIST_DIR}" --config nfpm.generated.yaml
 
 # Verify the package
 DEB_FILE=$(ls -1 "${DIST_DIR}"/*.deb 2>/dev/null | head -1)

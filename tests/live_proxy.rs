@@ -18,8 +18,8 @@ use tokio::net::TcpListener;
 
 use std::path::Path;
 
-use mcp_proxy::config::ProxyConfig;
 use mcp_proxy::Proxy;
+use mcp_proxy::config::ProxyConfig;
 
 // ---------------------------------------------------------------------------
 // Shared proxy (avoids spawning ~20 child processes per test)
@@ -200,11 +200,7 @@ fn live_config_disabled_backends_excluded() {
 #[test]
 fn live_config_hide_tools_populated() {
     let config = load_live_config();
-    let roslyn = config
-        .backends
-        .iter()
-        .find(|b| b.name == "roslyn")
-        .unwrap();
+    let roslyn = config.backends.iter().find(|b| b.name == "roslyn").unwrap();
     assert!(roslyn.hide_tools.len() >= 5, "roslyn should hide ≥5 tools");
 
     let codebase = config
@@ -218,25 +214,19 @@ fn live_config_hide_tools_populated() {
 #[test]
 fn live_config_rename_all_populated() {
     let config = load_live_config();
-    let roslyn = config
-        .backends
-        .iter()
-        .find(|b| b.name == "roslyn")
-        .unwrap();
-    assert!(!roslyn.rename_all.is_empty(), "roslyn should have rename_all");
+    let roslyn = config.backends.iter().find(|b| b.name == "roslyn").unwrap();
+    assert!(
+        !roslyn.rename_all.is_empty(),
+        "roslyn should have rename_all"
+    );
 
-    let qartez = config
-        .backends
-        .iter()
-        .find(|b| b.name == "qartez")
-        .unwrap();
-    assert!(!qartez.rename_all.is_empty(), "qartez should have rename_all");
+    let qartez = config.backends.iter().find(|b| b.name == "qartez").unwrap();
+    assert!(
+        !qartez.rename_all.is_empty(),
+        "qartez should have rename_all"
+    );
 
-    let lsp = config
-        .backends
-        .iter()
-        .find(|b| b.name == "lsp")
-        .unwrap();
+    let lsp = config.backends.iter().find(|b| b.name == "lsp").unwrap();
     assert!(!lsp.rename_all.is_empty(), "lsp should have rename_all");
 }
 
@@ -381,9 +371,7 @@ async fn health_endpoint_returns_200() {
 
     let body: Value = resp.json().await.expect("valid JSON");
     // HealthResponse uses "healthy" or "degraded", not "ok".
-    let status = body["status"]
-        .as_str()
-        .expect("status should be a string");
+    let status = body["status"].as_str().expect("status should be a string");
     assert!(
         status == "healthy" || status == "degraded",
         "expected 'healthy' or 'degraded', got: {status}"
@@ -589,7 +577,9 @@ async fn endpoint_group_shows_filtered_tools() {
     let has_group_routes = !config.proxy.endpoint_groups.is_empty();
 
     if !has_group_routes {
-        eprintln!("Skipping endpoint group filtering: no [[proxy.endpoint_groups]] routes configured");
+        eprintln!(
+            "Skipping endpoint group filtering: no [[proxy.endpoint_groups]] routes configured"
+        );
         // Verify that endpoint group tags exist on backends (info only)
         let tagged: Vec<&str> = config
             .backends
@@ -750,8 +740,10 @@ async fn endpoint_group_shows_filtered_tools() {
     // Group tools should all come from the group's backends.
     // We can verify this by checking that all group tool names start with
     // one of the group's backend name prefixes.
-    let group_tool_names: Vec<&str> =
-        group_tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    let group_tool_names: Vec<&str> = group_tools
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
 
     if !group_tool_names.is_empty() {
         eprintln!(
@@ -760,7 +752,6 @@ async fn endpoint_group_shows_filtered_tools() {
             &group_tool_names[..group_tool_names.len().min(5)]
         );
     }
-
 }
 
 #[tokio::test]
@@ -863,7 +854,10 @@ async fn disabled_backends_not_in_tools_list() {
     // Disabled backends: reasoning, nativedevtools, exa, langchain
     let disabled_prefixes = ["reasoning_", "nativedevtools_", "exa_", "langchain_"];
     for prefix in &disabled_prefixes {
-        let found: Vec<&&str> = tool_names.iter().filter(|n| n.starts_with(prefix)).collect();
+        let found: Vec<&&str> = tool_names
+            .iter()
+            .filter(|n| n.starts_with(prefix))
+            .collect();
         assert!(
             found.is_empty(),
             "disabled backend '{prefix}' should not have tools, but found: {found:?}"
@@ -906,7 +900,9 @@ async fn hidden_tools_not_in_tools_list() {
 
     // codebase hides "codebase_manage_adr" and "delete_project"
     assert!(
-        !tool_names.iter().any(|n| *n == "manage_adr" || *n == "delete_project"),
+        !tool_names
+            .iter()
+            .any(|n| *n == "manage_adr" || *n == "delete_project"),
         "hidden tools 'manage_adr'/'delete_project' should not appear"
     );
 }
@@ -991,7 +987,11 @@ async fn aliases_resolve_in_tools_list() {
         .filter(|n| n.starts_with("deepwiki_"))
         .collect();
     if !deepwiki_tools.is_empty() {
-        eprintln!("deepwiki has {} tools: {:?}", deepwiki_tools.len(), deepwiki_tools);
+        eprintln!(
+            "deepwiki has {} tools: {:?}",
+            deepwiki_tools.len(),
+            deepwiki_tools
+        );
     }
 }
 
@@ -1252,11 +1252,7 @@ async fn admin_backend_count_matches_config() {
 
     let config = load_live_config();
     // Admin API only reports enabled backends; config may have disabled ones.
-    let enabled_backends = config
-        .backends
-        .iter()
-        .filter(|b| b.enabled)
-        .count();
+    let enabled_backends = config.backends.iter().filter(|b| b.enabled).count();
 
     let resp = client
         .get(format!("http://{addr}/admin/backends"))
@@ -1278,7 +1274,8 @@ async fn admin_backend_count_matches_config() {
     assert!(
         admin_backends >= enabled_backends - 1 && admin_backends <= enabled_backends,
         "admin API should report ~{} enabled backends (±1), got {}",
-        enabled_backends, admin_backends
+        enabled_backends,
+        admin_backends
     );
 }
 
@@ -1300,4 +1297,151 @@ async fn admin_health_includes_backend_info() {
         body.get("status").is_some(),
         "health should have 'status' field"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint group scoping regression tests
+// ---------------------------------------------------------------------------
+
+/// Regression test: `/os/mcp` must only expose tools from the `os` group's
+/// member backends, NOT all backend tools.
+///
+/// Previously `/os/mcp` returned 283+ tools (nearly everything) instead of
+/// only the scoped tools from the group's backends.
+#[tokio::test]
+#[ignore]
+async fn os_endpoint_group_scopes_tools() {
+    let addr = shared_proxy_addr();
+    let client = reqwest::Client::new();
+
+    let config = load_live_config();
+
+    // Verify `os` group exists in config (confirms endpoint_group_list expansion)
+    assert!(
+        config.proxy.endpoint_groups.iter().any(|g| g.name == "os"),
+        "os group should be in expanded endpoint_groups"
+    );
+
+    // Count backends that directly declare endpoint_groups = ["os"]
+    let os_direct_backends: Vec<&str> = config
+        .backends
+        .iter()
+        .filter(|b| b.endpoint_groups.contains(&"os".to_string()))
+        .map(|b| b.name.as_str())
+        .collect();
+
+    assert!(
+        !os_direct_backends.is_empty(),
+        "os group should have at least one backend with endpoint_groups = [\"os\"]"
+    );
+    eprintln!("os direct backends: {os_direct_backends:?}");
+
+    // Send tools/list to /os/mcp (2026-07-28: stateless, no init needed)
+    let resp = client
+        .post(format!("http://{addr}/os/mcp"))
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body: Value = r.json().await.expect("valid JSON");
+            let tools = body
+                .get("result")
+                .and_then(|r| r.get("tools"))
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+            // Get all tools for comparison
+            let all_tools = list_all_tools(&client, addr).await;
+            let all_count = all_tools.len();
+
+            eprintln!(
+                "/os/mcp returned {} tools (default endpoint has {})",
+                tool_names.len(),
+                all_count
+            );
+
+            // Core assertion: /os/mcp must return significantly fewer tools
+            // than the default endpoint. The os group only has 2 backends (fs,
+            // term) with ~24 tools. If it returns >50% of total, scoping is
+            // completely broken and the GroupFilterService isn't working.
+            assert!(
+                tool_names.len() < all_count / 2,
+                "/os/mcp should only expose os-group tools, got {} out of {} total \
+                 — endpoint group scoping is broken (GroupFilterService not filtering)",
+                tool_names.len(),
+                all_count,
+            );
+
+            // Spot-check: fs and term tools must be present in the scoped set
+            let has_fs = tool_names.iter().any(|n| n.starts_with("fs_"));
+            let has_term = tool_names.iter().any(|n| n.starts_with("term_"));
+            assert!(has_fs, "/os/mcp should include fs_* tools");
+            assert!(has_term, "/os/mcp should include term_* tools");
+
+            // fs and term tools must NOT appear in unrelated groups
+            // (e.g. /search/mcp should not have fs_/term_ tools)
+            let search_resp = client
+                .post(format!("http://{addr}/search/mcp"))
+                .header("Content-Type", "application/json")
+                .body(
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                    }))
+                    .unwrap(),
+                )
+                .send()
+                .await;
+
+            if let Ok(r) = search_resp
+                && r.status().is_success()
+            {
+                let search_body: Value = r.json().await.expect("valid JSON");
+                let search_tools: Vec<&str> = search_body
+                    .get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(|t| t.as_array())
+                    .map(|arr| arr.iter().filter_map(|t| t["name"].as_str()).collect())
+                    .unwrap_or_default();
+
+                let leaked: Vec<&str> = search_tools
+                    .iter()
+                    .filter(|n| n.starts_with("fs_") || n.starts_with("term_"))
+                    .copied()
+                    .collect();
+
+                assert!(
+                    leaked.is_empty(),
+                    "/search/mcp leaked os-group tools: {leaked:?}"
+                );
+                eprintln!(
+                    "/search/mcp has {} tools, no fs_/term_ leakage",
+                    search_tools.len()
+                );
+            }
+
+            eprintln!(
+                "/os/mcp scoping OK: {} tools (vs {} total)",
+                tool_names.len(),
+                all_count
+            );
+        }
+        other => {
+            eprintln!("/os/mcp not available or error: {other:?}, skipping");
+        }
+    }
 }

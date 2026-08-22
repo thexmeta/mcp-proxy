@@ -274,13 +274,6 @@ impl ProxyConfig {
             return;
         }
 
-        let all_backend_names: Vec<String> = self
-            .backends
-            .iter()
-            .filter(|b| b.enabled)
-            .map(|b| b.name.clone())
-            .collect();
-
         let existing_names: HashSet<String> = self
             .proxy
             .endpoint_groups
@@ -301,7 +294,11 @@ impl ProxyConfig {
             let group = EndpointGroupConfig {
                 name: entry.clone(),
                 path: format!("/{entry}"),
-                backends: all_backend_names.clone(),
+                // Shorthand groups start with empty backends. Membership is
+                // determined by reverse references: backends that declare
+                // endpoint_groups = ["<group_name>"] in their config. This
+                // ensures GroupFilterService only allows the correct tools.
+                backends: Vec::new(),
                 tools: Vec::new(),
                 description: Some("Auto-generated endpoint group from shorthand".to_string()),
                 tool_discovery: false,
@@ -1471,12 +1468,16 @@ pub struct BackendFilter {
     pub read_only_only: bool,
 }
 
-/// A compiled pattern for name matching -- either a glob or a regex.
+/// A compiled pattern for name matching -- either a literal substring,
+/// a glob, or a regex.
 ///
 /// Constructed internally by [`NameFilter::allow_list`] and
 /// [`NameFilter::deny_list`].
 #[derive(Debug, Clone)]
 pub enum CompiledPattern {
+    /// A literal substring pattern (no wildcards, no `re:` prefix).
+    /// Matches via `str::contains` -- every occurrence is replaced.
+    Literal(String),
     /// A glob pattern (matched via `glob_match`).
     Glob(String),
     /// A pre-compiled regex pattern (from `re:` prefix).
@@ -1485,12 +1486,17 @@ pub enum CompiledPattern {
 
 impl CompiledPattern {
     /// Compile a pattern string. Patterns prefixed with `re:` are treated as
-    /// regular expressions; all others are treated as glob patterns.
+    /// regular expressions; plain strings without glob metacharacters (`*`, `?`)
+    /// are treated as literal substrings (match via `contains`); everything else
+    /// is a glob pattern.
     pub fn compile(pattern: &str) -> Result<Self> {
         if let Some(re_pat) = pattern.strip_prefix("re:") {
             let re = regex::Regex::new(re_pat)
                 .with_context(|| format!("invalid regex in filter pattern: {pattern}"))?;
             Ok(Self::Regex(re))
+        } else if !pattern.contains('*') && !pattern.contains('?') {
+            // Plain string with no glob metacharacters → literal substring match
+            Ok(Self::Literal(pattern.to_string()))
         } else {
             Ok(Self::Glob(pattern.to_string()))
         }
@@ -1499,6 +1505,7 @@ impl CompiledPattern {
     /// Check if this pattern matches the given name.
     pub fn matches(&self, name: &str) -> bool {
         match self {
+            Self::Literal(pat) => name.contains(pat.as_str()),
             Self::Glob(pat) => glob_match::glob_match(pat, name),
             Self::Regex(re) => re.is_match(name),
         }
@@ -3219,7 +3226,9 @@ mod tests {
             .find(|g| g.name == "os")
             .unwrap();
         assert_eq!(os_group.path, "/os");
-        assert_eq!(os_group.backends, vec!["files", "browser"]);
+        // Shorthand groups have empty backends — membership is via reverse
+        // references (backends with endpoint_groups = ["os"] in their config).
+        assert!(os_group.backends.is_empty());
 
         let web_group = config
             .proxy
@@ -3228,7 +3237,7 @@ mod tests {
             .find(|g| g.name == "web")
             .unwrap();
         assert_eq!(web_group.path, "/web");
-        assert_eq!(web_group.backends, vec!["files", "browser"]);
+        assert!(web_group.backends.is_empty());
     }
 
     #[test]
@@ -3268,7 +3277,7 @@ mod tests {
         assert_eq!(os_group.backends, vec!["files"]);
         assert_eq!(os_group.description.as_deref(), Some("Custom OS group"));
 
-        // Shorthand "web" should still be present
+        // Shorthand "web" should still be present (empty backends)
         let web_group = config
             .proxy
             .endpoint_groups
@@ -3276,7 +3285,7 @@ mod tests {
             .find(|g| g.name == "web")
             .unwrap();
         assert_eq!(web_group.path, "/web");
-        assert_eq!(web_group.backends, vec!["files", "browser"]);
+        assert!(web_group.backends.is_empty());
     }
 
     #[test]
@@ -4506,5 +4515,33 @@ backends:
         assert_eq!(config.backends[0].priority, 0);
         assert_eq!(config.backends[1].priority, 10);
         assert_eq!(config.backends[2].priority, 5);
+    }
+
+    #[test]
+    fn test_compiled_pattern_literal_variant() {
+        // Plain string without wildcards → Literal
+        let p = CompiledPattern::compile("-").unwrap();
+        assert!(matches!(p, CompiledPattern::Literal(_)));
+        assert!(p.matches("set-prop"));
+        assert!(p.matches("a-b-c"));
+        assert!(!p.matches("nodash"));
+    }
+
+    #[test]
+    fn test_compiled_pattern_glob_variant() {
+        // String with * → Glob
+        let p = CompiledPattern::compile("read_*").unwrap();
+        assert!(matches!(p, CompiledPattern::Glob(_)));
+        assert!(p.matches("read_file"));
+        assert!(!p.matches("write_file"));
+    }
+
+    #[test]
+    fn test_compiled_pattern_regex_variant() {
+        // String with re: prefix → Regex
+        let p = CompiledPattern::compile("re:^list_.*$").unwrap();
+        assert!(matches!(p, CompiledPattern::Regex(_)));
+        assert!(p.matches("list_users"));
+        assert!(!p.matches("get_users"));
     }
 }

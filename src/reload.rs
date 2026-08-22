@@ -149,6 +149,7 @@ pub fn spawn_config_watcher(
     shared_proxy: McpProxy,
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
+    alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         String,
@@ -161,6 +162,7 @@ pub fn spawn_config_watcher(
             shared_proxy,
             endpoint_group_registry,
             watchers,
+            alias_map,
             #[cfg(feature = "discovery")]
             discovery_index,
         )
@@ -174,6 +176,7 @@ async fn watch_loop(
     shared_proxy: McpProxy,
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
+    alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         String,
@@ -471,6 +474,26 @@ async fn watch_loop(
         // Update fingerprints to reflect current state
         backend_fingerprints = new_fingerprints;
         endpoint_group_fingerprints = new_eg_fingerprints;
+
+        // Rebuild the alias map when backends change.
+        // The global AliasService holds a shared Arc<RwLock<AliasMap>>,
+        // so updating the map via write lock immediately takes effect for
+        // all subsequent requests.
+        if backends_changed && let Some(ref shared_alias_map) = alias_map {
+            if let Some(new_map) = crate::proxy::build_alias_map(&new_config) {
+                let new_map = new_map.read().unwrap().clone();
+                let mut map = shared_alias_map.write().unwrap();
+                *map = new_map;
+                tracing::info!("Alias map updated after backend changes");
+            } else {
+                // No aliases configured — clear the map
+                let mut map = shared_alias_map.write().unwrap();
+                map.forward.clear();
+                map.reverse.clear();
+                map.forward_rules.clear();
+                tracing::info!("Alias map cleared (no aliases in updated config)");
+            }
+        }
 
         // Re-index discovery only when backends or endpoint groups actually changed
         #[cfg(feature = "discovery")]

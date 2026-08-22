@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -47,6 +48,10 @@ pub struct Proxy {
     shared_proxy: McpProxy,
     config: ProxyConfig,
     endpoint_group_registry: crate::endpoint_router::EndpointGroupRegistry,
+    /// Shared alias map for hot-reload support. When hot reload is enabled,
+    /// backends are added/removed dynamically and this map is updated so the
+    /// global AliasService picks up new aliases without a restart.
+    alias_map: Option<Arc<RwLock<crate::alias::AliasMap>>>,
     #[cfg(feature = "discovery")]
     discovery_index: Option<crate::discovery::SharedDiscoveryIndex>,
 }
@@ -438,7 +443,8 @@ impl Proxy {
         #[cfg(not(feature = "metrics"))]
         let metrics_handle = None;
 
-        let (service, cache_handle) = build_middleware_stack(&config, shared_proxy.clone())?;
+        let (service, cache_handle, alias_map) =
+            build_middleware_stack(&config, shared_proxy.clone())?;
 
         // Configure protocol version support for the HTTP transport
         let protocol_support = {
@@ -569,6 +575,7 @@ impl Proxy {
             shared_proxy,
             config,
             endpoint_group_registry,
+            alias_map,
             #[cfg(feature = "discovery")]
             discovery_index,
         })
@@ -610,6 +617,7 @@ impl Proxy {
             self.shared_proxy.clone(),
             self.endpoint_group_registry.clone(),
             watchers,
+            self.alias_map.clone(),
             #[cfg(feature = "discovery")]
             self.discovery_index
                 .as_ref()
@@ -679,16 +687,51 @@ fn oauth_scope_layer(
     Some(tower_mcp::oauth::ScopeEnforcementLayer::new(policy))
 }
 
-/// Build the MCP-level middleware stack around the proxy.
-fn build_middleware_stack(
-    config: &ProxyConfig,
-    proxy: McpProxy,
-) -> Result<(
+/// Build a shared alias map from all backends in the config.
+///
+/// Returns `None` if no aliases or rename rules are configured.
+pub(crate) fn build_alias_map(config: &ProxyConfig) -> Option<Arc<RwLock<crate::alias::AliasMap>>> {
+    let alias_mappings: Vec<_> = config
+        .backends
+        .iter()
+        .flat_map(|b| {
+            let ns = format!("{}{}", b.name, config.proxy.separator);
+            b.aliases
+                .iter()
+                .map(move |a| (ns.clone(), a.from.clone(), a.to.clone()))
+        })
+        .collect();
+
+    let rename_all_mappings: Vec<_> = config
+        .backends
+        .iter()
+        .flat_map(|b| {
+            let ns = format!("{}{}", b.name, config.proxy.separator);
+            b.rename_all
+                .iter()
+                .map(move |r| (ns.clone(), r.from.clone(), r.to.clone()))
+        })
+        .collect();
+
+    crate::alias::AliasMap::new(alias_mappings, rename_all_mappings)
+        .map(|m| Arc::new(RwLock::new(m)))
+}
+
+/// Return type for [`build_middleware_stack`].
+type MiddlewareStack = (
     BoxCloneService<RouterRequest, RouterResponse, Infallible>,
     Option<cache::CacheHandle>,
-)> {
+    Option<Arc<RwLock<crate::alias::AliasMap>>>,
+);
+
+/// Build the MCP-level middleware stack around the proxy.
+fn build_middleware_stack(config: &ProxyConfig, proxy: McpProxy) -> Result<MiddlewareStack> {
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
+
+    // Subscriptions/listen handler (innermost - intercepts before McpProxy for 2026-07-28)
+    tracing::info!("Applying SubscriptionsListen middleware");
+    service = BoxCloneService::new(crate::subscriptions::SubscriptionsListenLayer.layer(service));
 
     // Discover middleware (innermost - handles server/discover RPC for all transports)
     tracing::info!("Applying Discover middleware");
@@ -930,32 +973,18 @@ fn build_middleware_stack(
     }
 
     // Tool aliasing
-    let alias_mappings: Vec<_> = config
-        .backends
-        .iter()
-        .flat_map(|b| {
-            let ns = format!("{}{}", b.name, config.proxy.separator);
-            b.aliases
-                .iter()
-                .map(move |a| (ns.clone(), a.from.clone(), a.to.clone()))
-        })
-        .collect();
-
-    let rename_all_mappings: Vec<_> = config
-        .backends
-        .iter()
-        .flat_map(|b| {
-            let ns = format!("{}{}", b.name, config.proxy.separator);
-            b.rename_all
-                .iter()
-                .map(move |r| (ns.clone(), r.from.clone(), r.to.clone()))
-        })
-        .collect();
-
-    if let Some(alias_map) = alias::AliasMap::new(alias_mappings, rename_all_mappings) {
-        let count = alias_map.forward.len() + alias_map.forward_rules.len();
+    let alias_map = build_alias_map(config);
+    let alias_map_shared = alias_map.clone();
+    if let Some(ref am) = alias_map_shared {
+        let map = am.read().unwrap();
+        let count = map.forward.len() + map.forward_rules.len();
         tracing::info!(aliases = count, "Applying tool aliases");
-        service = BoxCloneService::new(alias::AliasService::new(service, alias_map));
+    }
+    if let Some(ref am) = alias_map_shared {
+        service = BoxCloneService::new(alias::AliasService::new_from_shared(
+            service,
+            Arc::clone(am),
+        ));
     }
 
     // Tool grouping (virtual tool namespaces)
@@ -1115,7 +1144,7 @@ fn build_middleware_stack(
         service = BoxCloneService::new(tower_mcp::CatchError::new(limited));
     }
 
-    Ok((service, cache_handle))
+    Ok((service, cache_handle, alias_map_shared))
 }
 
 /// Apply inbound authentication middleware to the router.

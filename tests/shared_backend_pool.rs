@@ -17,9 +17,7 @@ use serde::Deserialize;
 use tower::Service;
 
 use tower_mcp::client::ChannelTransport;
-use tower_mcp::protocol::{
-    CallToolParams, McpRequest, McpResponse, RequestId, ToolDefinition,
-};
+use tower_mcp::protocol::{CallToolParams, McpRequest, McpResponse, RequestId, ToolDefinition};
 use tower_mcp::proxy::McpProxy;
 use tower_mcp::router::{Extensions, RouterRequest, RouterResponse};
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
@@ -86,7 +84,10 @@ fn search_router() -> McpRouter {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn call(svc: &mut impl Service<RouterRequest, Response = RouterResponse, Error = Infallible>, request: McpRequest) -> RouterResponse {
+async fn call(
+    svc: &mut impl Service<RouterRequest, Response = RouterResponse, Error = Infallible>,
+    request: McpRequest,
+) -> RouterResponse {
     let req = RouterRequest {
         id: RequestId::Number(1),
         inner: request,
@@ -157,25 +158,57 @@ async fn test_single_process_per_backend() {
     // Group A should see math/ and text/ tools
     let resp_a = call(&mut group_a, McpRequest::ListTools(Default::default())).await;
     let tools_a = list_tools_names(resp_a);
-    assert!(tools_a.contains(&"math/add".to_string()), "group A should have math/add: {:?}", tools_a);
-    assert!(tools_a.contains(&"text/echo".to_string()), "group A should have text/echo: {:?}", tools_a);
-    assert!(!tools_a.iter().any(|t| t.starts_with("search/")), "group A should NOT have search tools: {:?}", tools_a);
+    assert!(
+        tools_a.contains(&"math/add".to_string()),
+        "group A should have math/add: {:?}",
+        tools_a
+    );
+    assert!(
+        tools_a.contains(&"text/echo".to_string()),
+        "group A should have text/echo: {:?}",
+        tools_a
+    );
+    assert!(
+        !tools_a.iter().any(|t| t.starts_with("search/")),
+        "group A should NOT have search tools: {:?}",
+        tools_a
+    );
 
     // Group B should see only search/ tools
     let resp_b = call(&mut group_b, McpRequest::ListTools(Default::default())).await;
     let tools_b = list_tools_names(resp_b);
-    assert!(tools_b.contains(&"search/web_search".to_string()), "group B should have search/web_search: {:?}", tools_b);
-    assert!(!tools_b.iter().any(|t| t.starts_with("math/")), "group B should NOT have math tools: {:?}", tools_b);
-    assert!(!tools_b.iter().any(|t| t.starts_with("text/")), "group B should NOT have text tools: {:?}", tools_b);
+    assert!(
+        tools_b.contains(&"search/web_search".to_string()),
+        "group B should have search/web_search: {:?}",
+        tools_b
+    );
+    assert!(
+        !tools_b.iter().any(|t| t.starts_with("math/")),
+        "group B should NOT have math tools: {:?}",
+        tools_b
+    );
+    assert!(
+        !tools_b.iter().any(|t| t.starts_with("text/")),
+        "group B should NOT have text tools: {:?}",
+        tools_b
+    );
 
     // Both groups can call tools — proving the shared proxy is functional
-    let resp_add = call(&mut group_a, tool_call("math/add", serde_json::json!({"a": 3, "b": 4}))).await;
+    let resp_add = call(
+        &mut group_a,
+        tool_call("math/add", serde_json::json!({"a": 3, "b": 4})),
+    )
+    .await;
     match resp_add.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "7"),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 
-    let resp_search = call(&mut group_b, tool_call("search/web_search", serde_json::json!({"message": "rust"}))).await;
+    let resp_search = call(
+        &mut group_b,
+        tool_call("search/web_search", serde_json::json!({"message": "rust"})),
+    )
+    .await;
     match resp_search.inner.unwrap() {
         McpResponse::CallTool(result) => assert!(result.all_text().contains("rust")),
         other => panic!("expected CallTool, got: {:?}", other),
@@ -200,18 +233,32 @@ async fn test_endpoint_group_filters_tools() {
     // Group "devtools" should see math and text tools
     let resp = call(&mut devtools, McpRequest::ListTools(Default::default())).await;
     let names = list_tools_names(resp);
-    assert_eq!(names.len(), 2, "devtools should have exactly 2 tools: {:?}", names);
+    assert_eq!(
+        names.len(),
+        2,
+        "devtools should have exactly 2 tools: {:?}",
+        names
+    );
     assert!(names.contains(&"math/add".to_string()));
     assert!(names.contains(&"text/echo".to_string()));
 
     // Group "research" should see only search tools
     let resp = call(&mut research, McpRequest::ListTools(Default::default())).await;
     let names = list_tools_names(resp);
-    assert_eq!(names.len(), 1, "research should have exactly 1 tool: {:?}", names);
+    assert_eq!(
+        names.len(),
+        1,
+        "research should have exactly 1 tool: {:?}",
+        names
+    );
     assert!(names.contains(&"search/web_search".to_string()));
 
     // Calling a tool outside the group's namespace is rejected
-    let resp = call(&mut devtools, tool_call("search/web_search", serde_json::json!({"message": "test"}))).await;
+    let resp = call(
+        &mut devtools,
+        tool_call("search/web_search", serde_json::json!({"message": "test"})),
+    )
+    .await;
     assert!(
         resp.inner.is_err(),
         "calling non-member tool should be rejected: {:?}",
@@ -241,16 +288,14 @@ async fn test_hot_reload_shares_proxy() {
     assert_eq!(list_tools_names(resp).len(), 3, "should start with 3 tools");
 
     // Dynamically add a "utils" backend to the shared proxy
-    let utils_router = McpRouter::new()
-        .server_info("utils-server", "1.0.0")
-        .tool(
-            ToolBuilder::new("timestamp")
-                .description("Get current timestamp")
-                .handler(|_: tower_mcp::NoParams| async move {
-                    Ok(CallToolResult::text("1234567890".to_string()))
-                })
-                .build(),
-        );
+    let utils_router = McpRouter::new().server_info("utils-server", "1.0.0").tool(
+        ToolBuilder::new("timestamp")
+            .description("Get current timestamp")
+            .handler(|_: tower_mcp::NoParams| async move {
+                Ok(CallToolResult::text("1234567890".to_string()))
+            })
+            .build(),
+    );
     let utils_transport = ChannelTransport::new(utils_router);
     shared
         .add_backend("utils", utils_transport)
@@ -258,28 +303,56 @@ async fn test_hot_reload_shares_proxy() {
         .expect("add utils backend via hot-reload");
 
     // Update group filters to include the new backend
-    let mut group_a = wrap_with_group_filter(shared.clone(), &["math/", "text/", "search/", "utils/"]);
-    let mut group_b = wrap_with_group_filter(shared.clone(), &["math/", "text/", "search/", "utils/"]);
+    let mut group_a =
+        wrap_with_group_filter(shared.clone(), &["math/", "text/", "search/", "utils/"]);
+    let mut group_b =
+        wrap_with_group_filter(shared.clone(), &["math/", "text/", "search/", "utils/"]);
 
     // Both groups should now see 4 tools (including utils/timestamp)
     let resp_a = call(&mut group_a, McpRequest::ListTools(Default::default())).await;
     let names_a = list_tools_names(resp_a);
-    assert_eq!(names_a.len(), 4, "group A should see 4 tools after hot-reload: {:?}", names_a);
-    assert!(names_a.contains(&"utils/timestamp".to_string()), "group A should see utils/timestamp: {:?}", names_a);
+    assert_eq!(
+        names_a.len(),
+        4,
+        "group A should see 4 tools after hot-reload: {:?}",
+        names_a
+    );
+    assert!(
+        names_a.contains(&"utils/timestamp".to_string()),
+        "group A should see utils/timestamp: {:?}",
+        names_a
+    );
 
     let resp_b = call(&mut group_b, McpRequest::ListTools(Default::default())).await;
     let names_b = list_tools_names(resp_b);
-    assert_eq!(names_b.len(), 4, "group B should see 4 tools after hot-reload: {:?}", names_b);
-    assert!(names_b.contains(&"utils/timestamp".to_string()), "group B should see utils/timestamp: {:?}", names_b);
+    assert_eq!(
+        names_b.len(),
+        4,
+        "group B should see 4 tools after hot-reload: {:?}",
+        names_b
+    );
+    assert!(
+        names_b.contains(&"utils/timestamp".to_string()),
+        "group B should see utils/timestamp: {:?}",
+        names_b
+    );
 
     // Both groups can call the new tool
-    let resp_a_call = call(&mut group_a, tool_call("utils/timestamp", serde_json::json!({}))).await;
+    let resp_a_call = call(
+        &mut group_a,
+        tool_call("utils/timestamp", serde_json::json!({})),
+    )
+    .await;
     match resp_a_call.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "1234567890"),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 
-    let resp_b_call = call(&mut group_b, tool_call("utils/timestamp", serde_json::json!({}))).await;
+    let resp_b_call = call(
+        &mut group_b,
+        tool_call("utils/timestamp", serde_json::json!({})),
+    )
+    .await;
     match resp_b_call.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "1234567890"),
         other => panic!("expected CallTool, got: {:?}", other),
@@ -303,34 +376,65 @@ async fn test_multiple_groups_share_backend() {
     let mut math_and_search = wrap_with_group_filter(shared.clone(), &["math/", "search/"]);
 
     // Both groups see math/add
-    let resp_math = call(&mut math_only, tool_call("math/add", serde_json::json!({"a": 10, "b": 20}))).await;
+    let resp_math = call(
+        &mut math_only,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
     match resp_math.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "30"),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 
-    let resp_shared = call(&mut math_and_search, tool_call("math/add", serde_json::json!({"a": 10, "b": 20}))).await;
+    let resp_shared = call(
+        &mut math_and_search,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
     match resp_shared.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "30"),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 
     // math-and-search can also call search, but math-only cannot
-    let resp_search = call(&mut math_and_search, tool_call("search/web_search", serde_json::json!({"message": "hello"}))).await;
+    let resp_search = call(
+        &mut math_and_search,
+        tool_call("search/web_search", serde_json::json!({"message": "hello"})),
+    )
+    .await;
     match resp_search.inner.unwrap() {
         McpResponse::CallTool(result) => assert!(result.all_text().contains("hello")),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 
-    let resp_denied = call(&mut math_only, tool_call("search/web_search", serde_json::json!({"message": "hello"}))).await;
-    assert!(resp_denied.inner.is_err(), "math-only group should not access search tools");
+    let resp_denied = call(
+        &mut math_only,
+        tool_call("search/web_search", serde_json::json!({"message": "hello"})),
+    )
+    .await;
+    assert!(
+        resp_denied.inner.is_err(),
+        "math-only group should not access search tools"
+    );
 
     // Verify ListTools counts are correct
     let resp = call(&mut math_only, McpRequest::ListTools(Default::default())).await;
-    assert_eq!(list_tools_names(resp).len(), 1, "math-only should have 1 tool");
+    assert_eq!(
+        list_tools_names(resp).len(),
+        1,
+        "math-only should have 1 tool"
+    );
 
-    let resp = call(&mut math_and_search, McpRequest::ListTools(Default::default())).await;
-    assert_eq!(list_tools_names(resp).len(), 2, "math-and-search should have 2 tools");
+    let resp = call(
+        &mut math_and_search,
+        McpRequest::ListTools(Default::default()),
+    )
+    .await;
+    assert_eq!(
+        list_tools_names(resp).len(),
+        2,
+        "math-and-search should have 2 tools"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -345,27 +449,19 @@ async fn test_per_group_middleware_canary() {
     use mcp_proxy::canary::CanaryService;
 
     // Build shared proxy with primary and canary backends
-    let primary_router = McpRouter::new()
-        .server_info("primary", "1.0.0")
-        .tool(
-            ToolBuilder::new("process")
-                .description("Process via primary")
-                .handler(|_: tower_mcp::NoParams| async move {
-                    Ok(CallToolResult::text("primary:ok"))
-                })
-                .build(),
-        );
+    let primary_router = McpRouter::new().server_info("primary", "1.0.0").tool(
+        ToolBuilder::new("process")
+            .description("Process via primary")
+            .handler(|_: tower_mcp::NoParams| async move { Ok(CallToolResult::text("primary:ok")) })
+            .build(),
+    );
 
-    let canary_router = McpRouter::new()
-        .server_info("canary", "1.0.0")
-        .tool(
-            ToolBuilder::new("process")
-                .description("Process via canary")
-                .handler(|_: tower_mcp::NoParams| async move {
-                    Ok(CallToolResult::text("canary:ok"))
-                })
-                .build(),
-        );
+    let canary_router = McpRouter::new().server_info("canary", "1.0.0").tool(
+        ToolBuilder::new("process")
+            .description("Process via canary")
+            .handler(|_: tower_mcp::NoParams| async move { Ok(CallToolResult::text("canary:ok")) })
+            .build(),
+    );
 
     let proxy = McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
@@ -397,7 +493,11 @@ async fn test_per_group_middleware_canary() {
     // and the canary middleware handles routing
 
     // Call api/process with 100% canary weight — should get canary response
-    let resp = call(&mut canary_svc, tool_call("api/process", serde_json::json!({}))).await;
+    let resp = call(
+        &mut canary_svc,
+        tool_call("api/process", serde_json::json!({})),
+    )
+    .await;
     match resp.inner.unwrap() {
         McpResponse::CallTool(result) => {
             assert_eq!(
@@ -417,10 +517,10 @@ async fn test_per_group_middleware_canary() {
 /// returns transport-level errors for the primary backend.
 #[tokio::test]
 async fn test_per_group_middleware_failover() {
+    use mcp_proxy::failover::FailoverService;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use mcp_proxy::failover::FailoverService;
     use tower_mcp::protocol::ListToolsResult;
 
     /// Mock service: returns Err for primary/backend tools, Ok for backup.
@@ -492,7 +592,11 @@ async fn test_per_group_middleware_failover() {
     let mut failover_svc = FailoverService::new(FailPrimaryMock, failover_mappings, "/");
 
     // Call api/process — primary returns Err, should fall over to backup
-    let resp = call(&mut failover_svc, tool_call("api/process", serde_json::json!({}))).await;
+    let resp = call(
+        &mut failover_svc,
+        tool_call("api/process", serde_json::json!({})),
+    )
+    .await;
     match resp.inner.unwrap() {
         McpResponse::CallTool(result) => {
             assert_eq!(
@@ -535,14 +639,28 @@ fn test_shorthand_endpoint_groups() {
     // Shorthand should create 2 endpoint groups
     assert_eq!(config.proxy.endpoint_groups.len(), 2);
 
-    let os_group = config.proxy.endpoint_groups.iter().find(|g| g.name == "os").unwrap();
+    let os_group = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .find(|g| g.name == "os")
+        .unwrap();
     assert_eq!(os_group.path, "/os");
-    assert_eq!(os_group.backends, vec!["files", "browser"]);
-    assert_eq!(os_group.description.as_deref(), Some("Auto-generated endpoint group from shorthand"));
+    // Shorthand groups have empty backends — membership is via reverse references
+    assert!(os_group.backends.is_empty());
+    assert_eq!(
+        os_group.description.as_deref(),
+        Some("Auto-generated endpoint group from shorthand")
+    );
 
-    let web_group = config.proxy.endpoint_groups.iter().find(|g| g.name == "web").unwrap();
+    let web_group = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .find(|g| g.name == "web")
+        .unwrap();
     assert_eq!(web_group.path, "/web");
-    assert_eq!(web_group.backends, vec!["files", "browser"]);
+    assert!(web_group.backends.is_empty());
 }
 
 /// Shorthand groups can be overridden by explicit endpoint_groups.
@@ -574,15 +692,25 @@ fn test_shorthand_endpoint_groups_override() {
     let config = ProxyConfig::parse(toml).unwrap();
 
     // "os" should be overridden by the explicit entry
-    let os_group = config.proxy.endpoint_groups.iter().find(|g| g.name == "os").unwrap();
+    let os_group = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .find(|g| g.name == "os")
+        .unwrap();
     assert_eq!(os_group.path, "/custom-os");
     assert_eq!(os_group.backends, vec!["files"]);
     assert_eq!(os_group.description.as_deref(), Some("Custom OS group"));
 
-    // "web" should be auto-generated from shorthand
-    let web_group = config.proxy.endpoint_groups.iter().find(|g| g.name == "web").unwrap();
+    // "web" should be auto-generated from shorthand (empty backends)
+    let web_group = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .find(|g| g.name == "web")
+        .unwrap();
     assert_eq!(web_group.path, "/web");
-    assert_eq!(web_group.backends, vec!["files", "browser"]);
+    assert!(web_group.backends.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +751,11 @@ fn test_global_backend_env() {
     assert_eq!(api_backend.env.get("SHARED_VAR").unwrap(), "global");
 
     // Per-backend should override global
-    assert_eq!(api_backend.env.get("LOG_LEVEL").unwrap(), "DEBUG", "per-backend env should override global");
+    assert_eq!(
+        api_backend.env.get("LOG_LEVEL").unwrap(),
+        "DEBUG",
+        "per-backend env should override global"
+    );
 
     // Per-backend-only vars should be preserved
     assert_eq!(api_backend.env.get("LOCAL_VAR").unwrap(), "local");
@@ -713,7 +845,11 @@ fn test_global_middleware_defaults_merged() {
 
     // fast backend should keep its own timeout (per-backend overrides)
     let fast = config.backends.iter().find(|b| b.name == "fast").unwrap();
-    assert_eq!(fast.timeout.as_ref().unwrap().seconds, 5, "per-backend timeout should override global");
+    assert_eq!(
+        fast.timeout.as_ref().unwrap().seconds,
+        5,
+        "per-backend timeout should override global"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +865,12 @@ async fn test_shared_proxy_no_filter_shows_all_tools() {
 
     let resp = call(&mut proxy, McpRequest::ListTools(Default::default())).await;
     let names = list_tools_names(resp);
-    assert_eq!(names.len(), 3, "unfiltered proxy should show all 3 tools: {:?}", names);
+    assert_eq!(
+        names.len(),
+        3,
+        "unfiltered proxy should show all 3 tools: {:?}",
+        names
+    );
     assert!(names.contains(&"math/add".to_string()));
     assert!(names.contains(&"text/echo".to_string()));
     assert!(names.contains(&"search/web_search".to_string()));
@@ -747,10 +888,18 @@ async fn test_group_filter_empty_namespaces_hides_all() {
 
     let resp = call(&mut empty_group, McpRequest::ListTools(Default::default())).await;
     let names = list_tools_names(resp);
-    assert!(names.is_empty(), "empty group should see no tools: {:?}", names);
+    assert!(
+        names.is_empty(),
+        "empty group should see no tools: {:?}",
+        names
+    );
 
     // Calling any tool should be rejected
-    let resp = call(&mut empty_group, tool_call("math/add", serde_json::json!({"a": 1, "b": 2}))).await;
+    let resp = call(
+        &mut empty_group,
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 2})),
+    )
+    .await;
     assert!(resp.inner.is_err(), "empty group should reject all calls");
 }
 
@@ -771,16 +920,14 @@ async fn test_shared_proxy_new_backend_invisible_without_filter_update() {
     assert_eq!(list_tools_names(resp).len(), 2, "should start with 2 tools");
 
     // Add a new "extra" backend to the shared proxy
-    let extra_router = McpRouter::new()
-        .server_info("extra", "1.0.0")
-        .tool(
-            ToolBuilder::new("ping")
-                .description("Ping")
-                .handler(|_: tower_mcp::NoParams| async move {
-                    Ok(CallToolResult::text("pong".to_string()))
-                })
-                .build(),
-        );
+    let extra_router = McpRouter::new().server_info("extra", "1.0.0").tool(
+        ToolBuilder::new("ping")
+            .description("Ping")
+            .handler(|_: tower_mcp::NoParams| async move {
+                Ok(CallToolResult::text("pong".to_string()))
+            })
+            .build(),
+    );
     shared
         .add_backend("extra", ChannelTransport::new(extra_router))
         .await
@@ -789,10 +936,22 @@ async fn test_shared_proxy_new_backend_invisible_without_filter_update() {
     // Group filter NOT updated — still only math/text
     let resp = call(&mut group, McpRequest::ListTools(Default::default())).await;
     let names = list_tools_names(resp);
-    assert_eq!(names.len(), 2, "group should still see only 2 tools: {:?}", names);
-    assert!(!names.iter().any(|t| t.starts_with("extra/")), "extra/ should be invisible: {:?}", names);
+    assert_eq!(
+        names.len(),
+        2,
+        "group should still see only 2 tools: {:?}",
+        names
+    );
+    assert!(
+        !names.iter().any(|t| t.starts_with("extra/")),
+        "extra/ should be invisible: {:?}",
+        names
+    );
 
     // Call extra/ping should fail (not in allowed namespaces)
     let resp = call(&mut group, tool_call("extra/ping", serde_json::json!({}))).await;
-    assert!(resp.inner.is_err(), "extra/ping should be rejected by group filter");
+    assert!(
+        resp.inner.is_err(),
+        "extra/ping should be rejected by group filter"
+    );
 }

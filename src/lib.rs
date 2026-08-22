@@ -195,6 +195,7 @@ pub mod reload;
 pub mod retry;
 #[cfg(feature = "skills")]
 pub mod skills;
+pub mod subscriptions;
 #[cfg(feature = "oauth")]
 pub mod token;
 pub mod tool_group;
