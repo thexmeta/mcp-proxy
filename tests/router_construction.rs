@@ -433,6 +433,234 @@ async fn test_multiple_endpoint_groups_coexist() {
     let _router = build_dynamic_endpoint_group_router(default_router, registry);
 }
 
+// ---------------------------------------------------------------------------
+// Test: Reverse-reference endpoint group membership (config-driven)
+// ---------------------------------------------------------------------------
+//
+// This is the test that catches the real-world bug class: a backend declares
+// `endpoint_groups = ["search"]` (reverse reference) and must be resolved into
+// the "search" endpoint group WITHOUT being explicitly listed in the group's
+// `backends` field. The shorthand `endpoint_group_list = ["search"]` expands to
+// a group with empty `backends`, so membership is entirely via reverse refs.
+//
+// It drives the REAL production endpoint-group code path:
+//   ProxyConfig::parse -> expand_endpoint_group_list (shorthand expansion)
+//   -> build_endpoint_group_routers (shared proxy + resolve_group_backends
+//      + GroupFilterService) -> build_dynamic_endpoint_group_router
+// and then probes the live HTTP endpoints to confirm the group serves the
+// correct member set (and only that set).
+//
+// NOTE: `expose_grouped_in_default` is parsed but not yet wired into the
+// default endpoint (a separate latent concern); this test focuses on group
+// membership via reverse references, which is the bug class that slipped
+// through previously. Backends are in-process `ChannelTransport` routers so no
+// external processes are spawned.
+
+/// Build a full proxy from a TOML config that uses `endpoint_group_list` +
+/// reverse references, drive the real `build_endpoint_group_routers` path with
+/// in-process backends, spawn it, and assert the group endpoint serves the
+/// complete member set (and only that set).
+#[tokio::test]
+async fn test_reverse_reference_group_membership_via_config() {
+    // `search_srv` declares endpoint_groups = ["search"] (reverse reference).
+    // `math` is a plain backend with no group. The shorthand
+    // `endpoint_group_list = ["search"]` expands to a group with empty
+    // `backends`, so `search_srv` must be resolved via its reverse reference.
+    let toml = r#"
+        [proxy]
+        name = "reverse-ref-proxy"
+        version = "1.0.0"
+        endpoint_group_list = ["search"]
+        expose_grouped_in_default = false
+        [proxy.listen]
+        port = 9091
+
+        [[backends]]
+        name = "search_srv"
+        transport = "stdio"
+        command = "echo"
+        endpoint_groups = ["search"]
+
+        [[backends]]
+        name = "math"
+        transport = "stdio"
+        command = "echo"
+    "#;
+
+    let config = mcp_proxy::ProxyConfig::parse(toml).expect("config should parse");
+
+    // The shorthand group must have empty `backends` (membership via reverse ref).
+    let search_group = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .find(|g| g.name == "search")
+        .expect("search group should exist from endpoint_group_list");
+    assert!(
+        search_group.backends.is_empty(),
+        "shorthand group backends must be empty; membership is via reverse refs"
+    );
+
+    // Resolve group backends — this is the exact function the proxy uses.
+    let resolved = mcp_proxy::endpoint_router::resolve_group_backends(
+        &config.backends,
+        &config.proxy.endpoint_groups,
+        search_group,
+    );
+    let resolved_names: Vec<&str> = resolved.iter().map(|b| b.name.as_str()).collect();
+    assert!(
+        resolved_names.contains(&"search_srv"),
+        "reverse reference: search_srv must be resolved into the search group, got {resolved_names:?}"
+    );
+    assert!(
+        !resolved_names.contains(&"math"),
+        "math has no endpoint_groups, must NOT be in search group, got {resolved_names:?}"
+    );
+
+    // Build ONE shared McpProxy with in-process backends (no external processes).
+    // Names match the config so GroupFilterService namespaces line up.
+    let shared_proxy = McpProxy::builder(&config.proxy.name, &config.proxy.version)
+        .separator(&config.proxy.separator)
+        .backend("search_srv", ChannelTransport::new(search_router()))
+        .await
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("shared proxy should build");
+
+    // Drive the REAL production endpoint-group builder. This calls
+    // `resolve_group_backends` + `GroupFilterService` for each group and
+    // populates the registry. If reverse-reference resolution were broken,
+    // the search group would have no backends and this would bail with an error.
+    let registry = EndpointGroupRegistry::new();
+    let (_group_routers, grouped_names) = mcp_proxy::endpoint_router::build_endpoint_group_routers(
+        &config,
+        Some(&registry),
+        Some(&shared_proxy),
+    )
+    .await
+    .expect("build_endpoint_group_routers must succeed (reverse refs resolved)");
+
+    assert!(
+        grouped_names.contains("search_srv"),
+        "search_srv must be reported as a grouped backend, got {grouped_names:?}"
+    );
+    assert!(
+        !grouped_names.contains("math"),
+        "ungrouped backend math must NOT be reported as grouped, got {grouped_names:?}"
+    );
+
+    // Build the default router from the shared proxy, then mount the groups.
+    let default_service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(shared_proxy.clone());
+    let (default_router, _sh) =
+        tower_mcp::transport::http::HttpTransport::from_service(default_service)
+            .into_router_with_handle();
+    let router = build_dynamic_endpoint_group_router(default_router, registry);
+
+    // Spawn on a random port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // The search group endpoint MUST serve search_srv tools and MUST NOT serve
+    // math tools (GroupFilterService restricts to the resolved member set).
+    let search_tools = list_tools_on_path(&client, &base, "/search/mcp").await;
+    assert!(
+        search_tools.iter().any(|n| n.starts_with("search_srv")),
+        "search group must expose search_srv tools via reverse reference, got {search_tools:?}"
+    );
+    assert!(
+        !search_tools.iter().any(|n| n.starts_with("math")),
+        "search group must NOT expose math tools (group filter), got {search_tools:?}"
+    );
+
+    // The default endpoint must still serve the ungrouped math backend.
+    let main_tools = list_tools_on_path(&client, &base, "/").await;
+    assert!(
+        main_tools.iter().any(|n| n.starts_with("math")),
+        "ungrouped backend math must be on main endpoint, got {main_tools:?}"
+    );
+
+    server_handle.abort();
+}
+
+/// Perform an MCP initialize + notifications/initialized + tools/list handshake
+/// over HTTP on the given path and return the list of tool names.
+async fn list_tools_on_path(client: &reqwest::Client, base: &str, path: &str) -> Vec<String> {
+    let init = client
+        .post(format!("{base}{path}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1.0.0" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("initialize request");
+
+    let sid = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let mut notif = client
+        .post(format!("{base}{path}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+                .to_string(),
+        );
+    if let Some(ref s) = sid {
+        notif = notif.header("mcp-session-id", s);
+    }
+    let _ = notif.send().await;
+
+    let mut list = client
+        .post(format!("{base}{path}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string());
+    if let Some(ref s) = sid {
+        list = list.header("mcp-session-id", s);
+    }
+    let resp = list.send().await.expect("tools/list request");
+    let body: serde_json::Value = resp.json().await.expect("valid json");
+
+    body.get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Verify that endpoint groups with different path prefixes work.
 #[tokio::test]
 async fn test_endpoint_group_path_prefixes() {

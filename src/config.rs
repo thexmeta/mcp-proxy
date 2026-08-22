@@ -836,7 +836,7 @@ pub struct BackendConfig {
 }
 
 /// Backend transport protocol.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     /// Subprocess communicating via stdin/stdout.
@@ -1668,6 +1668,52 @@ impl BackendConfig {
     }
 }
 
+/// Normalize a host:port pair for self-reference comparison.
+///
+/// - `localhost` → `127.0.0.1`
+/// - `0.0.0.0` → `127.0.0.1` (wildcard listens on all interfaces, including loopback)
+/// - `::` / `[::]` → `127.0.0.1` (IPv6 wildcard)
+/// - `[::1]` → `127.0.0.1` (IPv6 loopback)
+fn normalize_addr(host: &str, port: u16) -> String {
+    let normalized_host = match host {
+        "localhost" | "0.0.0.0" | "::" | "[::]" | "[::1]" => "127.0.0.1",
+        other => other,
+    };
+    format!("{normalized_host}:{port}")
+}
+
+/// Extract host and port from an HTTP/HTTPS URL string.
+///
+/// Returns `None` if parsing fails or the URL has no host.
+fn parse_host_port(url_str: &str) -> Option<(String, u16)> {
+    // Strip scheme
+    let without_scheme = url_str
+        .strip_prefix("https://")
+        .or_else(|| url_str.strip_prefix("http://"))?;
+    // Take everything before the first '/' or '?' or '#'
+    let authority = without_scheme.split(['/', '?', '#']).next()?;
+    // Split host and port
+    if let Some(colon_pos) = authority.rfind(':') {
+        let host_part = &authority[..colon_pos];
+        let port_str = &authority[colon_pos + 1..];
+        // Strip brackets for IPv6: [::1]:8080
+        let host = host_part
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host_part);
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        // No explicit port — use scheme default
+        let default_port = if url_str.starts_with("https://") {
+            443
+        } else {
+            80
+        };
+        Some((authority.to_string(), default_port))
+    }
+}
+
 impl ProxyConfig {
     /// Load and validate a config from a file path.
     ///
@@ -2101,6 +2147,36 @@ impl ProxyConfig {
             }
         }
 
+        // Check for self-referencing HTTP backends (connection loop detection)
+        {
+            let listen_host = &self.proxy.listen.host;
+            let listen_port = self.proxy.listen.port;
+            // Normalize the listen address for comparison
+            let listen_addr = normalize_addr(listen_host, listen_port);
+
+            for backend in &self.backends {
+                if backend.transport != TransportType::Http {
+                    continue;
+                }
+                if let Some((url_str, Some((host, port)))) =
+                    backend.url.as_ref().map(|u| (u, parse_host_port(u)))
+                {
+                    let backend_addr = normalize_addr(&host, port);
+                    if backend_addr == listen_addr {
+                        anyhow::bail!(
+                            "backend '{}' has URL '{}' which points to the proxy's own \
+                             listen address {}:{} — this creates a connection loop. \
+                             Use the actual backend server URL instead.",
+                            backend.name,
+                            url_str,
+                            listen_host,
+                            listen_port
+                        );
+                    }
+                }
+            }
+        }
+
         // Validate canary_of references
         for backend in &self.backends {
             if let Some(ref primary) = backend.canary_of {
@@ -2436,6 +2512,7 @@ mod tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "remote"
@@ -2651,6 +2728,96 @@ mod tests {
             }
             other => panic!("expected Jwt auth, got: {:?}", other),
         }
+    }
+
+    // ========================================================================
+    // Self-referencing HTTP backend validation
+    // ========================================================================
+
+    #[test]
+    fn test_reject_self_referencing_http_backend() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://127.0.0.1:3300/mcp"
+        "#;
+
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connection loop") || msg.contains("own listen address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_localhost_self_reference() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 8080
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://localhost:8080/mcp"
+        "#;
+
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connection loop") || msg.contains("own listen address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_allow_different_port() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://127.0.0.1:8080/mcp"
+        "#;
+
+        // Should parse and validate successfully
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.backends[0].name, "remote");
+    }
+
+    #[test]
+    fn test_allow_external_url() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "external"
+        transport = "http"
+        url = "https://api.example.com/mcp"
+        "#;
+
+        // Should parse and validate successfully
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.backends[0].name, "external");
     }
 
     // ========================================================================
@@ -2948,6 +3115,7 @@ mod tests {
         [proxy]
         name = "od-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "flaky"
@@ -2978,6 +3146,7 @@ mod tests {
         [proxy]
         name = "od-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "flaky"
@@ -3004,6 +3173,7 @@ mod tests {
         [proxy]
         name = "mirror-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -3030,6 +3200,7 @@ mod tests {
         [proxy]
         name = "mirror-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -3095,6 +3266,7 @@ mod tests {
         [proxy]
         name = "hedge-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -3121,6 +3293,7 @@ mod tests {
         [proxy]
         name = "hedge-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -3301,6 +3474,7 @@ mod tests {
         [proxy]
         name = "inject-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "db"
@@ -3624,6 +3798,7 @@ mod tests {
         [proxy]
         name = "override-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3654,6 +3829,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3678,6 +3854,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3706,6 +3883,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3731,6 +3909,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"

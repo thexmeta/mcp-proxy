@@ -812,6 +812,7 @@ fn test_global_middleware_defaults_merged() {
         [proxy]
         name = "test-proxy"
         [proxy.listen]
+        port = 9090
 
         [proxy.timeout]
         seconds = 60

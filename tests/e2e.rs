@@ -27,7 +27,10 @@ use mcp_proxy::discover::DiscoverLayer;
 use mcp_proxy::filter::CapabilityFilterService;
 use mcp_proxy::inject::{InjectArgsService, InjectionRules};
 use mcp_proxy::validation::{ValidationConfig, ValidationService};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 use tower::Layer;
+use tower_mcp::client::HttpClientTransport;
 use tower_mcp_types::protocol::{Implementation, RequestMeta};
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1159,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "primary"
@@ -1179,6 +1183,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "primary"
@@ -1292,6 +1297,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -2595,4 +2601,456 @@ async fn test_e2e_mixed_partial_meta_on_2025_request() {
     );
     let resp = proxy.call(req).await.expect("infallible");
     assert_eq!(get_tool_result_text(&resp), "10");
+}
+
+// ===========================================================================
+// Tier 15: Unreachable / failing backend resilience
+// ===========================================================================
+
+/// Start an HTTP MCP server on a random port and return (addr, handle).
+/// This is a real HTTP MCP server that the proxy can connect to as a backend.
+async fn start_http_mcp_server(router: McpRouter) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(router);
+    let (axum_router, _session_handle) =
+        tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.ok();
+    });
+    (addr, handle)
+}
+
+/// Start an HTTP proxy server (McpProxy wrapped in HTTP transport) and return
+/// (addr, handle).
+async fn start_http_proxy(proxy: McpProxy) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(proxy);
+    let (router, _session_handle) =
+        tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    (addr, handle)
+}
+
+/// An MCP backend whose handler returns a JSON-RPC error on every call.
+fn always_fail_router() -> McpRouter {
+    let fail = ToolBuilder::new("fail")
+        .description("Always fails")
+        .handler(
+            |_: tower_mcp::NoParams| async move { Ok(CallToolResult::error("backend exploded")) },
+        )
+        .build();
+
+    McpRouter::new()
+        .server_info("fail-server", "1.0.0")
+        .tool(fail)
+}
+
+/// Test 1: When an HTTP backend goes down after proxy startup, requests to that
+/// backend's namespace return a JSON-RPC error (not a panic or crash).
+///
+/// This is the exact scenario from the user's reported error:
+/// proxy starts with reachable backend → backend goes down → client gets
+/// "connection refused" wrapped in a JSON-RPC error.
+#[tokio::test]
+async fn test_http_backend_unreachable_returns_error() {
+    // Step 1: Start a real HTTP MCP backend.
+    let (backend_addr, backend_handle) = start_http_mcp_server(math_router()).await;
+
+    // Step 2: Start a proxy with the HTTP backend pointing at the running server.
+    let backend_url = format!("http://{}", backend_addr);
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("remote", HttpClientTransport::new(&backend_url))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build with reachable backend");
+
+    let (proxy_addr, proxy_handle) = start_http_proxy(proxy).await;
+
+    // Step 3: Kill the backend — simulate it going down.
+    backend_handle.abort();
+    // Give the OS a moment to release the port.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 4: Send a request through the proxy to the now-dead backend.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "remote/add",
+                    "arguments": { "a": 1, "b": 2 }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("request should reach the proxy");
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    // MCP transport returns 200; errors go in the JSON-RPC error field.
+    assert_eq!(status, 200, "HTTP status should be 200: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("error").is_some(),
+        "response should contain JSON-RPC error when backend is unreachable: {body}"
+    );
+
+    let error_msg = json["error"]["message"].as_str().unwrap_or("");
+    assert!(!error_msg.is_empty(), "error message should not be empty");
+
+    proxy_handle.abort();
+}
+
+/// Test 2: When an HTTP backend goes down, the proxy stays alive and other
+/// backends continue to work.
+#[tokio::test]
+async fn test_http_backend_unreachable_does_not_crash_proxy() {
+    // Step 1: Start a real HTTP MCP backend (the "remote" one).
+    let (backend_addr, backend_handle) = start_http_mcp_server(math_router()).await;
+
+    // Step 2: Start a proxy with BOTH a channel backend AND the HTTP backend.
+    let backend_url = format!("http://{}", backend_addr);
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("local", ChannelTransport::new(text_router()))
+        .await
+        .backend("remote", HttpClientTransport::new(&backend_url))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let (proxy_addr, proxy_handle) = start_http_proxy(proxy).await;
+
+    // Verify both backends work while the HTTP backend is up.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Call local backend.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "hello" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("local backend request");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "hello");
+
+    // Step 3: Kill the HTTP backend.
+    backend_handle.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 4: Call the LOCAL backend again — it must still work.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "still alive" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("local backend should still work");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "still alive");
+
+    // Step 5: Call the DEAD backend — should return JSON-RPC error, not crash.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "remote/add",
+                    "arguments": { "a": 1, "b": 2 }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("dead backend request should reach proxy");
+    let body = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("error").is_some(),
+        "dead backend should return JSON-RPC error: {body}"
+    );
+
+    // Step 6: Call local one more time — proxy is still operational.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "final check" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("final local backend check");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "final check");
+
+    proxy_handle.abort();
+}
+
+/// Test 3: A stdio backend pointing at a non-existent binary must fail to
+/// start — the proxy either refuses to build or returns an error.
+#[tokio::test]
+async fn test_stdio_backend_spawn_failure_returns_error() {
+    let config = ProxyConfig::parse(
+        r#"
+        [proxy]
+        name = "test-proxy"
+        version = "1.0.0"
+        [proxy.listen]
+
+        [[backends]]
+        name = "bad"
+        transport = "stdio"
+        command = "/nonexistent/binary"
+        "#,
+    )
+    .expect("config should parse");
+
+    let result = mcp_proxy::Proxy::from_config(config).await;
+    assert!(
+        result.is_err(),
+        "Proxy::from_config should fail with a non-existent binary"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("nonexistent") || err_msg.contains("spawn") || err_msg.contains("backend"),
+        "error should mention the failed backend: {err_msg}"
+    );
+}
+
+/// Test 4: A backend that errors on request does not crash the proxy —
+/// subsequent requests still succeed.
+#[tokio::test]
+async fn test_proxy_survives_backend_failure_during_request() {
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("broken", ChannelTransport::new(always_fail_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(proxy);
+    let mut svc = service;
+
+    // First: call the broken backend — should return an error result.
+    let resp = call(&mut svc, tool_call("broken/fail", serde_json::json!({}))).await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => {
+            assert!(result.is_error, "broken backend should return error result");
+            assert!(
+                result.all_text().contains("backend exploded"),
+                "error text should be descriptive: {}",
+                result.all_text()
+            );
+        }
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+
+    // Second: call the GOOD backend — proxy must still be alive.
+    let resp = call(
+        &mut svc,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
+    assert_eq!(get_tool_result_text(&resp), "30");
+
+    // Third: call the broken backend again — still errors, no crash.
+    let resp = call(&mut svc, tool_call("broken/fail", serde_json::json!({}))).await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => {
+            assert!(result.is_error, "broken backend should error again");
+        }
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+
+    // Fourth: list tools — proxy still operational.
+    let resp = call(&mut svc, McpRequest::ListTools(Default::default())).await;
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/add".to_string()),
+        "math/add should still be listed: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"broken/fail".to_string()),
+        "broken/fail should still be listed: {:?}",
+        names
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 16: Config validation — self-referencing HTTP backend rejection
+// ---------------------------------------------------------------------------
+
+/// A self-referencing HTTP backend (URL points to the proxy's own listen
+/// address) must be rejected at config validation time, NOT at runtime.
+/// This prevents the confusing "connection refused" error where the proxy
+/// tries to connect to itself as a backend.
+#[tokio::test]
+async fn test_self_referencing_http_backend_rejected_at_startup() {
+    // Proxy listens on 127.0.0.1:3300, backend points to the same address.
+    // ProxyConfig::parse() calls validate() which must catch this.
+    let toml = r#"
+        [proxy]
+        name = "test-self-ref"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "self_ref_backend"
+        transport = "http"
+        url = "http://127.0.0.1:3300/mcp"
+    "#;
+
+    let err = ProxyConfig::parse(toml).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("connection loop") || msg.contains("own listen address"),
+        "expected self-reference error, got: {msg}"
+    );
+}
+
+/// Verify that localhost ↔ 127.0.0.1 is normalized correctly.
+#[tokio::test]
+async fn test_localhost_self_reference_also_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-self-ref-localhost"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 8080
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://localhost:8080/mcp"
+    "#;
+
+    let err = ProxyConfig::parse(toml).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("connection loop") || msg.contains("own listen address"),
+        "expected self-reference error for localhost, got: {msg}"
+    );
+}
+
+/// Different ports should NOT be rejected — only same host:port is a loop.
+#[tokio::test]
+async fn test_different_port_not_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-diff-port"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://127.0.0.1:9090/mcp"
+    "#;
+
+    let config = ProxyConfig::parse(toml).unwrap();
+    assert_eq!(config.backends[0].name, "remote");
+}
+
+/// External URLs must never be rejected.
+#[tokio::test]
+async fn test_external_url_not_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-external"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "external"
+        transport = "http"
+        url = "https://api.example.com/mcp"
+    "#;
+
+    let config = ProxyConfig::parse(toml).unwrap();
+    assert_eq!(config.backends[0].name, "external");
 }
