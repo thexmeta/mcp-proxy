@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use axum::Router;
+use tower::Layer;
 use tower::util::BoxCloneService;
 use tower_mcp::SessionHandle;
 use tower_mcp::proxy::McpProxy;
@@ -88,9 +89,14 @@ fn build_endpoint_group_middleware_stack(
     proxy: McpProxy,
     group_backend_names: &HashSet<String>,
     group_namespaces: Option<HashSet<String>>,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
 ) -> Result<BoxCloneService<RouterRequest, RouterResponse, Infallible>> {
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
+
+    // Clone the group scope up front: it is consumed by GroupFilterService below
+    // and also needed (cloned again) for the warm-catalog layer after the 2026 trio.
+    let group_scope_for_warm = group_namespaces.clone();
 
     // Group filter (innermost): restrict to member backend namespaces
     if let Some(namespaces) = group_namespaces
@@ -114,6 +120,23 @@ fn build_endpoint_group_middleware_stack(
         group.name
     );
     service = apply_2026_layers(service, config);
+
+    // Warm catalog serving (C11/C19): immediately after the 2026 trio and
+    // outside GroupFilter, so cached List* entries for down lazy backends are
+    // appended and then scoped by the group filter. The group scope is the set
+    // of member backend namespaces (or `None` when no group filter applies).
+    tracing::info!(
+        "Applying warm catalog serving layer (endpoint group: {})",
+        group.name
+    );
+    service = BoxCloneService::new(
+        crate::warm_catalog_service::WarmCatalogLayer::new(
+            lazy_registry,
+            config.proxy.separator.clone(),
+            group_scope_for_warm,
+        )
+        .layer(service),
+    );
 
     // Filter backends to only those in this group for middleware that needs backend-specific config
     let group_backends: Vec<_> = config
@@ -573,12 +596,14 @@ pub async fn build_endpoint_group_routers(
     config: &ProxyConfig,
     registry: Option<&EndpointGroupRegistry>,
     shared_proxy: Option<&McpProxy>,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
 ) -> Result<(Vec<EndpointGroupRouter>, HashSet<String>)> {
     let mut endpoint_group_routers = Vec::new();
     let mut grouped_backend_names = HashSet::new();
 
     for group in &config.proxy.endpoint_groups {
-        let router = build_single_endpoint_group(config, group, shared_proxy).await?;
+        let router =
+            build_single_endpoint_group(config, group, shared_proxy, lazy_registry.clone()).await?;
         endpoint_group_routers.push(router.clone());
         grouped_backend_names.extend(
             resolve_group_backends(&config.backends, &config.proxy.endpoint_groups, group)
@@ -605,6 +630,7 @@ pub async fn build_single_endpoint_group(
     config: &ProxyConfig,
     group: &EndpointGroupConfig,
     shared_proxy: Option<&McpProxy>,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
 ) -> Result<EndpointGroupRouter> {
     // Validate path
     if !group.path.starts_with('/') {
@@ -676,6 +702,7 @@ pub async fn build_single_endpoint_group(
         mcp_proxy.clone(),
         &group_backend_names,
         group_namespaces,
+        lazy_registry,
     )?;
 
     // Create HTTP router for this group. Protocol version support mirrors the

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -143,6 +144,7 @@ fn build_watcher(config: &WatcherConfig) -> Box<dyn ConfigWatcher> {
 
 /// Spawn a background task that watches the config file and manages backends dynamically.
 /// Tries watchers in order until one succeeds.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     proxy: McpProxy,
@@ -150,6 +152,7 @@ pub fn spawn_config_watcher(
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         String,
@@ -163,6 +166,7 @@ pub fn spawn_config_watcher(
             endpoint_group_registry,
             watchers,
             alias_map,
+            lazy_registry,
             #[cfg(feature = "discovery")]
             discovery_index,
         )
@@ -170,6 +174,7 @@ pub fn spawn_config_watcher(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch_loop(
     config_path: PathBuf,
     proxy: McpProxy,
@@ -177,6 +182,7 @@ async fn watch_loop(
     endpoint_group_registry: EndpointGroupRegistry,
     watchers: Vec<WatcherConfig>,
     alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         String,
@@ -336,6 +342,8 @@ async fn watch_loop(
             } else {
                 tracing::warn!(backend = %removed, "Backend not found for removal");
             }
+            // FR-009: drop any lazy-registry entry (no-op if not lazy).
+            lazy_registry.unregister(removed);
         }
 
         // Add new backends
@@ -352,16 +360,59 @@ async fn watch_loop(
                     );
 
                     replaced_backends.push(&backend.name);
-                    // Remove old, add new
-                    proxy.remove_backend(&backend.name).await;
-                    if let Err(e) = add_backend(&proxy, backend).await {
-                        tracing::error!(
-                            backend = %backend.name,
-                            error = %e,
-                            "Failed to replace backend via hot reload"
-                        );
-                    } else {
-                        tracing::info!(backend = %backend.name, "Backend replaced");
+
+                    // Determine the OLD spawn mode: a backend present in the lazy
+                    // registry was lazy; otherwise it was eager (FR-009/AC-006).
+                    let old_mode = lazy_registry
+                        .get(&backend.name)
+                        .map(|b| b.config.spawn_mode)
+                        .unwrap_or(crate::config::SpawnMode::Eager);
+
+                    match (old_mode, backend.spawn_mode.clone()) {
+                        // eager -> lazy: kill the child, register lazy (no spawn).
+                        (crate::config::SpawnMode::Eager, crate::config::SpawnMode::Lazy) => {
+                            proxy.remove_backend(&backend.name).await;
+                            lazy_registry.register_lazy(backend.clone());
+                            tracing::info!(backend = %backend.name, "Backend flipped eager -> lazy (registered, not spawned)");
+                        }
+                        // lazy -> eager: drop lazy registration, eager spawn.
+                        (crate::config::SpawnMode::Lazy, crate::config::SpawnMode::Eager) => {
+                            lazy_registry.unregister(&backend.name);
+                            if let Err(e) = add_backend(&proxy, backend).await {
+                                tracing::error!(
+                                    backend = %backend.name,
+                                    error = %e,
+                                    "Failed to flip backend lazy -> eager via hot reload"
+                                );
+                            } else {
+                                tracing::info!(backend = %backend.name, "Backend flipped lazy -> eager (spawned)");
+                            }
+                        }
+                        // both lazy: config changed but still lazy -> re-probe + cache update.
+                        (crate::config::SpawnMode::Lazy, crate::config::SpawnMode::Lazy) => {
+                            if let Err(e) = lazy_registry.reconcile_config_change(backend).await {
+                                tracing::error!(
+                                    backend = %backend.name,
+                                    error = %e,
+                                    "Failed to reconcile lazy backend config change"
+                                );
+                            } else {
+                                tracing::info!(backend = %backend.name, "Lazy backend config reconciled (will re-probe on next spawn)");
+                            }
+                        }
+                        // both eager: existing behavior — remove old, add new.
+                        (crate::config::SpawnMode::Eager, crate::config::SpawnMode::Eager) => {
+                            proxy.remove_backend(&backend.name).await;
+                            if let Err(e) = add_backend(&proxy, backend).await {
+                                tracing::error!(
+                                    backend = %backend.name,
+                                    error = %e,
+                                    "Failed to replace backend via hot reload"
+                                );
+                            } else {
+                                tracing::info!(backend = %backend.name, "Backend replaced");
+                            }
+                        }
                     }
                 }
                 continue;
@@ -371,10 +422,15 @@ async fn watch_loop(
             tracing::info!(
                 name = %backend.name,
                 transport = ?backend.transport,
+                spawn_mode = ?backend.spawn_mode,
                 "Adding new backend via hot reload"
             );
 
-            if let Err(e) = add_backend(&proxy, backend).await {
+            // AC-006: lazy backends are registered but NOT eagerly spawned.
+            if backend.spawn_mode == crate::config::SpawnMode::Lazy {
+                lazy_registry.register_lazy(backend.clone());
+                tracing::info!(backend = %backend.name, "Lazy backend added via hot reload (not spawned)");
+            } else if let Err(e) = add_backend(&proxy, backend).await {
                 tracing::error!(
                     backend = %backend.name,
                     error = %e,
@@ -423,6 +479,7 @@ async fn watch_loop(
                         &shared_proxy,
                         &new_config,
                         endpoint_group,
+                        lazy_registry.clone(),
                     )
                     .await
                     {
@@ -450,6 +507,7 @@ async fn watch_loop(
                 &shared_proxy,
                 &new_config,
                 endpoint_group,
+                lazy_registry.clone(),
             )
             .await
             {
@@ -636,12 +694,14 @@ async fn build_endpoint_group(
     shared_proxy: &McpProxy,
     config: &ProxyConfig,
     endpoint_group: &crate::config::EndpointGroupConfig,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
 ) -> anyhow::Result<()> {
     // Use the shared McpProxy — no duplicate process spawning.
     let group_router = crate::endpoint_router::build_single_endpoint_group(
         config,
         endpoint_group,
         Some(shared_proxy),
+        lazy_registry,
     )
     .await?;
 
@@ -657,16 +717,27 @@ async fn rebuild_endpoint_group(
     shared_proxy: &McpProxy,
     config: &ProxyConfig,
     endpoint_group: &crate::config::EndpointGroupConfig,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
 ) -> anyhow::Result<()> {
     // Remove the old endpoint group first
     registry.remove(&endpoint_group.name);
 
     // Build and register the new one using the shared proxy
-    build_endpoint_group(registry, shared_proxy, config, endpoint_group).await
+    build_endpoint_group(
+        registry,
+        shared_proxy,
+        config,
+        endpoint_group,
+        lazy_registry,
+    )
+    .await
 }
 
 /// Connect and add a single backend to the proxy, including per-backend middleware.
-async fn add_backend(proxy: &McpProxy, backend: &BackendConfig) -> anyhow::Result<()> {
+///
+/// Shared by the hot-reload path and the lazy registry's spawn path (Wave 5) so
+/// per-backend middleware is applied identically (POS-004).
+pub(crate) async fn add_backend(proxy: &McpProxy, backend: &BackendConfig) -> anyhow::Result<()> {
     // Skip disabled backends
     if !backend.enabled {
         tracing::info!(backend = %backend.name, "Skipping disabled backend");

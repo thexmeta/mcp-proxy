@@ -19,7 +19,11 @@ use tokio::net::TcpListener;
 use std::path::Path;
 
 use mcp_proxy::Proxy;
-use mcp_proxy::config::ProxyConfig;
+use mcp_proxy::config::{
+    BackendConfig, ProxyConfig, ProxySettings, SpawnMode, TransportType, WarmCacheConfig,
+};
+use mcp_proxy::warm_cache::{BinaryHasher, WarmCatalog, WarmCatalogStore};
+use tower_mcp_types::protocol::ToolDefinition;
 
 // ---------------------------------------------------------------------------
 // Shared proxy (avoids spawning ~20 child processes per test)
@@ -1444,4 +1448,567 @@ async fn os_endpoint_group_scopes_tools() {
             eprintln!("/os/mcp not available or error: {other:?}, skipping");
         }
     }
+}
+
+// ===========================================================================
+// Tests — lazy / on-demand backend spawning with persistent warm tool cache
+// ===========================================================================
+//
+// These are LIVE tests: they spawn a REAL python stdio MCP server as a child
+// process. They are `#[ignore]` so the default `cargo test` run skips them and
+// they only run with `cargo test --test live_proxy -- --ignored`.
+//
+// They build their OWN proxy from an in-code config (NOT the shared live proxy)
+// because the live config at `/home/mxadm/.mcp-proxy/config.toml` is unrelated
+// to the lazy feature under test.
+
+/// Minimal MCP stdio server (Python stdlib only). Exposes one tool `ping`.
+///
+/// Speaks NEWLINE-DELIMITED JSON (one JSON-RPC object per line, terminated by
+/// `\n`) — NOT LSP Content-Length framing. `tower-mcp`'s `StdioClientTransport`
+/// writes `message + b"\n"` and reads line-by-line; a Content-Length-framed
+/// server DEADLOCKS.
+const LAZY_MIN_SERVER: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None: break
+    mid = req.get("id"); method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":False},"resources":{}},"serverInfo":{"name":"live-min","version":"1.0.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Return pong","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}],"isError":False}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resourceTemplates":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}}); break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+
+/// Build a [`ProxyConfig`] in-code with warm cache enabled + one lazy stdio
+/// backend (`files`) pointing at the given python server, plus a dummy eager
+/// backend (`__dummy__`) so the shared [`McpProxy`] has ≥1 backend to build.
+///
+/// `ProxyConfig` does NOT derive `Clone`, so callers rebuild via this helper
+/// rather than `.clone()`.
+fn lazy_live_config(dir: &Path, server: &Path) -> ProxyConfig {
+    ProxyConfig {
+        proxy: ProxySettings {
+            name: "lazy-live-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+        },
+        backends: vec![
+            // Dummy eager backend (real MCP server) so the shared McpProxy has
+            // at least one backend to build (lazy backends are registered, not
+            // spawned at startup).
+            BackendConfig {
+                name: "__dummy__".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            // Lazy stdio backend under test.
+            BackendConfig {
+                name: "files".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                spawn_mode: SpawnMode::Lazy,
+                idle_timeout_secs: Some(30),
+                ..Default::default()
+            },
+        ],
+        auth: None,
+        performance: mcp_proxy::config::PerformanceConfig::default(),
+        security: mcp_proxy::config::SecurityConfig::default(),
+        cache: mcp_proxy::config::CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig {
+            enabled: true,
+            dir: Some(dir.to_path_buf()),
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        },
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    }
+}
+
+/// A namespaced tool definition for the seeded warm catalog.
+fn lazy_ping_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "ping".to_string(),
+        title: None,
+        description: Some("Return pong".to_string()),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        icons: None,
+        annotations: None,
+        execution: None,
+        meta: None,
+    }
+}
+
+/// L1 — lazy backend builds + catalog loads from warm cache.
+///
+/// The lazy backend must NOT be spawned at startup (`spawn_state == Down`) and
+/// must be registered in the lazy registry by name.
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l1_builds_and_registered_down() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l1-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+
+    // Build the proxy from the in-code config (no live config involved).
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+
+    let registry = proxy.lazy_registry();
+
+    // The lazy backend must be registered by name.
+    assert!(
+        registry.names().contains(&"files".to_string()),
+        "lazy backend 'files' must be registered in the lazy registry"
+    );
+
+    // It must NOT be spawned at startup — served from the warm cache instead.
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Down,
+        "lazy backend must be Down at startup (not eagerly spawned)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L2 — first call spawns on-demand (live).
+///
+/// After `ensure_spawned`, the backend must transition to `Up` and its warm
+/// catalog must be present (captured from the live probe).
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l2_first_call_spawns_on_demand() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l2-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+    let registry = proxy.lazy_registry();
+
+    // Precondition: starts Down.
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Down,
+        "precondition: lazy backend starts Down"
+    );
+
+    // First action request brings the backend up on demand.
+    registry
+        .ensure_spawned("files")
+        .await
+        .expect("ensure_spawned must spawn the lazy backend");
+
+    // It must now be Up.
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Up,
+        "lazy backend must be Up after ensure_spawned"
+    );
+
+    // The spawned backend's warm catalog must be present (captured by the probe).
+    let lb = registry.get("files").expect("lazy backend present");
+    assert!(
+        lb.catalog.is_some(),
+        "spawned lazy backend must have a warm catalog from the live probe"
+    );
+    let names: Vec<&str> = lb
+        .catalog
+        .iter()
+        .flat_map(|c| c.tools.iter().map(|t| t.name.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"files/ping"),
+        "probed catalog must contain the namespaced files/ping tool, got: {names:?}"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L3 — warm catalog persists across restart (live).
+///
+/// Build proxy #1, seed a warm catalog on disk, drop it, build proxy #2 with the
+/// SAME config, and assert the catalog reloads from disk (mirrors `r3` in
+/// `test_lazy_restart.rs` but live against a real python server).
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l3_warm_catalog_persists_across_restart() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l3-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+
+    // First proxy: build the registry, then seed a warm catalog on disk.
+    let proxy1 = Proxy::from_config(lazy_live_config(&dir, &server))
+        .await
+        .expect("first proxy builds");
+    let _reg1 = proxy1.lazy_registry();
+
+    let files_cfg = config
+        .backends
+        .iter()
+        .find(|b| b.name == "files")
+        .expect("files backend present")
+        .clone();
+    let hash = BinaryHasher::hash(&files_cfg);
+    let catalog = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![lazy_ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        hash.clone(),
+    );
+    let store = WarmCatalogStore::new(dir.clone());
+    store.save(&catalog).expect("seed warm catalog on disk");
+
+    // Drop the first proxy (simulates a process restart).
+    drop(proxy1);
+
+    // Second proxy with the SAME config: startup must load the persisted catalog.
+    let proxy2 = Proxy::from_config(lazy_live_config(&dir, &server))
+        .await
+        .expect("second proxy builds");
+    let reg2 = proxy2.lazy_registry();
+
+    let loaded = reg2
+        .get("files")
+        .and_then(|b| b.catalog)
+        .expect("warm catalog must be loaded from disk on restart (L3)");
+    assert_eq!(
+        loaded.tools.len(),
+        1,
+        "loaded catalog must contain the seeded tool"
+    );
+    assert_eq!(
+        loaded.tools[0].name, "files/ping",
+        "loaded tool must be namespaced as files/ping"
+    );
+    assert_eq!(
+        loaded.protocol_version.as_deref(),
+        Some("2026-07-28"),
+        "loaded catalog must preserve the seeded protocol version"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Like [`LAZY_MIN_SERVER`] but advertises protocol version `2026-07-28` so the
+/// post-spawn probe captures a **stateless** protocol version. This is required
+/// for `LazyBackendRegistry::idle_out` to perform the Down transition (guard C3
+/// in `src/lazy_registry.rs` only idle-outs `2026-07-28` backends). Used by L4.
+const LAZY_MIN_SERVER_2026: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None: break
+    mid = req.get("id"); method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2026-07-28","capabilities":{"tools":{"listChanged":False},"resources":{}},"serverInfo":{"name":"live-min","version":"1.0.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Return pong","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}],"isError":False}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resourceTemplates":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}}); break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+
+/// Local variant of [`lazy_live_config`] with a 1-second idle timeout so the
+/// idle-out transition can be driven deterministically (the background sweeper
+/// is non-deterministic). Identical to [`lazy_live_config`] except the `files`
+/// backend's `idle_timeout_secs` is `Some(1)`.
+fn lazy_live_config_fast_idle(dir: &Path, server: &Path) -> ProxyConfig {
+    let mut cfg = lazy_live_config(dir, server);
+    for b in cfg.backends.iter_mut() {
+        if b.name == "files" {
+            b.idle_timeout_secs = Some(1);
+        }
+    }
+    cfg
+}
+
+/// L4 — idle-out drives the full Up→Down transition (live).
+///
+/// `ensure_spawned` brings the backend Up (real python child + probe). After the
+/// idle timer elapses we call `idle_out` explicitly (rather than relying on the
+/// non-deterministic background sweeper) and assert it performs the Down
+/// transition, preserving the warm catalog.
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l4_idle_out_full_transition() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l4-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER_2026).expect("write server script");
+
+    let config = lazy_live_config_fast_idle(&dir, &server);
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+    let registry = proxy.lazy_registry();
+
+    // Bring the backend up on demand (real child + post-spawn probe).
+    registry
+        .ensure_spawned("files")
+        .await
+        .expect("ensure_spawned must spawn the lazy backend");
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Up,
+        "precondition: backend must be Up before idle-out"
+    );
+
+    // Let the idle timer elapse (configured to 1s).
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Drive the full Down transition explicitly via idle_out.
+    let out = registry
+        .idle_out("files")
+        .await
+        .expect("idle_out must run without error");
+    assert!(
+        out,
+        "idle_out must perform the Down transition (returns true) once the idle timer elapsed"
+    );
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Down,
+        "backend must be Down after idle-out (child terminated, catalog preserved)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L5 — concurrent first-calls coalesce into a single spawn (live).
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l5_coalesced_concurrent_spawn() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l5-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l5-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+    let registry = std::sync::Arc::new(proxy.lazy_registry());
+
+    // Fire several concurrent first-calls; all must succeed and the backend
+    // must end Up. The spawn guard coalesces them behind a single spawn.
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let r = std::sync::Arc::clone(&registry);
+        handles.push(tokio::spawn(async move { r.ensure_spawned("files").await }));
+    }
+    for h in handles {
+        h.await.expect("task joins").expect("spawn succeeds");
+    }
+
+    assert_eq!(
+        registry.spawn_state("files"),
+        mcp_proxy::lazy_registry::SpawnState::Up,
+        "backend must be Up after concurrent first-calls (L5)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L6 — protocol version preserved from warm catalog (live).
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l6_protocol_version_preserved() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l6-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+
+    // Seed a warm catalog on disk BEFORE building the proxy.
+    let files_cfg = config
+        .backends
+        .iter()
+        .find(|b| b.name == "files")
+        .expect("files backend present")
+        .clone();
+    let hash = BinaryHasher::hash(&files_cfg);
+    let catalog = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![lazy_ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        hash,
+    );
+    WarmCatalogStore::new(dir.clone())
+        .save(&catalog)
+        .expect("seed warm catalog on disk");
+
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+    let registry = proxy.lazy_registry();
+
+    assert_eq!(
+        registry.protocol_version("files").as_deref(),
+        Some("2026-07-28"),
+        "loaded warm catalog must preserve the seeded protocol version (L6)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L7 — warm catalog load is keyed by `BinaryHasher::hash`, not a placeholder
+/// (live). A catalog seeded with a wrong hash must NOT be loaded for `files`.
+#[tokio::test]
+#[ignore] // spawns a real python stdio MCP server
+async fn lazy_l7_hash_key_identity() {
+    let dir = std::env::temp_dir().join(format!("mcp-proxy-lazy-l7-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = std::env::temp_dir().join(format!("mcp-lazy-min-l7-{}.py", std::process::id()));
+    std::fs::write(&server, LAZY_MIN_SERVER).expect("write server script");
+
+    let config = lazy_live_config(&dir, &server);
+
+    let files_cfg = config
+        .backends
+        .iter()
+        .find(|b| b.name == "files")
+        .expect("files backend present")
+        .clone();
+    let hash = BinaryHasher::hash(&files_cfg);
+
+    // Correct-hash catalog (this is the one that must load).
+    let catalog = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![lazy_ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        hash.clone(),
+    );
+    WarmCatalogStore::new(dir.clone())
+        .save(&catalog)
+        .expect("seed correct-hash warm catalog");
+
+    // Wrong-hash catalog (must NOT be loaded for "files").
+    let wrong = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![lazy_ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        "wrong-hash".to_string(),
+    );
+    WarmCatalogStore::new(dir.clone())
+        .save(&wrong)
+        .expect("seed wrong-hash warm catalog");
+
+    let proxy = Proxy::from_config(config)
+        .await
+        .expect("proxy with lazy backend must build");
+    let registry = proxy.lazy_registry();
+
+    let loaded = registry
+        .get("files")
+        .and_then(|b| b.catalog)
+        .expect("warm catalog must be loaded from disk (L7)");
+    assert_eq!(
+        loaded.identity_hash, hash,
+        "load must be keyed by BinaryHasher::hash, not a placeholder (L7)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

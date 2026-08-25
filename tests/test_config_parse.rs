@@ -2,7 +2,7 @@ use mcp_proxy::config::ProxyConfig;
 use std::path::Path;
 
 fn main() {
-    let config = ProxyConfig::load(Path::new("test_reverse_refs.toml")).unwrap();
+    let config = ProxyConfig::load(Path::new("examples/configs/test_reverse_refs.toml")).unwrap();
     println!(
         "Backends: {:?}",
         config

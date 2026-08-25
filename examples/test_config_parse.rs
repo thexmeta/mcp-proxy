@@ -3,7 +3,7 @@ use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let default_path = "test_reverse_refs.toml".to_string();
+    let default_path = "examples/configs/test_reverse_refs.toml".to_string();
     let config_path = args.get(1).unwrap_or(&default_path);
     let config = ProxyConfig::load(Path::new(config_path)).unwrap();
     println!(

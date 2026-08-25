@@ -81,6 +81,7 @@ impl ProxyBuilder {
                 cache: CacheBackendConfig::default(),
                 observability: ObservabilityConfig::default(),
                 composite_tools: Vec::new(),
+                warm_cache: crate::config::WarmCacheConfig::default(),
                 source_path: None,
             },
         }
@@ -538,6 +539,9 @@ fn default_backend() -> BackendConfig {
         endpoint_groups: Vec::new(),
         tool_groups: Vec::new(),
         protocol_version: None,
+        spawn_mode: SpawnMode::default(),
+        idle_timeout_secs: None,
+        cache_key_suffix: None,
     }
 }
 

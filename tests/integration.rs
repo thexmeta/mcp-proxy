@@ -19,7 +19,7 @@ use mcp_proxy::alias::{AliasMap, AliasService};
 use mcp_proxy::cache::CacheService;
 use mcp_proxy::canary::CanaryService;
 use mcp_proxy::coalesce::CoalesceService;
-use mcp_proxy::config::{BackendCacheConfig, CacheBackendConfig};
+use mcp_proxy::config::{BackendCacheConfig, CacheBackendConfig, WarmCacheConfig};
 use mcp_proxy::config::{BackendFilter, InjectArgsConfig, NameFilter};
 use mcp_proxy::config::{ListenConfig, ObservabilityConfig, PerformanceConfig, SecurityConfig};
 use mcp_proxy::config::{ProtocolSupportConfig, ProxyConfig, ProxySettings};
@@ -1089,6 +1089,7 @@ fn make_proxy_config(protocol_versions: Vec<&str>) -> ProxyConfig {
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: ObservabilityConfig::default(),
     }
@@ -1571,4 +1572,209 @@ fn conformance_client_checks_placeholder() {
         "PLACEHOLDER: MCP client conformance suite (265 checks) not yet integrated. \
          Will be implemented when the conformance test binary is available."
     );
+}
+
+// ===========================================================================
+// Lazy backend registration regression (fast, in-process python server)
+// ===========================================================================
+
+use mcp_proxy::Proxy;
+use mcp_proxy::config::{BackendConfig, SpawnMode, TransportType};
+use mcp_proxy::lazy_registry::SpawnState;
+use mcp_proxy::warm_cache::{BinaryHasher, WarmCatalog, WarmCatalogStore};
+
+/// Minimal newline-delimited MCP stdio server (Python stdlib only). Exposes one
+/// `ping` tool and advertises protocol version `2026-07-28`. tower-mcp's
+/// `StdioClientTransport` speaks newline-delimited JSON (one object per line +
+/// `\n`); a Content-Length-framed server DEADLOCKS.
+const MIN_MCP_SERVER: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2026-07-28","capabilities":{"tools":{}},"serverInfo":{"name":"min-server","version":"1.0.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Return pong","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}],"isError":False}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+
+/// A namespaced `ping` tool definition for the seeded warm catalog.
+fn ping_tool() -> tower_mcp_types::protocol::ToolDefinition {
+    tower_mcp_types::protocol::ToolDefinition {
+        name: "ping".to_string(),
+        title: None,
+        description: Some("Return pong".to_string()),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        icons: None,
+        annotations: None,
+        execution: None,
+        meta: None,
+    }
+}
+
+/// Regression: a lazy backend is registered in the lazy registry (Down) but is
+/// NOT eagerly added to the proxy's routing namespaces, and its warm catalog
+/// (seeded on disk) is loaded at startup and contains the namespaced tool.
+#[tokio::test]
+async fn lazy_backend_registered_down_and_not_in_proxy_namespaces() {
+    let dir = std::env::temp_dir().join(format!(
+        "mcp-proxy-int-lazy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create cache dir");
+    let server = dir.join("mcp-min-srv-int.py");
+    std::fs::write(&server, MIN_MCP_SERVER).expect("write server script");
+
+    let cfg = ProxyConfig {
+        proxy: ProxySettings {
+            name: "lazy-int-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support: ProtocolSupportConfig::default(),
+        },
+        backends: vec![
+            // Dummy eager backend (real MCP server) so the shared McpProxy has
+            // at least one backend to build. `enabled: true` is REQUIRED.
+            BackendConfig {
+                name: "__dummy__".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            // Lazy stdio backend under test.
+            BackendConfig {
+                name: "files".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                spawn_mode: SpawnMode::Lazy,
+                idle_timeout_secs: Some(30),
+                ..Default::default()
+            },
+        ],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig {
+            enabled: true,
+            dir: Some(dir.clone()),
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        },
+        source_path: None,
+        observability: ObservabilityConfig::default(),
+    };
+
+    // Seed a warm catalog on disk BEFORE building the proxy.
+    let files_cfg = cfg
+        .backends
+        .iter()
+        .find(|b| b.name == "files")
+        .expect("files backend present")
+        .clone();
+    let hash = BinaryHasher::hash(&files_cfg);
+    let catalog = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        hash,
+    );
+    WarmCatalogStore::new(dir.clone())
+        .save(&catalog)
+        .expect("seed warm catalog on disk");
+
+    let proxy = Proxy::from_config(cfg).await.expect("proxy builds");
+    let reg = proxy.lazy_registry();
+
+    // Registered by name in the lazy registry.
+    assert!(
+        reg.names().contains(&"files".to_string()),
+        "lazy backend 'files' must be registered in the lazy registry"
+    );
+    // Down at startup (not eagerly spawned).
+    assert_eq!(
+        reg.spawn_state("files"),
+        SpawnState::Down,
+        "lazy backend must be Down at startup"
+    );
+    // NOT eagerly added to the proxy's routing namespaces.
+    assert!(
+        !reg.proxy_has_namespace("files"),
+        "lazy backend must not be eagerly added to the proxy namespaces"
+    );
+    // Loaded warm catalog contains the namespaced tool.
+    let loaded = reg
+        .get("files")
+        .and_then(|b| b.catalog)
+        .expect("warm catalog must be loaded from disk at startup");
+    assert_eq!(
+        loaded.tools.len(),
+        1,
+        "loaded catalog must contain one tool"
+    );
+    assert_eq!(
+        loaded.tools[0].name, "files/ping",
+        "loaded tool must be namespaced as files/ping"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

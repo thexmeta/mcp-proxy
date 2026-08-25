@@ -1,0 +1,56 @@
+# Lazy backend spawning with a persistent warm tool cache.
+#
+# Demonstrates the lazy/on-demand backend spawning feature. Backends marked
+# `spawn_mode = "lazy"` are NOT spawned at startup. Their tool catalog is served
+# from a persisted warm cache (so `tools/list` always shows them), and the
+# backend process is spawned on the first `tools/call` (coalesced across
+# concurrent first-calls). Idle stateless (2026-07-28) backends are terminated
+# after `idle_timeout_secs`; the warm catalog survives restarts.
+#
+# Usage: mcp-proxy --config examples/lazy-backend.toml
+
+[proxy]
+name = "lazy-gateway"
+version = "0.1.0"
+separator = "/"
+
+[proxy.listen]
+host = "127.0.0.1"
+port = 8080
+
+# Warm tool cache: persisted catalog JSON files on disk.
+# `enabled = true` turns on the warm cache; `dir` is where catalogs are stored
+# (omit `dir` to use a platform default such as <cache_dir>/mcp-proxy/warm).
+# `ttl_secs` is the maximum age of a catalog before it is treated as stale
+# (0 = never expire by age; only invalidated by an identity-hash change).
+[warm_cache]
+enabled = true
+dir = "/tmp/mcp-proxy-warm"
+ttl_secs = 3600
+
+# Eager backend (default): spawned at startup and kept running continuously.
+[[backends]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+# spawn_mode defaults to "eager" when omitted (backward compatible).
+
+# Lazy backend: NOT spawned at startup. Its tools appear in `tools/list` from
+# the persisted warm cache. The first `tools/call` spawns it on demand
+# (coalesced). After 600s (10 min) of inactivity, a stateless (2026-07-28)
+# backend is terminated; session-based (2025-11-25) backends are kept alive.
+# `cache_key_suffix` is folded into the warm-cache identity hash so a launcher
+# version bump (e.g. an `uvx` package version) forces a cache invalidation.
+[[backends]]
+name = "filesystem"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-filesystem", "/tmp"]
+spawn_mode = "lazy"
+idle_timeout_secs = 600
+cache_key_suffix = "v1"
+
+[observability]
+audit = true
+log_level = "info"

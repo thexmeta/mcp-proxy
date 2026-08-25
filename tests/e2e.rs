@@ -21,7 +21,7 @@ use mcp_proxy::alias::{AliasMap, AliasService};
 use mcp_proxy::cache::CacheService;
 use mcp_proxy::config::{
     BackendCacheConfig, BackendFilter, CacheBackendConfig, InjectArgsConfig, NameFilter,
-    PerformanceConfig, ProtocolSupportConfig, ProxyConfig, SecurityConfig,
+    PerformanceConfig, ProtocolSupportConfig, ProxyConfig, SecurityConfig, WarmCacheConfig,
 };
 use mcp_proxy::discover::DiscoverLayer;
 use mcp_proxy::filter::CapabilityFilterService;
@@ -191,6 +191,7 @@ async fn build_proxy() -> BoxCloneService<RouterRequest, RouterResponse, Infalli
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
@@ -245,6 +246,7 @@ async fn build_proxy_with_error_backend()
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
@@ -299,6 +301,7 @@ async fn build_proxy_with_slow_backend()
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
@@ -2287,6 +2290,7 @@ async fn build_proxy_with_protocol(
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };
@@ -2466,6 +2470,7 @@ async fn test_e2e_2026_middleware_stack_works_stateless() {
         security: SecurityConfig::default(),
         cache: CacheBackendConfig::default(),
         composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
         source_path: None,
         observability: mcp_proxy::config::ObservabilityConfig::default(),
     };

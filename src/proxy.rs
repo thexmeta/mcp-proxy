@@ -11,7 +11,6 @@ use axum::extract::{Path, Request};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::any;
-use tokio::process::Command;
 use tower::Layer;
 use tower::Service;
 use tower::timeout::TimeoutLayer;
@@ -48,6 +47,10 @@ pub struct Proxy {
     shared_proxy: McpProxy,
     config: ProxyConfig,
     endpoint_group_registry: crate::endpoint_router::EndpointGroupRegistry,
+    /// Registry of lazy backends (warm catalog + spawn state), shared across the
+    /// root stack, every endpoint-group stack, and the hot-reload path. Introduced
+    /// in Wave 3; the spawn guard / refcount / idle sweeper arrive in Waves 5-6.
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
     /// Shared alias map for hot-reload support. When hot reload is enabled,
     /// backends are added/removed dynamically and this map is updated so the
     /// global AliasService picks up new aliases without a restart.
@@ -101,24 +104,7 @@ pub(crate) async fn build_mcp_proxy_for_backends(
 
         match backend.transport {
             crate::config::TransportType::Stdio => {
-                let command = backend.command.as_deref().unwrap();
-                let args: Vec<&str> = backend.args.iter().map(|s| s.as_str()).collect();
-
-                let mut cmd = Command::new(command);
-                cmd.args(&args);
-
-                // Per-backend env vars (already includes global backend_env defaults)
-                for (key, value) in &backend.env {
-                    cmd.env(key, value);
-                }
-
-                if let Some(ref working_dir) = backend.working_dir {
-                    cmd.current_dir(working_dir);
-                }
-
-                let transport = tower_mcp::client::StdioClientTransport::spawn_command(&mut cmd)
-                    .await
-                    .with_context(|| format!("spawning backend '{}'", backend.name))?;
+                let transport = crate::stdio_spawn::spawn_stdio_transport(backend).await?;
 
                 builder = builder.backend(&backend.name, transport).await;
             }
@@ -180,6 +166,185 @@ pub(crate) async fn build_mcp_proxy_for_backends(
     }
 
     Ok((result.proxy, cb_handles))
+}
+
+/// Build the [`LazyBackendRegistry`] from the startup [`ProxyConfig`].
+///
+/// For every enabled stdio backend configured with `spawn_mode = "lazy"`:
+/// 1. Compute its identity hash via [`crate::warm_cache::BinaryHasher`].
+/// 2. Try to load a persisted [`WarmCatalog`] from the warm cache store.
+/// 3. On a cache miss, attempt a one-shot [`crate::warm_cache::ProbeRunner`] probe;
+///    on success persist the catalog, on failure log a warning and proceed with
+///    `catalog = None` (degrade to lazy — NFR-003). A probe error NEVER aborts
+///    startup.
+///
+/// After the registry is built, orphaned cache files are pruned: any
+/// `{name}-{hash}.json` whose `(name, hash)` no longer matches a configured
+/// backend is deleted (C7/C24). Pruning is scoped by `(name, hash)`, never name
+/// alone, and all errors are logged and swallowed.
+///
+/// Eager/HTTP/WebSocket backends are intentionally NOT added here — they continue
+/// to spawn eagerly through [`build_mcp_proxy_for_backends`]. The lazy registry
+/// only ADDS entries; it does not remove backends from `all_backend_refs`
+/// (that change arrives with Wave 4's serving layer).
+async fn build_lazy_registry(
+    config: &ProxyConfig,
+    shared_proxy: McpProxy,
+) -> Arc<crate::lazy_registry::LazyBackendRegistry> {
+    use crate::warm_cache::{BinaryHasher, ProbeRunner, WarmCatalogStore};
+
+    // Resolve the warm cache directory: explicit config, else platform default.
+    let cache_dir: std::path::PathBuf = match &config.warm_cache.dir {
+        Some(dir) => dir.clone(),
+        None => {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .ok()
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(".cache"));
+            base.join("mcp-proxy").join("catalog")
+        }
+    };
+
+    let store = WarmCatalogStore::new(cache_dir.clone());
+
+    let mut lazy_backends: Vec<crate::lazy_registry::LazyBackend> = Vec::new();
+
+    for backend in &config.backends {
+        if !backend.enabled
+            || backend.spawn_mode != crate::config::SpawnMode::Lazy
+            || backend.transport != crate::config::TransportType::Stdio
+        {
+            continue;
+        }
+
+        let hash = BinaryHasher::hash(backend);
+
+        // Try the persisted warm catalog first.
+        let catalog = match store.load(&backend.name, &hash) {
+            Some(catalog) => {
+                tracing::info!(
+                    name = %backend.name,
+                    hash = %hash,
+                    "Loaded warm catalog from cache"
+                );
+                Some(catalog)
+            }
+            None => {
+                // Cache miss: probe the backend once to capture its capabilities.
+                tracing::info!(
+                    name = %backend.name,
+                    hash = %hash,
+                    "Warm cache miss — probing backend"
+                );
+                match ProbeRunner::probe(backend, &config.proxy.separator).await {
+                    Ok(catalog) => {
+                        if let Err(e) = store.save(&catalog) {
+                            tracing::warn!(
+                                name = %backend.name,
+                                error = %e,
+                                "Failed to persist warm catalog; continuing without cache"
+                            );
+                        }
+                        Some(catalog)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            name = %backend.name,
+                            error = %e,
+                            "Warm catalog probe failed; backend will start without a warm cache"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        lazy_backends.push(crate::lazy_registry::LazyBackend {
+            config: backend.clone(),
+            // Propagate the warm catalog's protocol version (when present) so the
+            // registry surfaces it without re-spawning the backend (C20). A cache
+            // miss that falls back to a live probe also captures the version here.
+            protocol_version: catalog.as_ref().and_then(|c| c.protocol_version.clone()),
+            catalog,
+        });
+    }
+
+    let registry = Arc::new(
+        crate::lazy_registry::LazyBackendRegistry::from_backends(lazy_backends).with_runtime(
+            shared_proxy.clone(),
+            &store,
+            config.proxy.separator.clone(),
+        ),
+    );
+
+    // Startup cache GC (C7/C24): prune (name, hash)-orphaned catalog files.
+    prune_orphaned_catalogs(config, &store);
+
+    registry
+}
+
+/// Prune warm catalog files that no longer correspond to a configured backend.
+///
+/// For each `{name}-{hash}.json` in the cache directory, recompute the expected
+/// hash for the named backend (if it exists) and delete the file when either the
+/// backend is absent or its current hash differs. Scoped by `(name, hash)` — a
+/// file is never deleted based on name alone. All errors are logged and swallowed.
+fn prune_orphaned_catalogs(config: &ProxyConfig, store: &crate::warm_cache::WarmCatalogStore) {
+    use crate::warm_cache::BinaryHasher;
+
+    // Map of backend name -> current identity hash for stdio backends.
+    let current_hashes: std::collections::HashMap<&str, String> = config
+        .backends
+        .iter()
+        .filter(|b| b.transport == crate::config::TransportType::Stdio)
+        .map(|b| (b.name.as_str(), BinaryHasher::hash(b)))
+        .collect();
+
+    let entries = match std::fs::read_dir(store.cache_dir()) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(error = %e, "Warm cache GC: cannot read cache dir");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Only consider files shaped like `{name}-{hash}`.
+        let (name, hash) = match file_stem.rsplit_once('-') {
+            Some((name, hash)) => (name.to_string(), hash.to_string()),
+            None => continue,
+        };
+
+        let is_orphan = match current_hashes.get(name.as_str()) {
+            Some(current_hash) => current_hash != &hash,
+            None => true,
+        };
+
+        if is_orphan {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Warm cache GC: failed to remove orphaned catalog"
+                );
+            } else {
+                tracing::info!(path = %path.display(), "Warm cache GC: pruned orphaned catalog");
+            }
+        }
+    }
 }
 
 /// Apply per-backend middleware layers to the builder.
@@ -398,10 +563,25 @@ impl Proxy {
 
         // Step 2: Build ONE shared McpProxy with ALL backends.
         // Each stdio backend spawns exactly one child process.
-        let all_backend_refs: Vec<&crate::config::BackendConfig> = config.backends.iter().collect();
+        //
+        // Lazy backends (`spawn_mode = "lazy"`) are intentionally EXCLUDED from
+        // the shared proxy here: they must NOT be spawned at startup. They are
+        // registered in the `LazyBackendRegistry` (built just below) and only
+        // spawned on first action request (coalesced) or probed for their warm
+        // catalog. Eager/HTTP/WebSocket backends are spawned as before (AC-008).
+        let all_backend_refs: Vec<&crate::config::BackendConfig> = config
+            .backends
+            .iter()
+            .filter(|b| b.spawn_mode != crate::config::SpawnMode::Lazy)
+            .collect();
         tracing::info!(
             total_backend_count = all_backend_refs.len(),
-            "Building shared McpProxy with ALL backends"
+            lazy_backend_count = config
+                .backends
+                .iter()
+                .filter(|b| b.spawn_mode == crate::config::SpawnMode::Lazy)
+                .count(),
+            "Building shared McpProxy with eager backends (lazy backends registered, not spawned)"
         );
 
         let (shared_proxy, cb_handles) = build_mcp_proxy_for_backends(
@@ -415,6 +595,24 @@ impl Proxy {
 
         tracing::info!("Shared McpProxy built — all backends spawned, each exactly once");
 
+        // Step 2b: Build the lazy backend registry (Wave 3).
+        //
+        // NOTE: For Wave 3, lazy backends are STILL eagerly spawned above via
+        // `build_mcp_proxy_for_backends` (they remain in `all_backend_refs`).
+        // The actual "skip eager spawn for lazy" behavior requires the
+        // WarmCatalogService serving layer (Wave 4) so `tools/list` can be served
+        // from the warm catalog while the process is down. Wave 3 only:
+        //   - builds the registry of lazy stdio backends,
+        //   - loads-or-probes a WarmCatalog for each (probe errors degrade gracefully),
+        //   - prunes orphaned cache files scoped by (name, hash).
+        // Eager/HTTP/WebSocket backends are unchanged (AC-008).
+        let lazy_registry = build_lazy_registry(&config, shared_proxy.clone()).await;
+
+        // Start the idle sweeper for lazy backends (Wave 6). Polls every 5s; the
+        // per-backend `idle_timeout_secs` gates actual idle-out. Session-based
+        // (2025-11-25) backends are never idle-out (kept alive, C3).
+        lazy_registry.start_sweeper(5);
+
         let proxy_for_admin = shared_proxy.clone();
         let mut proxy_for_caller = shared_proxy.clone();
         let proxy_for_management = shared_proxy.clone();
@@ -425,6 +623,7 @@ impl Proxy {
             &config,
             Some(&endpoint_group_registry),
             Some(&shared_proxy),
+            lazy_registry.clone(),
         )
         .await?;
 
@@ -444,7 +643,7 @@ impl Proxy {
         let metrics_handle = None;
 
         let (service, cache_handle, alias_map) =
-            build_middleware_stack(&config, shared_proxy.clone())?;
+            build_middleware_stack(&config, shared_proxy.clone(), lazy_registry.clone())?;
 
         // Configure protocol version support for the HTTP transport.
         // Shared with endpoint-group routes via `build_protocol_support`.
@@ -566,6 +765,7 @@ impl Proxy {
             shared_proxy,
             config,
             endpoint_group_registry,
+            lazy_registry,
             alias_map,
             #[cfg(feature = "discovery")]
             discovery_index,
@@ -592,6 +792,16 @@ impl Proxy {
         self.shared_proxy.clone()
     }
 
+    /// Get a clone of the lazy backend registry.
+    ///
+    /// Tracks per-backend warm catalogs and spawn state for backends configured
+    /// with `spawn_mode = "lazy"`. Shared across the root stack, every
+    /// endpoint-group stack, and the hot-reload path so a backend referenced by
+    /// multiple groups uses ONE child process (C5/C18).
+    pub fn lazy_registry(&self) -> Arc<crate::lazy_registry::LazyBackendRegistry> {
+        self.lazy_registry.clone()
+    }
+
     /// Enable hot reload by watching the given config file path.
     ///
     /// New backends added to the config file will be connected dynamically
@@ -609,6 +819,7 @@ impl Proxy {
             self.endpoint_group_registry.clone(),
             watchers,
             self.alias_map.clone(),
+            self.lazy_registry.clone(),
             #[cfg(feature = "discovery")]
             self.discovery_index
                 .as_ref()
@@ -769,7 +980,11 @@ type MiddlewareStack = (
 );
 
 /// Build the MCP-level middleware stack around the proxy.
-fn build_middleware_stack(config: &ProxyConfig, proxy: McpProxy) -> Result<MiddlewareStack> {
+fn build_middleware_stack(
+    config: &ProxyConfig,
+    proxy: McpProxy,
+    lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
+) -> Result<MiddlewareStack> {
     let mut service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
         BoxCloneService::new(proxy);
 
@@ -777,6 +992,19 @@ fn build_middleware_stack(config: &ProxyConfig, proxy: McpProxy) -> Result<Middl
     // Shared with endpoint-group routes via `apply_2026_layers` to prevent drift.
     tracing::info!("Applying 2026-07-28 layers (SubscriptionsListen, Discover, MetaValidation)");
     service = apply_2026_layers(service, config);
+
+    // Warm catalog serving (C11/C19): outermost of the capability layers,
+    // immediately after the 2026 trio. Appends cached List* entries for down
+    // lazy backends. Root stack scope is `None` (all lazy backends).
+    tracing::info!("Applying warm catalog serving layer (root stack)");
+    service = BoxCloneService::new(
+        crate::warm_catalog_service::WarmCatalogLayer::new(
+            lazy_registry,
+            config.proxy.separator.clone(),
+            None,
+        )
+        .layer(service),
+    );
 
     let mut cache_handle: Option<cache::CacheHandle> = None;
 
@@ -1544,5 +1772,208 @@ mod protocol_support_tests {
             "ListTools should pass through to the inner service, got: {:?}",
             list_resp.inner
         );
+    }
+}
+
+/// Unit test: `build_lazy_registry` loads a warm catalog from disk at startup
+/// for a lazy backend that is registered Down (served from cache, not spawned).
+///
+/// The lazy backend points at a real python server (so `Proxy::from_config`
+/// would spawn it on demand), but at startup it must remain Down and expose the
+/// seeded warm catalog. The dummy eager backend MUST point at a real spawnable
+/// server so `Proxy::from_config` can build the shared proxy.
+#[cfg(test)]
+mod lazy_warm_catalog_startup_tests {
+    use super::*;
+    use crate::config::{BackendConfig, ProxySettings, SpawnMode, TransportType, WarmCacheConfig};
+    use crate::lazy_registry::SpawnState;
+    use crate::warm_cache::{BinaryHasher, WarmCatalog, WarmCatalogStore};
+    use std::io::Write;
+    use tower_mcp_types::protocol::ToolDefinition;
+
+    /// Minimal newline-delimited MCP stdio server (Python stdlib only). Exposes
+    /// one `ping` tool. tower-mcp's `StdioClientTransport` speaks
+    /// newline-delimited JSON (one object per line + `\n`); a Content-Length
+    /// framed server DEADLOCKS.
+    const MIN_MCP_SERVER: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2026-07-28","capabilities":{"tools":{}},"serverInfo":{"name":"min-server","version":"1.0.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Return pong","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}],"isError":False}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+
+    fn ping_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "ping".to_string(),
+            title: None,
+            description: Some("Return pong".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icons: None,
+            annotations: None,
+            execution: None,
+            meta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_lazy_registry_loads_warm_catalog_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-proxy-unit-lazy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        let server = dir.join("mcp-min-srv-unit.py");
+        {
+            let mut f = std::fs::File::create(&server).expect("create server script");
+            f.write_all(MIN_MCP_SERVER.as_bytes())
+                .expect("write server script");
+        }
+
+        let cfg = ProxyConfig {
+            proxy: ProxySettings {
+                name: "lazy-unit-proxy".to_string(),
+                version: "1.0.0".to_string(),
+                separator: "/".to_string(),
+                listen: crate::config::ListenConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                },
+                instructions: None,
+                shutdown_timeout_seconds: 30,
+                hot_reload: false,
+                import_backends: None,
+                rate_limit: None,
+                client_rate_limit: None,
+                tool_discovery: false,
+                tool_exposure: crate::config::ToolExposure::default(),
+                expose_grouped_in_default: false,
+                endpoint_groups: vec![],
+                tool_groups: vec![],
+                watchers: vec![],
+                backend_env: std::collections::HashMap::new(),
+                timeout: None,
+                circuit_breaker: None,
+                retry: None,
+                endpoint_group_list: vec![],
+                protocol_support: crate::config::ProtocolSupportConfig::default(),
+            },
+            backends: vec![
+                // Dummy eager backend (real MCP server) so the shared McpProxy
+                // has at least one backend to build. `enabled: true` is REQUIRED.
+                BackendConfig {
+                    name: "__dummy__".to_string(),
+                    enabled: true,
+                    transport: TransportType::Stdio,
+                    command: Some("python3".to_string()),
+                    args: vec![server.to_string_lossy().to_string()],
+                    ..Default::default()
+                },
+                // Lazy stdio backend under test (Down, served from cache).
+                BackendConfig {
+                    name: "files".to_string(),
+                    enabled: true,
+                    transport: TransportType::Stdio,
+                    command: Some("python3".to_string()),
+                    args: vec![server.to_string_lossy().to_string()],
+                    spawn_mode: SpawnMode::Lazy,
+                    idle_timeout_secs: Some(30),
+                    ..Default::default()
+                },
+            ],
+            auth: None,
+            performance: crate::config::PerformanceConfig::default(),
+            security: crate::config::SecurityConfig::default(),
+            cache: crate::config::CacheBackendConfig::default(),
+            composite_tools: vec![],
+            warm_cache: WarmCacheConfig {
+                enabled: true,
+                dir: Some(dir.clone()),
+                ttl_secs: 0,
+                invalidate_on_hash_change: true,
+            },
+            source_path: None,
+            observability: crate::config::ObservabilityConfig::default(),
+        };
+
+        // Seed a warm catalog on disk BEFORE building the proxy.
+        let files_cfg = cfg
+            .backends
+            .iter()
+            .find(|b| b.name == "files")
+            .expect("files backend present")
+            .clone();
+        let hash = BinaryHasher::hash(&files_cfg);
+        let catalog = WarmCatalog::from_probe_result(
+            "files",
+            "/",
+            vec![ping_tool()],
+            vec![],
+            vec![],
+            vec![],
+            Some("2026-07-28".to_string()),
+            hash,
+        );
+        WarmCatalogStore::new(dir.clone())
+            .save(&catalog)
+            .expect("seed warm catalog on disk");
+
+        let proxy = Proxy::from_config(cfg).await.expect("proxy builds");
+        let reg = proxy.lazy_registry();
+
+        // The lazy backend must be Down (not spawned) but its cached tool is
+        // loaded from disk.
+        assert_eq!(
+            reg.spawn_state("files"),
+            SpawnState::Down,
+            "lazy backend must be Down at startup (served from cache)"
+        );
+        let loaded = reg
+            .get("files")
+            .and_then(|b| b.catalog)
+            .expect("warm catalog must be loaded from disk at startup");
+        assert_eq!(
+            loaded.tools.len(),
+            1,
+            "loaded catalog must contain one tool"
+        );
+        assert_eq!(
+            loaded.tools[0].name, "files/ping",
+            "loaded tool must be namespaced as files/ping"
+        );
+
+        let _ = std::fs::remove_file(&server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

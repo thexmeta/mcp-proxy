@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - `default_protocol_version` config option in `[proxy.protocol_support]`
 - Discover middleware for `server/discover` RPC (SEP-2575)
 - MetaValidation middleware for per-request `_meta` validation (SEP-2243)
+- **Lazy backend spawning with persistent warm tool cache**: backends with `spawn_mode = "lazy"` are not spawned at startup; their tool catalog is served from a persisted warm cache and the backend is spawned on first request (coalesced). Idle stateless (2026-07-28) backends are terminated after `idle_timeout_secs`; the warm catalog survives restarts. See `examples/configs/lazy-backend.toml`.
 
 ### Dependencies
 

@@ -180,6 +180,7 @@ pub mod filter;
 pub mod inject;
 #[cfg(feature = "oauth")]
 pub mod introspection;
+pub mod lazy_registry;
 pub mod mcp_compat;
 pub mod mcp_json;
 pub mod meta_validation;
@@ -195,11 +196,14 @@ pub mod reload;
 pub mod retry;
 #[cfg(feature = "skills")]
 pub mod skills;
+pub mod stdio_spawn;
 pub mod subscriptions;
 #[cfg(feature = "oauth")]
 pub mod token;
 pub mod tool_group;
 pub mod validation;
+pub mod warm_cache;
+pub mod warm_catalog_service;
 #[cfg(feature = "websocket")]
 pub mod ws_transport;
 

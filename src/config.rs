@@ -254,9 +254,46 @@ pub struct ProxyConfig {
     /// Composite tools that fan out to multiple backend tools.
     #[serde(default)]
     pub composite_tools: Vec<CompositeToolConfig>,
+    /// Warm tool-cache configuration for lazy/on-demand backend spawning.
+    #[serde(default)]
+    pub warm_cache: WarmCacheConfig,
     /// Path to the config file (set during load, not serialized).
     #[serde(skip)]
     pub source_path: Option<std::path::PathBuf>,
+}
+
+/// Warm tool-cache configuration for lazy/on-demand backend spawning.
+///
+/// Governs where warm catalogs are persisted and how long they remain valid.
+/// Consumed by later waves of the warm-cache feature; Wave 1 only adds the
+/// fields with safe defaults so existing configs keep deserializing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WarmCacheConfig {
+    /// Whether the warm cache is enabled. Default: false (opt-in, backward compatible).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory for warm catalog JSON files. `None` uses a platform default
+    /// (e.g. `<cache_dir>/mcp-proxy/warm`) when enabled.
+    #[serde(default)]
+    pub dir: Option<std::path::PathBuf>,
+    /// Maximum age (seconds) of a warm catalog before it is treated as stale.
+    /// `0` means "never expire by age" (only invalidated by identity-hash change).
+    #[serde(default)]
+    pub ttl_secs: u64,
+    /// If true, a changed backend identity hash invalidates (prunes) the old catalog.
+    #[serde(default = "default_true")]
+    pub invalidate_on_hash_change: bool,
+}
+
+impl Default for WarmCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        }
+    }
 }
 
 impl ProxyConfig {
@@ -833,6 +870,37 @@ pub struct BackendConfig {
     /// For HTTP, this sets the `MCP-Protocol-Version` header.
     /// Valid values: "2026-07-28", "2025-11-25"
     pub protocol_version: Option<String>,
+    /// Spawn mode for this backend.
+    /// `Eager` (default) keeps the backend process running continuously.
+    /// `Lazy` (later waves) allows the backend to be spawned on-demand and torn
+    /// down when idle, serving a warm tool catalog from disk while dead.
+    #[serde(default)]
+    pub spawn_mode: SpawnMode,
+    /// Idle timeout in seconds before a lazily-spawned backend is torn down.
+    /// Only meaningful when `spawn_mode = "lazy"`. `None` means never idle-timeout.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// Optional explicit suffix folded into the backend's warm-cache identity hash.
+    /// Use this to pin a launcher/package version (e.g. `npx` package version)
+    /// that cannot be auto-resolved offline, forcing a cache invalidation when it
+    /// changes. Hashed but never logged; see `BinaryHasher`.
+    #[serde(default)]
+    pub cache_key_suffix: Option<String>,
+}
+
+/// Backend spawn mode.
+///
+/// Controls whether a backend process runs continuously (`Eager`) or is spawned
+/// on demand and allowed to idle out (`Lazy`). `Lazy` is consumed by later waves
+/// of the warm-cache feature; Wave 1 only adds the field with a safe default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpawnMode {
+    /// Keep the backend process running continuously (default, backward compatible).
+    #[default]
+    Eager,
+    /// Spawn on demand; tear down when idle. Serves warm catalog from disk while dead.
+    Lazy,
 }
 
 /// Backend transport protocol.
@@ -1827,6 +1895,7 @@ impl ProxyConfig {
             cache: CacheBackendConfig::default(),
             observability: ObservabilityConfig::default(),
             composite_tools: Vec::new(),
+            warm_cache: WarmCacheConfig::default(),
             source_path: Some(path.to_path_buf()),
         };
 

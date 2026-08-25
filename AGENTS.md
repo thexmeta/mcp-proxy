@@ -57,7 +57,7 @@ tests/
   e2e.rs           # Comprehensive E2E test suite (44 tests, 10 tiers)
 
 examples/
-  *.toml           # Example proxy configs for different deployment patterns
+  configs/*.toml  # Example proxy configs for different deployment patterns
   docker-compose/  # Docker compose example with HTTP backend
 ```
 

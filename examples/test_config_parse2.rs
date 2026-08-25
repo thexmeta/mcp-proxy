@@ -2,7 +2,7 @@ use mcp_proxy::config::ProxyConfig;
 use std::path::Path;
 
 fn main() {
-    let config = ProxyConfig::load(Path::new("examples/endpoint_groups.toml")).unwrap();
+    let config = ProxyConfig::load(Path::new("examples/configs/endpoint_groups.toml")).unwrap();
     println!(
         "Backends: {:?}",
         config

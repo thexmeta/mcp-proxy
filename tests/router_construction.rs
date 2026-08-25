@@ -16,6 +16,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -538,6 +539,7 @@ async fn test_reverse_reference_group_membership_via_config() {
         &config,
         Some(&registry),
         Some(&shared_proxy),
+        Arc::new(mcp_proxy::lazy_registry::LazyBackendRegistry::from_backends(vec![])),
     )
     .await
     .expect("build_endpoint_group_routers must succeed (reverse refs resolved)");

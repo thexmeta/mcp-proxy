@@ -28,6 +28,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::config::SpawnMode;
+
 use crate::config::{BackendConfig, TransportType};
 
 /// Top-level `.mcp.json` structure.
@@ -138,6 +140,9 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         endpoint_groups: Vec::new(),
         tool_groups: Vec::new(),
         protocol_version: None,
+        spawn_mode: SpawnMode::default(),
+        idle_timeout_secs: None,
+        cache_key_suffix: None,
     })
 }
 

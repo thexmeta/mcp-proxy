@@ -15,6 +15,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -140,6 +141,7 @@ async fn spawn_parity_server(versions: &[&str]) -> (SocketAddr, tokio::task::Joi
             &config,
             Some(&registry),
             Some(&shared_proxy),
+            Arc::new(mcp_proxy::lazy_registry::LazyBackendRegistry::from_backends(vec![])),
         )
         .await
         .expect("build_endpoint_group_routers must succeed");
@@ -474,4 +476,116 @@ async fn test_endpoint_group_tool_scoping_preserved() {
     );
 
     handle.abort();
+}
+
+/// The warm-catalog serving layer (C11/C19) must be wired into the endpoint-group
+/// middleware stack WITHOUT breaking the build when a lazy backend is a member
+/// of the group. This locks in stack parity: the same `WarmCatalogLayer` that
+/// wraps the root `/` stack also wraps every endpoint-group stack.
+///
+/// We drive the real `build_endpoint_group_routers` with a lazy stdio backend
+/// (`spawn_mode = "lazy"`) placed in the group and assert the group routers
+/// build successfully (the layer is present and the registry is threaded
+/// through). A regression that dropped the layer or its registry argument would
+/// either fail to compile or panic here.
+#[tokio::test]
+async fn test_endpoint_group_builds_with_lazy_backend_in_group() {
+    let config_toml = r#"
+        [proxy]
+        name = "parity-proxy"
+        version = "1.0.0"
+        endpoint_group_list = ["search"]
+        expose_grouped_in_default = false
+        [proxy.listen]
+        port = 9099
+        [proxy.protocol_support]
+        versions = ["2026-07-28", "2025-11-25"]
+
+        [[backends]]
+        name = "search_srv"
+        transport = "stdio"
+        command = "echo"
+        endpoint_groups = ["search"]
+
+        [[backends]]
+        name = "lazy_files"
+        transport = "stdio"
+        command = "echo"
+        spawn_mode = "lazy"
+        endpoint_groups = ["search"]
+        "#;
+
+    let config = mcp_proxy::ProxyConfig::parse(config_toml).expect("config should parse");
+
+    // Shared proxy with in-process backends (lazy stdio backend is still
+    // eagerly spawned in Wave 3, so ChannelTransport stands in for it here).
+    let shared_proxy = McpProxy::builder(&config.proxy.name, &config.proxy.version)
+        .separator(&config.proxy.separator)
+        .backend("search_srv", ChannelTransport::new(search_router()))
+        .await
+        .backend("lazy_files", ChannelTransport::new(math_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("shared proxy should build");
+
+    // A warm catalog registry with a cached tool for the lazy backend. This is
+    // the data the WarmCatalogLayer will append to List* responses.
+    let warm_catalog = mcp_proxy::warm_cache::WarmCatalog::from_probe_result(
+        "lazy_files",
+        &config.proxy.separator,
+        vec![tower_mcp_types::protocol::ToolDefinition {
+            name: "read".to_string(),
+            title: None,
+            description: Some("read file".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icons: None,
+            annotations: None,
+            execution: None,
+            meta: None,
+        }],
+        vec![],
+        vec![],
+        vec![],
+        Some("2025-11-25".to_string()),
+        "testhash".to_string(),
+    );
+    let lazy_backend = mcp_proxy::lazy_registry::LazyBackend {
+        config: config
+            .backends
+            .iter()
+            .find(|b| b.name == "lazy_files")
+            .unwrap()
+            .clone(),
+        catalog: Some(warm_catalog),
+        protocol_version: None,
+    };
+    let lazy_registry =
+        Arc::new(mcp_proxy::lazy_registry::LazyBackendRegistry::from_backends(vec![lazy_backend]));
+
+    let registry = EndpointGroupRegistry::new();
+    let result = mcp_proxy::endpoint_router::build_endpoint_group_routers(
+        &config,
+        Some(&registry),
+        Some(&shared_proxy),
+        lazy_registry,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "endpoint-group routers (with lazy backend + warm-catalog layer) must build: {:?}",
+        result.err()
+    );
+    let (group_routers, grouped_names) = result.unwrap();
+    assert_eq!(
+        group_routers.len(),
+        1,
+        "exactly one endpoint group expected"
+    );
+    assert!(
+        grouped_names.contains("lazy_files"),
+        "lazy_files must be reported as a grouped backend, got {grouped_names:?}"
+    );
 }

@@ -293,6 +293,42 @@ Client B --> /coding/mcp --> [GroupFilter: coding]        --> McpProxy --> tavil
 
 This means a backend like `context7` shared between `search` and `coding` groups runs only one process, saving resources and simplifying management.
 
+### Lazy Backend Spawning & Warm Cache
+
+Backends marked `spawn_mode = "lazy"` are **not** spawned at startup. Instead, their tool catalog is served from a persisted **warm cache** on disk, so `tools/list` (and friends) always shows them even while the backend process is dead. The backend is spawned on the first `tools/call` (coalesced across concurrent first-calls), then torn down again once idle.
+
+**Why use it?**
+
+- **Fast startup** — heavy backends (e.g. `uvx`/`npx` servers) no longer block proxy boot.
+- **Always-visible catalog** — clients see the full tool list immediately, regardless of spawn state.
+- **Resource savings** — idle backends are terminated, freeing processes and memory.
+
+**Enable it** by setting `spawn_mode = "lazy"` on a backend and turning on the warm cache (a top-level `[warm_cache]` section):
+
+```toml
+[warm_cache]
+enabled = true
+dir = "/tmp/mcp-proxy-warm"   # optional; platform default if omitted
+ttl_secs = 3600               # 0 = never expire by age
+
+[[backends]]
+name = "filesystem"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-filesystem", "/tmp"]
+spawn_mode = "lazy"
+idle_timeout_secs = 600       # terminate after 10 min idle (stateless only)
+cache_key_suffix = "v1"       # folded into the cache identity hash
+```
+
+**`idle_timeout_secs` semantics (C3):** only meaningful for stateless `2026-07-28` backends. A lazy backend is terminated after this many seconds of inactivity. `None` means never idle-out; `Some(0)` keeps the backend alive. Session-based `2025-11-25` backends are **not** idle-timed-out (their sessions cannot be transparently recreated), so they stay running once spawned.
+
+**`cache_key_suffix`:** an optional string folded into the backend's warm-cache identity hash (computed from the resolved command, args, working directory, and env *keys* — never secret values). Use it to pin a launcher/package version (e.g. an `uvx` package version) that cannot be auto-resolved offline, forcing a cache invalidation when it changes.
+
+**On-demand spawn flow:** a `tools/call` for a down lazy backend triggers a spawn (coalesced so concurrent first-calls share one process), probes its live catalog, and reconciles it against the warm cache. The warm catalog is persisted to disk and **survives restarts** — after a restart the backend is again served from cache without respawn until the next call.
+
+See [`examples/configs/lazy-backend.toml`](examples/configs/lazy-backend.toml) for a complete, runnable-looking example.
+
 ### Global Backend Configuration
 
 Reduce config duplication with global defaults applied to all backends:

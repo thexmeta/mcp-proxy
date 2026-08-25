@@ -42,6 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+thiserror = "1"
 metrics = { version = "0.24.3", optional = true }
 metrics-exporter-prometheus = { version = "0.18.1", optional = true }
 opentelemetry = { version = "0.32", optional = true }
@@ -68,6 +69,8 @@ rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 dashmap = "6"
 tokio-stream = "0.1"
 http-body-util = "0.1.5"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 indexmap = "2"
