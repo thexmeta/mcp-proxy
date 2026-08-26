@@ -1450,6 +1450,123 @@ async fn os_endpoint_group_scopes_tools() {
     }
 }
 
+/// Live e2e regression: EVERY endpoint group must expose >0 tools.
+///
+/// This is the test that catches the `in_group()` warm-catalog bug. With the
+/// bug, endpoint groups containing ONLY lazy stdio backends (os, lsp, browser,
+/// desktop, python, cdp) returned 0 tools because the warm-catalog append
+/// silently failed. After the fix, each group exposes its lazy backends' cached
+/// tools.
+///
+/// Runs against the live config at `/home/mxadm/.mcp-proxy/config.toml`.
+#[tokio::test]
+#[ignore]
+async fn all_endpoint_groups_expose_tools() {
+    let addr = shared_proxy_addr();
+    let client = reqwest::Client::new();
+
+    let config = load_live_config();
+    assert!(
+        !config.proxy.endpoint_groups.is_empty(),
+        "live config must define endpoint groups"
+    );
+
+    let mut failures: Vec<(String, usize)> = Vec::new();
+    let mut results: Vec<(String, usize)> = Vec::new();
+
+    // Backends that have a warm catalog on disk (probed successfully). The
+    // probe is resilient to servers that don't support resources/list (it
+    // captures tools and skips the unsupported capability), so every backend
+    // that starts up should get a warm catalog. We only assert >0 for groups
+    // that have ≥1 backend with a warm catalog on disk — a group whose members
+    // all failed to probe (no warm catalog) would legitimately return 0.
+    let warm_cache_dir = config
+        .warm_cache
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let has_warm_catalog = |backend: &BackendConfig| -> bool {
+        let hash = BinaryHasher::hash(backend);
+        warm_cache_dir
+            .join(format!("{}-{}.json", backend.name, hash))
+            .exists()
+    };
+
+    for group in &config.proxy.endpoint_groups {
+        let path = group.path.clone();
+        let resp = client
+            .post(format!("http://{addr}{path}/mcp"))
+            .header("Content-Type", "application/json")
+            .body(
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                }))
+                .unwrap(),
+            )
+            .send()
+            .await;
+
+        let count = match resp {
+            Ok(r) if r.status().is_success() => {
+                let body: Value = r.json().await.expect("valid JSON");
+                body.get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(|t| t.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        };
+
+        eprintln!(
+            "endpoint group `{}` ({}) → {} tools",
+            group.name, path, count
+        );
+        results.push((group.name.clone(), count));
+
+        // Only groups with ≥1 backend that has a warm catalog on disk are
+        // expected to expose tools. Groups whose members all failed probing
+        // (no warm catalog) legitimately return 0 and are not a regression.
+        let group_has_warm_backend = config
+            .backends
+            .iter()
+            .filter(|b| b.endpoint_groups.contains(&group.name))
+            .any(has_warm_catalog);
+        if group_has_warm_backend && count == 0 {
+            failures.push((group.name.clone(), count));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "endpoint groups with warm-catalog backends returned 0 tools (in_group warm-catalog bug?): {:?}\nfull results: {:?}",
+        failures,
+        results
+    );
+}
+
+/// Live e2e regression: the default `/` endpoint must expose the full tool set
+/// (all HTTP backends + all grouped backends). With the `in_group()` bug this
+/// was unaffected, but it locks in the baseline tool count so a future
+/// regression that drops backends from the shared proxy is caught.
+#[tokio::test]
+#[ignore]
+async fn default_endpoint_exposes_full_tool_set() {
+    let addr = shared_proxy_addr();
+    let client = reqwest::Client::new();
+
+    let all_tools = list_all_tools(&client, addr).await;
+    eprintln!("default `/` endpoint exposes {} tools", all_tools.len());
+
+    assert!(
+        all_tools.len() >= 100,
+        "default endpoint should expose ≥100 tools (got {}), backends may be missing",
+        all_tools.len()
+    );
+}
+
 // ===========================================================================
 // Tests — lazy / on-demand backend spawning with persistent warm tool cache
 // ===========================================================================
@@ -1517,6 +1634,8 @@ fn lazy_live_config(dir: &Path, server: &Path) -> ProxyConfig {
             },
             instructions: None,
             shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
             hot_reload: false,
             import_backends: None,
             rate_limit: None,
@@ -1532,6 +1651,8 @@ fn lazy_live_config(dir: &Path, server: &Path) -> ProxyConfig {
             circuit_breaker: None,
             retry: None,
             endpoint_group_list: vec![],
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
         },
         backends: vec![

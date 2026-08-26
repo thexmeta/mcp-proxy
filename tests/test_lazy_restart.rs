@@ -34,6 +34,8 @@ fn lazy_config(dir: &Path, server: &Path) -> ProxyConfig {
             },
             instructions: None,
             shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
             hot_reload: false,
             import_backends: None,
             rate_limit: None,
@@ -49,6 +51,8 @@ fn lazy_config(dir: &Path, server: &Path) -> ProxyConfig {
             circuit_breaker: None,
             retry: None,
             endpoint_group_list: vec![],
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
         },
         backends: vec![

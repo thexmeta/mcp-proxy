@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use notify_debouncer_mini::new_debouncer;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tower::util::BoxCloneService;
 use tower_mcp::proxy::{BackendService, McpProxy};
@@ -316,6 +315,8 @@ async fn watch_loop(
         };
         new_config.resolve_env_vars();
 
+        let kill_timeout_secs = new_config.proxy.shutdown_kill_timeout_secs;
+
         let new_fingerprints: HashMap<String, String> = new_config
             .backends
             .iter()
@@ -378,7 +379,7 @@ async fn watch_loop(
                         // lazy -> eager: drop lazy registration, eager spawn.
                         (crate::config::SpawnMode::Lazy, crate::config::SpawnMode::Eager) => {
                             lazy_registry.unregister(&backend.name);
-                            if let Err(e) = add_backend(&proxy, backend).await {
+                            if let Err(e) = add_backend(&proxy, backend, kill_timeout_secs).await {
                                 tracing::error!(
                                     backend = %backend.name,
                                     error = %e,
@@ -403,7 +404,23 @@ async fn watch_loop(
                         // both eager: existing behavior — remove old, add new.
                         (crate::config::SpawnMode::Eager, crate::config::SpawnMode::Eager) => {
                             proxy.remove_backend(&backend.name).await;
-                            if let Err(e) = add_backend(&proxy, backend).await {
+                            if let Err(e) = add_backend(&proxy, backend, kill_timeout_secs).await {
+                                tracing::error!(
+                                    backend = %backend.name,
+                                    error = %e,
+                                    "Failed to replace backend via hot reload"
+                                );
+                            } else {
+                                tracing::info!(backend = %backend.name, "Backend replaced");
+                            }
+                        }
+                        // `Unset` should never reach here — `apply_global_defaults()`
+                        // resolves it to Eager/Lazy at load time. Treat defensively
+                        // as Eager (existing behavior) to keep the match exhaustive.
+                        (crate::config::SpawnMode::Unset, _)
+                        | (_, crate::config::SpawnMode::Unset) => {
+                            proxy.remove_backend(&backend.name).await;
+                            if let Err(e) = add_backend(&proxy, backend, kill_timeout_secs).await {
                                 tracing::error!(
                                     backend = %backend.name,
                                     error = %e,
@@ -426,11 +443,15 @@ async fn watch_loop(
                 "Adding new backend via hot reload"
             );
 
-            // AC-006: lazy backends are registered but NOT eagerly spawned.
-            if backend.spawn_mode == crate::config::SpawnMode::Lazy {
+            // AC-006: lazy STDIO backends are registered but NOT eagerly spawned.
+            // HTTP/WebSocket backends have no child process to defer, so "lazy"
+            // is meaningless for them — always spawn eagerly.
+            if backend.spawn_mode == crate::config::SpawnMode::Lazy
+                && backend.transport == crate::config::TransportType::Stdio
+            {
                 lazy_registry.register_lazy(backend.clone());
                 tracing::info!(backend = %backend.name, "Lazy backend added via hot reload (not spawned)");
-            } else if let Err(e) = add_backend(&proxy, backend).await {
+            } else if let Err(e) = add_backend(&proxy, backend, kill_timeout_secs).await {
                 tracing::error!(
                     backend = %backend.name,
                     error = %e,
@@ -737,7 +758,13 @@ async fn rebuild_endpoint_group(
 ///
 /// Shared by the hot-reload path and the lazy registry's spawn path (Wave 5) so
 /// per-backend middleware is applied identically (POS-004).
-pub(crate) async fn add_backend(proxy: &McpProxy, backend: &BackendConfig) -> anyhow::Result<()> {
+///
+/// `kill_timeout_secs` controls SIGTERM→SIGKILL escalation for stdio backends.
+pub(crate) async fn add_backend(
+    proxy: &McpProxy,
+    backend: &BackendConfig,
+    kill_timeout_secs: u64,
+) -> anyhow::Result<()> {
     // Skip disabled backends
     if !backend.enabled {
         tracing::info!(backend = %backend.name, "Skipping disabled backend");
@@ -754,24 +781,9 @@ pub(crate) async fn add_backend(proxy: &McpProxy, backend: &BackendConfig) -> an
 
     match backend.transport {
         TransportType::Stdio => {
-            let command = backend
-                .command
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("stdio backend requires 'command'"))?;
-            let args: Vec<&str> = backend.args.iter().map(|s| s.as_str()).collect();
-
-            let mut cmd = Command::new(command);
-            cmd.args(&args);
-            for (key, value) in &backend.env {
-                cmd.env(key, value);
-            }
-
-            if let Some(ref working_dir) = backend.working_dir {
-                cmd.current_dir(working_dir);
-            }
-
+            let kill_timeout = std::time::Duration::from_secs(kill_timeout_secs);
             let transport =
-                tower_mcp::client::StdioClientTransport::spawn_command(&mut cmd).await?;
+                crate::stdio_spawn::spawn_stdio_transport(backend, kill_timeout).await?;
 
             if has_middleware {
                 let layer = build_backend_layer(backend);

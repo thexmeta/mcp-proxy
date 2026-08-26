@@ -1,0 +1,48 @@
+# All-lazy proxy: every backend uses spawn_mode = "lazy".
+#
+# Backends are NOT spawned at startup. Their tool catalogs are served from
+# the warm cache (JSON files in ~/.cache/mcp-proxy/catalog/). The first
+# action request (CallTool, ReadResource, GetPrompt) triggers on-demand spawn.
+#
+# IMPORTANT: warm_cache MUST be enabled (it is by default) so that tools/list
+# returns cached capabilities at startup. Without warm cache, the proxy starts
+# but tools/list is empty until backends are spawned.
+#
+# First run: backends are probed to populate the warm cache (may take a moment).
+# Subsequent runs: cached catalogs are loaded instantly.
+
+[proxy]
+name = "all-lazy-proxy"
+version = "1.0.0"
+listen = { host = "127.0.0.1", port = 8080 }
+
+# Global defaults: all backends inherit lazy spawn + 10-minute idle timeout.
+default_spawn_mode = "lazy"
+default_idle_timeout_secs = 600
+
+# Warm cache is required for all-lazy to serve cached tools at startup.
+[warm_cache]
+enabled = true
+# dir defaults to ~/.cache/mcp-proxy/catalog/
+
+[[backends]]
+name = "files"
+transport = "stdio"
+command = "python3"
+args = ["examples/mcp_file_server.py"]
+# No spawn_mode -> inherits global "lazy" default.
+
+[[backends]]
+name = "tools"
+transport = "stdio"
+command = "node"
+args = ["examples/mcp_tool_server.js"]
+# No spawn_mode -> inherits global "lazy" default.
+
+# Override a specific backend to eager if needed:
+# [[backends]]
+# name = "always-on"
+# transport = "stdio"
+# command = "python3"
+# args = ["examples/mcp_always_on.py"]
+# spawn_mode = "eager"

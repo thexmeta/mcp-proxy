@@ -75,26 +75,69 @@ impl ProbeRunner {
             .await
             .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
 
+        // Tools are the critical capability — if listing tools fails the probe
+        // cannot produce a useful warm catalog, so propagate that error.
         let tools = client
             .list_all_tools()
             .await
             .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
-        let resources = client
-            .list_all_resources()
-            .await
-            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
-        let resource_templates = client
-            .list_all_resource_templates()
-            .await
-            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
-        let prompts = client
-            .list_all_prompts()
-            .await
-            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
+
+        // Resources / templates / prompts are best-effort: many servers (e.g.
+        // rust-mcp-filesystem) expose tools but NOT resources, and respond to
+        // `resources/list` with a "Server does not support resources" error.
+        // A failure here must NOT abort the whole probe — we still want the
+        // tools in the warm catalog. Capture an empty list and log instead.
+        let resources = match client.list_all_resources().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: resources/list unsupported, skipping"
+                );
+                vec![]
+            }
+        };
+        let resource_templates = match client.list_all_resource_templates().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: resource templates unsupported, skipping"
+                );
+                vec![]
+            }
+        };
+        let prompts = match client.list_all_prompts().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: prompts/list unsupported, skipping"
+                );
+                vec![]
+            }
+        };
 
         // Best-effort shutdown so the child exits cleanly; ignore errors so we
         // still return the captured catalog.
-        let _ = client.shutdown().await;
+        match client.shutdown().await {
+            Ok(()) => {
+                tracing::info!(
+                    name = %backend.name,
+                    "Warm catalog probe: shutdown sent"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: shutdown failed (child may have already exited)"
+                );
+            }
+        }
 
         Ok(WarmCatalog::from_probe_result(
             &backend.name,
@@ -286,5 +329,83 @@ while True:
         );
         // The catalog carries the real backend identity hash.
         assert_eq!(cat.identity_hash, BinaryHasher::hash(&backend));
+    }
+
+    /// Regression test: a server that exposes tools but does NOT support
+    /// `resources/list` (e.g. rust-mcp-filesystem, which responds with
+    /// "Server does not support resources") must still produce a warm catalog
+    /// containing its tools. Previously the probe aborted on the resources
+    /// error and the backend got NO warm catalog, so its tools were missing
+    /// from endpoint groups (e.g. `os` group showed only `term_*`, not `fs_*`).
+    #[tokio::test]
+    async fn probe_succeeds_when_resources_unsupported() {
+        let script = r#"
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":"2025-11-25",
+            "capabilities":{"tools":{"listChanged":False}},
+            "serverInfo":{"name":"no-resources","version":"0.1.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+            {"name":"read_file","description":"read","inputSchema":{"type":"object"}},
+            {"name":"write_file","description":"write","inputSchema":{"type":"object"}}]}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support resources (required for resources/list)"}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support resources"}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support prompts"}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+        let backend = BackendConfig {
+            name: "no-res-backend".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("python3".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            ..Default::default()
+        };
+
+        let res = ProbeRunner::probe(&backend, "/").await;
+        let cat = res.expect("probe must succeed even when resources unsupported");
+
+        // Tools are captured despite the resources error.
+        assert_eq!(cat.tools.len(), 2, "both tools must be captured");
+        assert_eq!(cat.tools[0].name, "no-res-backend/read_file");
+        assert_eq!(cat.tools[1].name, "no-res-backend/write_file");
+        // Resources/prompts are empty (skipped, not fatal).
+        assert!(
+            cat.resources.is_empty(),
+            "resources must be empty (unsupported)"
+        );
+        assert!(
+            cat.resource_templates.is_empty(),
+            "resource templates must be empty (unsupported)"
+        );
+        assert!(
+            cat.prompts.is_empty(),
+            "prompts must be empty (unsupported)"
+        );
     }
 }

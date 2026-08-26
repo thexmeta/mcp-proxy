@@ -105,16 +105,16 @@ impl<S> WarmCatalogService<S> {
 /// True if a namespaced name's backend prefix belongs to the group scope.
 ///
 /// With `None` scope (root stack) every name passes. With `Some(namespaces)`
-/// the name passes only if its backend prefix — the substring before the first
-/// `separator` — is a member of `namespaces` (C19).
-fn in_group(name: &str, scope: &Option<HashSet<String>>, separator: &str) -> bool {
+/// the name passes only if it is namespaced under one of the scoped backend
+/// prefixes (C19). The scope set stores prefixes WITH the trailing separator
+/// (e.g. `fs_`, `term_`), so we match by prefix (`name.starts_with(prefix)`)
+/// rather than splitting on the separator — splitting `term_ht_create_session`
+/// on `_` yields the bare token `term`, which would NOT match the scoped value
+/// `term_` and would wrongly exclude every group-scoped cached tool.
+fn in_group(name: &str, scope: &Option<HashSet<String>>, _separator: &str) -> bool {
     match scope {
         None => true,
-        Some(ns) => name
-            .split(separator)
-            .next()
-            .map(|p| ns.contains(p))
-            .unwrap_or(false),
+        Some(ns) => ns.iter().any(|prefix| name.starts_with(prefix)),
     }
 }
 

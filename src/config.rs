@@ -383,6 +383,21 @@ impl ProxyConfig {
             if backend.retry.is_none() {
                 backend.retry = self.proxy.retry.clone();
             }
+
+            // Global spawn mode default (per-backend Unset inherits proxy default).
+            if backend.spawn_mode == SpawnMode::Unset {
+                backend.spawn_mode = self.proxy.default_spawn_mode.clone();
+            }
+
+            // Global idle timeout default (per-backend None inherits proxy default).
+            if backend.idle_timeout_secs.is_none() {
+                backend.idle_timeout_secs = self.proxy.default_idle_timeout_secs;
+            }
+        }
+
+        // force_kill overrides shutdown_kill_timeout_secs to 0 (immediate SIGKILL).
+        if self.proxy.force_kill {
+            self.proxy.shutdown_kill_timeout_secs = 0;
         }
     }
 }
@@ -518,6 +533,16 @@ pub struct ProxySettings {
     /// Graceful shutdown timeout in seconds (default: 30)
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_seconds: u64,
+    /// Timeout (seconds) after SIGTERM before sending SIGKILL to stdio
+    /// backend child processes. Default: 2. Set to 0 to skip SIGTERM and
+    /// kill immediately.
+    #[serde(default = "default_shutdown_kill_timeout")]
+    pub shutdown_kill_timeout_secs: u64,
+    /// Force-kill all backend processes immediately on shutdown (skip SIGTERM).
+    /// When true, `shutdown_kill_timeout_secs` is treated as 0.
+    /// Useful for fast restarts when backends are slow to exit.
+    #[serde(default)]
+    pub force_kill: bool,
     /// Enable hot reload: watch config file for new backends
     #[serde(default)]
     pub hot_reload: bool,
@@ -603,6 +628,16 @@ pub struct ProxySettings {
     /// Controls which MCP protocol versions the HTTP server accepts.
     #[serde(default)]
     pub protocol_support: ProtocolSupportConfig,
+
+    /// Default spawn mode for backends that don't specify one.
+    /// Backends with `spawn_mode = "unset"` (the per-backend default) inherit
+    /// this value. Defaults to `Eager` (backward compatible).
+    #[serde(default = "default_spawn_mode_eager")]
+    pub default_spawn_mode: SpawnMode,
+    /// Default idle timeout (seconds) for lazily-spawned backends that don't
+    /// specify `idle_timeout_secs`. `None` means never idle-timeout.
+    #[serde(default)]
+    pub default_idle_timeout_secs: Option<u64>,
 }
 
 /// How backend tools are exposed to MCP clients.
@@ -893,14 +928,27 @@ pub struct BackendConfig {
 /// Controls whether a backend process runs continuously (`Eager`) or is spawned
 /// on demand and allowed to idle out (`Lazy`). `Lazy` is consumed by later waves
 /// of the warm-cache feature; Wave 1 only adds the field with a safe default.
+///
+/// `Unset` is the per-backend default: it inherits the proxy-level
+/// `default_spawn_mode` (which itself defaults to `Eager`). After config
+/// normalization ([`ProxyConfig::apply_global_defaults`]) no backend retains
+/// `Unset` — it is resolved to `Eager` or `Lazy`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpawnMode {
-    /// Keep the backend process running continuously (default, backward compatible).
+    /// Not specified; inherits the proxy-level `default_spawn_mode` (Eager).
     #[default]
+    Unset,
+    /// Keep the backend process running continuously (default, backward compatible).
     Eager,
     /// Spawn on demand; tear down when idle. Serves warm catalog from disk while dead.
     Lazy,
+}
+
+/// Serde default for [`ProxySettings::default_spawn_mode`]: resolves to `Eager`
+/// so the GLOBAL default is backward compatible (not `Unset`).
+fn default_spawn_mode_eager() -> SpawnMode {
+    SpawnMode::Eager
 }
 
 /// Backend transport protocol.
@@ -1501,6 +1549,10 @@ fn default_shutdown_timeout() -> u64 {
     30
 }
 
+fn default_shutdown_kill_timeout() -> u64 {
+    2
+}
+
 fn default_otlp_endpoint() -> String {
     "http://localhost:4317".to_string()
 }
@@ -1828,6 +1880,7 @@ impl ProxyConfig {
 
         config.source_path = Some(path.to_path_buf());
         config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -1871,6 +1924,8 @@ impl ProxyConfig {
                 },
                 instructions: None,
                 shutdown_timeout_seconds: default_shutdown_timeout(),
+                shutdown_kill_timeout_secs: default_shutdown_kill_timeout(),
+                force_kill: false,
                 hot_reload: false,
                 import_backends: None,
                 rate_limit: None,
@@ -1887,6 +1942,8 @@ impl ProxyConfig {
                 endpoint_group_list: Vec::new(),
                 watchers: default_watchers(),
                 protocol_support: ProtocolSupportConfig::default(),
+                default_spawn_mode: SpawnMode::Eager,
+                default_idle_timeout_secs: None,
             },
             backends,
             auth: None,
@@ -1928,6 +1985,7 @@ impl ProxyConfig {
     pub fn parse(toml: &str) -> Result<Self> {
         let mut config: Self = toml::from_str(toml).context("parsing config")?;
         config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -1957,6 +2015,7 @@ impl ProxyConfig {
     pub fn parse_yaml(yaml: &str) -> Result<Self> {
         let mut config: Self = serde_yaml::from_str(yaml).context("parsing YAML config")?;
         config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -2321,6 +2380,21 @@ impl ProxyConfig {
                     }
                 }
             }
+        }
+
+        // Warn when all backends are lazy and warm cache is disabled — tools/list
+        // will return empty until backends are spawned on demand.
+        let all_lazy = !self.backends.is_empty()
+            && self
+                .backends
+                .iter()
+                .all(|b| b.spawn_mode == SpawnMode::Lazy);
+        if all_lazy && !self.warm_cache.enabled {
+            tracing::warn!(
+                "all backends are lazy but warm_cache is disabled — \
+                 tools/list will return empty until backends are spawned on demand. \
+                 Enable warm_cache to serve cached capabilities at startup."
+            );
         }
 
         Ok(())
@@ -2715,6 +2789,69 @@ mod tests {
 
         assert!(config.performance.coalesce_requests);
         assert_eq!(config.security.max_argument_size, Some(1048576));
+    }
+
+    #[test]
+    fn test_shutdown_kill_timeout_default() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 2); // default
+        assert!(!config.proxy.force_kill); // default
+    }
+
+    #[test]
+    fn test_force_kill_parses_from_toml() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        force_kill = true
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.proxy.force_kill);
+        // parse() calls apply_global_defaults(), which overrides to 0
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_shutdown_kill_timeout_custom() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        shutdown_kill_timeout_secs = 5
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_force_kill_overrides_timeout() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        shutdown_kill_timeout_secs = 5
+        force_kill = true
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert!(config.proxy.force_kill);
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 0);
     }
 
     #[test]

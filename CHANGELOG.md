@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Endpoint groups with only lazy stdio backends returned 0 tools**: the `in_group()` helper in `WarmCatalogService` split tool names on the separator and matched the bare prefix (e.g. `"term"`) against the scope set, which stores prefixes WITH the trailing separator (e.g. `"term_"`). The mismatch caused every warm-catalog tool append for endpoint groups to silently fail, so groups containing ONLY lazy stdio backends (os, lsp, browser, desktop, python, cdp) exposed 0 tools. Fixed by matching on `name.starts_with(prefix)` instead of splitting. Added regression tests `g4_endpoint_group_with_only_lazy_stdio_exposes_warm_catalog_tools` and `g5_endpoint_group_cache_miss_probes_fs_like_backend` (both fail with the old code, pass with the fix) and live e2e tests `all_endpoint_groups_expose_tools` / `default_endpoint_exposes_full_tool_set`.
+- **Lazy backends that don't support `resources/list` got NO warm catalog**: the warm-catalog probe aborted on the first capability-listing error, so servers that expose tools but not resources (e.g. `rust-mcp-filesystem`, `roslyn`, `codebase`, `sequential_thinking`, `cedar_analysis`) produced no warm catalog and their tools were missing from endpoint groups (the `os` group showed only `term_*`, not `fs_*`). Fixed by making `resources`/`resource_templates`/`prompts` listings best-effort — a failure is logged and skipped, while `tools` (the critical capability) still propagates. Added regression test `probe_succeeds_when_resources_unsupported`. After this fix all 16 live backends get a warm catalog and every endpoint group exposes its tools.
+
+These two fixes were previously uncommitted working-tree edits; they are now durable in this commit. The deployed binary was rebuilt with both fixes, resolving the `os` endpoint-group regression (the `os` group now exposes the full 24-tool set: 17 `fs_*` + 7 `term_*`).
+
 ### Features
 
 - **Shared backend pool**: each backend spawns exactly once regardless of how many endpoint groups reference it

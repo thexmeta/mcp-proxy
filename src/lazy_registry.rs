@@ -101,6 +101,8 @@ pub struct LazyBackendRegistry {
     proxy: Option<McpProxy>,
     store: Option<Arc<WarmCatalogStore>>,
     separator: String,
+    /// SIGKILL timeout (seconds) for stdio backends during spawn.
+    kill_timeout_secs: u64,
     /// Test override for the backend spawn (see [`SpawnBackendFn`]).
     spawn_fn: Option<SpawnBackendFn>,
     /// Test override for the post-spawn probe (see [`ProbeBackendFn`]).
@@ -147,6 +149,7 @@ impl LazyBackendRegistry {
             proxy: None,
             store: None,
             separator: String::new(),
+            kill_timeout_secs: 2, // default, overridden by with_runtime
             spawn_fn: None,
             probe_fn: None,
             idle_out_fn: None,
@@ -162,10 +165,12 @@ impl LazyBackendRegistry {
         proxy: McpProxy,
         store: &WarmCatalogStore,
         separator: String,
+        kill_timeout_secs: u64,
     ) -> Self {
         self.proxy = Some(proxy);
         self.store = Some(store.clone_into_arc());
         self.separator = separator;
+        self.kill_timeout_secs = kill_timeout_secs;
         self
     }
 
@@ -396,7 +401,7 @@ impl LazyBackendRegistry {
                         "lazy registry runtime (proxy) not configured; cannot spawn '{name}'"
                     )
                 })?;
-                crate::reload::add_backend(&proxy, &config).await?;
+                crate::reload::add_backend(&proxy, &config, self.kill_timeout_secs).await?;
             }
         }
 
@@ -626,6 +631,42 @@ impl LazyBackendRegistry {
             }
         });
     }
+
+    /// Shut down all active lazy backends.
+    ///
+    /// Called during proxy shutdown to ensure child processes are terminated
+    /// promptly. Iterates all backends in `Up` state and removes them from
+    /// the proxy, which drops the transport and kills the child process.
+    pub async fn shutdown_all(&self) {
+        let names: Vec<String> = self
+            .backends
+            .iter()
+            .filter(|entry| *entry.value().state.lock().expect("state lock") == SpawnState::Up)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        if names.is_empty() {
+            return;
+        }
+
+        tracing::info!(count = names.len(), "Shutting down lazy backends");
+
+        for name in &names {
+            let removed = match &self.idle_out_fn {
+                Some(f) => f(name).await,
+                None => match &self.proxy {
+                    Some(proxy) => proxy.remove_backend(name).await,
+                    None => false,
+                },
+            };
+            if removed {
+                self.set_state_down(name);
+                tracing::info!(backend = %name, "Lazy backend shut down");
+            }
+        }
+
+        tracing::info!(count = names.len(), "All lazy backends shut down");
+    }
 }
 
 /// Name-set of a catalog's tools (for drift comparison).
@@ -671,7 +712,12 @@ mod tests {
             .build_strict()
             .await
             .expect("proxy builds");
-        LazyBackendRegistry::from_backends(vec![]).with_runtime(proxy, &store, "/".to_string())
+        LazyBackendRegistry::from_backends(vec![]).with_runtime(
+            proxy,
+            &store,
+            "/".to_string(),
+            2, // default kill_timeout_secs
+        )
     }
 
     /// Build a stdio [`BackendConfig`] with the given spawn mode + idle timeout.
@@ -1295,5 +1341,126 @@ mod tests {
             "concurrent first-calls must coalesce into exactly one spawn (R4/FR-006)"
         );
         assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    }
+
+    // ----------------------------------------------------------------------
+    // shutdown_all: terminates all Up backends.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shutdown_all_terminates_up_backends() {
+        let removed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let idle_out_fn: IdleOutFn = {
+            let removed = removed.clone();
+            Arc::new(move |name: &str| {
+                let removed = removed.clone();
+                let name = name.to_string();
+                Box::pin(async move {
+                    removed.lock().unwrap().push(name);
+                    true
+                })
+            })
+        };
+
+        // Backend A: Up
+        let config_a = BackendConfig {
+            name: "backend_a".to_string(),
+            transport: TransportType::Stdio,
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        // Backend B: Up
+        let config_b = BackendConfig {
+            name: "backend_b".to_string(),
+            transport: TransportType::Stdio,
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        // Backend C: Down (never spawned)
+        let config_c = BackendConfig {
+            name: "backend_c".to_string(),
+            transport: TransportType::Stdio,
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+
+        let reg = LazyBackendRegistry::from_backends(vec![
+            LazyBackend {
+                config: config_a,
+                catalog: None,
+                protocol_version: None,
+            },
+            LazyBackend {
+                config: config_b,
+                catalog: None,
+                protocol_version: None,
+            },
+            LazyBackend {
+                config: config_c,
+                catalog: None,
+                protocol_version: None,
+            },
+        ])
+        .with_idle_out_hook(idle_out_fn);
+
+        reg.mark_up_for_test("backend_a");
+        reg.mark_up_for_test("backend_b");
+        // backend_c stays Down
+
+        reg.shutdown_all().await;
+
+        let removed_names = removed.lock().unwrap();
+        assert!(
+            removed_names.contains(&"backend_a".to_string()),
+            "backend_a must be removed"
+        );
+        assert!(
+            removed_names.contains(&"backend_b".to_string()),
+            "backend_b must be removed"
+        );
+        assert_eq!(reg.spawn_state("backend_a"), SpawnState::Down);
+        assert_eq!(reg.spawn_state("backend_b"), SpawnState::Down);
+        // backend_c was never Up, so it should NOT be in the removed list.
+        assert!(
+            !removed_names.contains(&"backend_c".to_string()),
+            "backend_c (Down) must not be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_noop_when_no_backends_up() {
+        let removed = Arc::new(AtomicUsize::new(0));
+        let idle_out_fn: IdleOutFn = {
+            let removed = removed.clone();
+            Arc::new(move |_name: &str| {
+                let removed = removed.clone();
+                Box::pin(async move {
+                    removed.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            })
+        };
+
+        let config = BackendConfig {
+            name: "idle".to_string(),
+            transport: TransportType::Stdio,
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+
+        let reg = LazyBackendRegistry::from_backends(vec![LazyBackend {
+            config,
+            catalog: None,
+            protocol_version: None,
+        }])
+        .with_idle_out_hook(idle_out_fn);
+
+        // All backends are Down — shutdown_all should be a no-op.
+        reg.shutdown_all().await;
+        assert_eq!(
+            removed.load(Ordering::SeqCst),
+            0,
+            "no backends should be removed"
+        );
     }
 }

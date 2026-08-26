@@ -673,6 +673,7 @@ pub async fn build_single_endpoint_group(
                 &config.proxy.separator,
                 config.proxy.instructions.as_ref(),
                 &group_backends,
+                config.proxy.shutdown_kill_timeout_secs,
             )
             .await?;
             proxy

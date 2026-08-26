@@ -74,6 +74,7 @@ pub(crate) async fn build_mcp_proxy_for_backends(
     separator: &str,
     proxy_instructions: Option<&String>,
     backends: &[&crate::config::BackendConfig],
+    kill_timeout_secs: u64,
 ) -> Result<(McpProxy, HashMap<String, CbHandle>)> {
     let mut builder = McpProxy::builder(proxy_name, proxy_version).separator(separator);
     let mut cb_handles: HashMap<String, CbHandle> = HashMap::new();
@@ -104,7 +105,9 @@ pub(crate) async fn build_mcp_proxy_for_backends(
 
         match backend.transport {
             crate::config::TransportType::Stdio => {
-                let transport = crate::stdio_spawn::spawn_stdio_transport(backend).await?;
+                let kill_timeout = std::time::Duration::from_secs(kill_timeout_secs);
+                let transport =
+                    crate::stdio_spawn::spawn_stdio_transport(backend, kill_timeout).await?;
 
                 builder = builder.backend(&backend.name, transport).await;
             }
@@ -230,6 +233,10 @@ async fn build_lazy_registry(
                 tracing::info!(
                     name = %backend.name,
                     hash = %hash,
+                    tools = catalog.tools.len(),
+                    resources = catalog.resources.len(),
+                    prompts = catalog.prompts.len(),
+                    protocol_version = ?catalog.protocol_version,
                     "Loaded warm catalog from cache"
                 );
                 Some(catalog)
@@ -243,6 +250,14 @@ async fn build_lazy_registry(
                 );
                 match ProbeRunner::probe(backend, &config.proxy.separator).await {
                     Ok(catalog) => {
+                        tracing::info!(
+                            name = %backend.name,
+                            tools = catalog.tools.len(),
+                            resources = catalog.resources.len(),
+                            prompts = catalog.prompts.len(),
+                            protocol_version = ?catalog.protocol_version,
+                            "Warm catalog probe completed"
+                        );
                         if let Err(e) = store.save(&catalog) {
                             tracing::warn!(
                                 name = %backend.name,
@@ -274,11 +289,19 @@ async fn build_lazy_registry(
         });
     }
 
+    tracing::info!(
+        total = lazy_backends.len(),
+        with_catalog = lazy_backends.iter().filter(|b| b.catalog.is_some()).count(),
+        without_catalog = lazy_backends.iter().filter(|b| b.catalog.is_none()).count(),
+        "Lazy backend registry ready"
+    );
+
     let registry = Arc::new(
         crate::lazy_registry::LazyBackendRegistry::from_backends(lazy_backends).with_runtime(
             shared_proxy.clone(),
             &store,
             config.proxy.separator.clone(),
+            config.proxy.shutdown_kill_timeout_secs,
         ),
     );
 
@@ -572,7 +595,14 @@ impl Proxy {
         let all_backend_refs: Vec<&crate::config::BackendConfig> = config
             .backends
             .iter()
-            .filter(|b| b.spawn_mode != crate::config::SpawnMode::Lazy)
+            .filter(|b| {
+                // Only lazy STDIO backends are excluded from the shared proxy:
+                // they are spawned on-demand via the LazyBackendRegistry.
+                // HTTP/WebSocket backends have no child process to defer, so
+                // "lazy" spawn_mode is meaningless for them — always include.
+                !(b.spawn_mode == crate::config::SpawnMode::Lazy
+                    && b.transport == crate::config::TransportType::Stdio)
+            })
             .collect();
         tracing::info!(
             total_backend_count = all_backend_refs.len(),
@@ -590,6 +620,7 @@ impl Proxy {
             &config.proxy.separator,
             config.proxy.instructions.as_ref(),
             &all_backend_refs,
+            config.proxy.shutdown_kill_timeout_secs,
         )
         .await?;
 
@@ -859,10 +890,14 @@ impl Proxy {
             .with_context(|| format!("binding to {}", addr))?;
 
         let shutdown_timeout = Duration::from_secs(self.config.proxy.shutdown_timeout_seconds);
+        let lazy_registry = self.lazy_registry.clone();
         axum::serve(listener, self.router)
             .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
             .await
             .context("server error")?;
+
+        // Shut down all lazy backends after HTTP connections drain.
+        lazy_registry.shutdown_all().await;
 
         tracing::info!("Proxy shut down");
         Ok(())
@@ -1872,6 +1907,8 @@ while True:
                 },
                 instructions: None,
                 shutdown_timeout_seconds: 30,
+                shutdown_kill_timeout_secs: 2,
+                force_kill: false,
                 hot_reload: false,
                 import_backends: None,
                 rate_limit: None,
@@ -1888,6 +1925,8 @@ while True:
                 retry: None,
                 endpoint_group_list: vec![],
                 protocol_support: crate::config::ProtocolSupportConfig::default(),
+                default_spawn_mode: crate::config::SpawnMode::Eager,
+                default_idle_timeout_secs: None,
             },
             backends: vec![
                 // Dummy eager backend (real MCP server) so the shared McpProxy

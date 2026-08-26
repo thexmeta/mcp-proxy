@@ -57,6 +57,8 @@ impl ProxyBuilder {
                     },
                     instructions: None,
                     shutdown_timeout_seconds: 30,
+                    shutdown_kill_timeout_secs: 2,
+                    force_kill: false,
                     hot_reload: false,
                     import_backends: None,
                     rate_limit: None,
@@ -73,6 +75,8 @@ impl ProxyBuilder {
                     endpoint_group_list: Vec::new(),
                     watchers: crate::config::default_watchers(),
                     protocol_support: crate::config::ProtocolSupportConfig::default(),
+                    default_spawn_mode: crate::config::SpawnMode::Eager,
+                    default_idle_timeout_secs: None,
                 },
                 backends: Vec::new(),
                 auth: None,
@@ -117,6 +121,13 @@ impl ProxyBuilder {
     /// Set the graceful shutdown timeout (default: 30s).
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.config.proxy.shutdown_timeout_seconds = timeout.as_secs();
+        self
+    }
+
+    /// Set the timeout (seconds) after SIGTERM before SIGKILL is sent to
+    /// stdio backend child processes (default: 2s).
+    pub fn shutdown_kill_timeout(mut self, timeout: Duration) -> Self {
+        self.config.proxy.shutdown_kill_timeout_secs = timeout.as_secs();
         self
     }
 

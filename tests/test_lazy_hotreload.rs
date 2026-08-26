@@ -40,7 +40,7 @@ async fn runtime_registry() -> LazyBackendRegistry {
         .build_strict()
         .await
         .expect("proxy builds");
-    LazyBackendRegistry::from_backends(vec![]).with_runtime(proxy, &store, "/".to_string())
+    LazyBackendRegistry::from_backends(vec![]).with_runtime(proxy, &store, "/".to_string(), 2)
 }
 
 /// Build a stdio [`BackendConfig`] with the given spawn mode + idle timeout.
@@ -221,7 +221,7 @@ async fn h5b_reconcile_loads_cached_catalog_for_new_hash() {
         .await
         .expect("proxy builds");
     let reg =
-        LazyBackendRegistry::from_backends(vec![]).with_runtime(proxy, &store, "/".to_string());
+        LazyBackendRegistry::from_backends(vec![]).with_runtime(proxy, &store, "/".to_string(), 2);
 
     // Seed a warm catalog keyed by the NEW hash (v2) so reconcile finds it.
     let new_cfg = backend("files", SpawnMode::Lazy, Some(20), Some("v2"));
