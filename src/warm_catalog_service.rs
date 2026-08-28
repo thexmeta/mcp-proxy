@@ -658,6 +658,73 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Regression: R2 — backend name with TWO+ separators must still match.
+    // The longest-prefix resolver must pick `a_b_c` (not `a` or `a_b`) when
+    // a CallTool arrives for `a_b_c_d`. A naive first-underscore split would
+    // yield `a` and fail to find the backend.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn action_request_backend_name_with_multiple_separators_uses_longest_prefix() {
+        // Regression test: backend name `a_b_c` (TWO separators) with tool
+        // name `d` produces the routed tool name `a_b_c_d`. The resolver
+        // must pick `a_b_c` via the longest-prefix match — never `a` or `a_b`.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawn_count = StdArc::new(AtomicUsize::new(0));
+        let spawn_fn: crate::lazy_registry::SpawnBackendFn = {
+            let count = spawn_count.clone();
+            StdArc::new(move |_cfg: &BackendConfig| {
+                let count = count.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let probe_fn: crate::lazy_registry::ProbeBackendFn =
+            StdArc::new(|_cfg: &BackendConfig, _sep: &str| {
+                Box::pin(async move { Err(anyhow::anyhow!("probe skipped in test")) })
+            });
+
+        // Backend name contains the separator `_` TWICE — the old naive
+        // `split('_').next()` would yield `a` (not in registry).
+        let registry = LazyBackendRegistry::from_backends(vec![lazy_backend_with_catalog(
+            "a_b_c",
+            "_",
+            &["d"],
+        )])
+        .with_test_hooks(spawn_fn, probe_fn);
+
+        let mock = MockService::with_tools(&[]);
+        let mut svc = WarmCatalogService::new(mock, StdArc::new(registry), "_".to_string(), None);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(CallToolParams {
+                name: "a_b_c_d".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            resp.inner.is_ok(),
+            "multi-separator backend name must trigger spawn and forward"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "a_b_c backend must be spawned exactly once (longest-prefix match)"
+        );
+    }
+
     #[tokio::test]
     async fn action_request_to_unknown_backend_forwards_without_spawn() {
         // A CallTool whose name prefix is NOT a lazy backend forwards unchanged

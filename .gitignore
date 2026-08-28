@@ -7,3 +7,7 @@ dist/
 nfpm.generated.yaml
 .qartez/
 docs/plan/
+
+# Vendored Cargo source (used by `cargo vendor`); never commit it.
+# AGENTS.md explicitly forbids modifying or tracking vendored source.
+vendor/
