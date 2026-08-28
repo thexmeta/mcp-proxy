@@ -118,20 +118,40 @@ fn in_group(name: &str, scope: &Option<HashSet<String>>, _separator: &str) -> bo
     }
 }
 
+/// Resolve a tool/prompt name to its owning backend via longest-prefix match.
+///
+/// Splits `tool_name` on `separator` and returns the longest registered backend
+/// name that forms a valid prefix (e.g. `"electron_cdp"` wins over `"electron"`
+/// for `"electron_cdp_set_console_live"`). Returns `None` when no backend
+/// matches.
+fn resolve_backend_name(
+    tool_name: &str,
+    known_backends: &[String],
+    separator: &str,
+) -> Option<String> {
+    let mut candidates: Vec<&String> = known_backends
+        .iter()
+        .filter(|b| tool_name.starts_with(format!("{b}{separator}").as_str()))
+        .collect();
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    candidates.into_iter().next().cloned()
+}
+
 /// Extract the target lazy backend name for an action request.
 ///
-/// For `CallTool`/`GetPrompt` the backend is the namespaced-name prefix (before
-/// the first `separator`). For `ReadResource` the URI is not namespaced, so the
-/// owning backend is resolved via the warm catalog's resource URIs. Returns
-/// `None` for non-action requests or when no backend can be determined.
+/// For `CallTool`/`GetPrompt` the backend is resolved via longest-prefix match
+/// against known backends (handles separator characters within backend names).
+/// For `ReadResource` the URI is not namespaced, so the owning backend is
+/// resolved via the warm catalog's resource URIs. Returns `None` for non-action
+/// requests or when no backend can be determined.
 fn request_backend_name(
     reg: &LazyBackendRegistry,
     req: &McpRequest,
     separator: &str,
 ) -> Option<String> {
     match req {
-        McpRequest::CallTool(p) => p.name.split(separator).next().map(String::from),
-        McpRequest::GetPrompt(p) => p.name.split(separator).next().map(String::from),
+        McpRequest::CallTool(p) => resolve_backend_name(&p.name, &reg.names(), separator),
+        McpRequest::GetPrompt(p) => resolve_backend_name(&p.name, &reg.names(), separator),
         McpRequest::ReadResource(p) => reg.backend_for_resource_uri(&p.uri),
         _ => None,
     }
@@ -574,6 +594,70 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Regression: R2 underscored backend name must not split incorrectly.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn action_request_underscored_backend_name_triggers_spawn() {
+        // Regression test: backend name `electron_cdp` with separator `_` —
+        // the tool name `electron_cdp_start_app` must resolve to backend
+        // `electron_cdp` (not `electron`) via longest-prefix match.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawn_count = StdArc::new(AtomicUsize::new(0));
+        let spawn_fn: crate::lazy_registry::SpawnBackendFn = {
+            let count = spawn_count.clone();
+            StdArc::new(move |_cfg: &BackendConfig| {
+                let count = count.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let probe_fn: crate::lazy_registry::ProbeBackendFn =
+            StdArc::new(|_cfg: &BackendConfig, _sep: &str| {
+                Box::pin(async move { Err(anyhow::anyhow!("probe skipped in test")) })
+            });
+
+        // Backend name contains the separator `_` — the old naive
+        // `split('_').next()` would yield `"electron"` (not in registry).
+        let registry = LazyBackendRegistry::from_backends(vec![lazy_backend_with_catalog(
+            "electron_cdp",
+            "_",
+            &["start_app", "diagnose"],
+        )])
+        .with_test_hooks(spawn_fn, probe_fn);
+
+        let mock = MockService::with_tools(&[]);
+        let mut svc = WarmCatalogService::new(mock, StdArc::new(registry), "_".to_string(), None);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(CallToolParams {
+                name: "electron_cdp_start_app".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            resp.inner.is_ok(),
+            "underscored backend name must trigger spawn and forward"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "electron_cdp backend must be spawned once"
+        );
+    }
+
     #[tokio::test]
     async fn action_request_to_unknown_backend_forwards_without_spawn() {
         // A CallTool whose name prefix is NOT a lazy backend forwards unchanged
@@ -756,6 +840,43 @@ mod tests {
         assert!(
             resp.inner.is_ok(),
             "unknown backend action request forwards without panic"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // resolve_backend_name: longest-prefix-match unit tests.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn request_backend_name_longest_prefix_match() {
+        let known = vec!["electron_cdp".to_string()];
+        assert_eq!(
+            resolve_backend_name("electron_cdp_set_console_live", &known, "_"),
+            Some("electron_cdp".to_string())
+        );
+    }
+
+    #[test]
+    fn request_backend_name_no_underscore_backend() {
+        let known = vec!["term".to_string()];
+        assert_eq!(
+            resolve_backend_name("term_ping", &known, "_"),
+            Some("term".to_string())
+        );
+    }
+
+    #[test]
+    fn request_backend_name_unknown_tool() {
+        let known = vec!["term".to_string()];
+        assert_eq!(resolve_backend_name("unknown_tool", &known, "_"), None);
+    }
+
+    #[test]
+    fn request_backend_name_multiple_underscores_in_name() {
+        let known = vec!["cedar_analysis".to_string()];
+        assert_eq!(
+            resolve_backend_name("cedar_analysis_analyze", &known, "_"),
+            Some("cedar_analysis".to_string())
         );
     }
 }

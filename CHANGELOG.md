@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 These two fixes were previously uncommitted working-tree edits; they are now durable in this commit. The deployed binary was rebuilt with both fixes, resolving the `os` endpoint-group regression (the `os` group now exposes the full 24-tool set: 17 `fs_*` + 7 `term_*`).
 
+- **Lazy tool calls fail with "Unknown tool" when backend name contains the separator**: `request_backend_name()` split tool names on the separator (`_`) and took the first token — e.g. `electron_cdp_set_console_live` split by `_` yielded `"electron"` (not `"electron_cdp"`). The registry lookup for `"electron"` failed, the spawn path was skipped, and the proxy returned "Unknown tool" instead of forwarding to the backend. This affected all lazy backends whose names contain the separator: `electron_cdp`, `cedar_analysis`, `sequential_thinking`, `chrome_devtools`, `computer_use`, `grep_github`, `ms_docs`, `nativedevtools`, `avalonia_ui`, `avalonia_spy`. Fixed by extracting `resolve_backend_name()` which does longest-prefix match against known backends — `"electron_cdp"` wins over `"electron"` for `"electron_cdp_start_app"`. Added regression tests `request_backend_name_longest_prefix_match` (4 unit tests) and `action_request_underscored_backend_name_triggers_spawn` (end-to-end spawn verification).
+
 ### Features
 
 - **Shared backend pool**: each backend spawns exactly once regardless of how many endpoint groups reference it
