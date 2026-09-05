@@ -268,12 +268,45 @@ async fn build_lazy_registry(
                         Some(catalog)
                     }
                     Err(e) => {
+                        // Probe failed — try fuzzy fallback: find any existing
+                        // catalog file for this backend name (hash may have
+                        // changed due to config drift since the catalog was
+                        // created). Re-save with the current hash so subsequent
+                        // startups hit the fast `load()` path.
                         tracing::warn!(
                             name = %backend.name,
                             error = %e,
-                            "Warm catalog probe failed; backend will start without a warm cache"
+                            "Warm catalog probe failed; attempting fuzzy catalog fallback"
                         );
-                        None
+                        match store.load_any_for_backend(&backend.name) {
+                            Some(mut catalog) => {
+                                let old_hash = catalog.identity_hash.clone();
+                                catalog.identity_hash = hash.clone();
+                                if let Err(e) = store.save(&catalog) {
+                                    tracing::warn!(
+                                        name = %backend.name,
+                                        error = %e,
+                                        "Failed to re-save fuzzy-matched catalog"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        name = %backend.name,
+                                        old_hash = %old_hash,
+                                        new_hash = %hash,
+                                        tools = catalog.tools.len(),
+                                        "Recovered stale warm catalog via fuzzy fallback"
+                                    );
+                                }
+                                Some(catalog)
+                            }
+                            None => {
+                                tracing::warn!(
+                                    name = %backend.name,
+                                    "Warm catalog probe failed and no stale catalog found; backend will start without a warm cache"
+                                );
+                                None
+                            }
+                        }
                     }
                 }
             }
@@ -442,7 +475,8 @@ fn apply_backend_middleware(
             .limit_for_period(rl.requests)
             .refresh_period(Duration::from_secs(rl.period_seconds))
             .name(format!("{}-ratelimit", backend.name))
-            .build();
+            .build()
+            .expect("failed to build rate limiter layer");
         builder = builder.backend_layer(layer);
     }
 
@@ -470,7 +504,8 @@ fn apply_backend_middleware(
             .wait_duration_in_open(Duration::from_secs(cb.wait_duration_seconds))
             .permitted_calls_in_half_open(cb.permitted_calls_in_half_open)
             .name(format!("{}-cb", backend.name))
-            .build_with_handle();
+            .build_with_handle()
+            .expect("failed to build circuit breaker layer");
         cb_handles.insert(backend.name.clone(), handle);
         builder = builder.backend_layer(layer);
     }
@@ -891,10 +926,27 @@ impl Proxy {
 
         let shutdown_timeout = Duration::from_secs(self.config.proxy.shutdown_timeout_seconds);
         let lazy_registry = self.lazy_registry.clone();
-        axum::serve(listener, self.router)
-            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
-            .await
-            .context("server error")?;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = axum::serve(listener, self.router).with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(());
+        });
+
+        tokio::select! {
+            res = server => {
+                res.context("server error")?;
+            }
+            _ = async {
+                let _ = shutdown_rx.await;
+                tokio::time::sleep(shutdown_timeout).await;
+            } => {
+                tracing::warn!(
+                    timeout_seconds = shutdown_timeout.as_secs(),
+                    "Drain timeout expired, forcing shutdown"
+                );
+            }
+        }
 
         // Shut down all lazy backends after HTTP connections drain.
         lazy_registry.shutdown_all().await;
@@ -1427,7 +1479,8 @@ fn build_middleware_stack(
             .limit_for_period(rl.requests)
             .refresh_period(Duration::from_secs(rl.period_seconds))
             .name("global-ratelimit")
-            .build();
+            .build()
+            .expect("failed to build global rate limiter layer");
         let limited = tower::Layer::layer(&layer, service);
         service = BoxCloneService::new(tower_mcp::CatchError::new(limited));
     }
@@ -1635,7 +1688,7 @@ async fn apply_auth(config: &ProxyConfig, router: Router) -> Result<Router> {
 }
 
 /// Wait for SIGTERM or SIGINT, then log and return.
-pub async fn shutdown_signal(timeout: Duration) {
+pub async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
@@ -1650,10 +1703,8 @@ pub async fn shutdown_signal(timeout: Duration) {
     {
         ctrl_c.await.ok();
     }
-    tracing::info!(
-        timeout_seconds = timeout.as_secs(),
-        "Shutdown signal received, draining connections"
-    );
+
+    tracing::info!("Shutdown signal received, draining connections");
 }
 
 #[cfg(all(test, feature = "oauth"))]

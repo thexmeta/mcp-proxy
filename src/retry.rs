@@ -80,7 +80,8 @@ pub fn build_retry_layer(
             .tokens_per_second(min_per_sec)
             .max_tokens(max_tokens.max(1))
             .initial_tokens(max_tokens.max(1))
-            .build();
+            .build()
+            .expect("failed to build retry budget");
 
         builder = builder.budget(budget);
     }

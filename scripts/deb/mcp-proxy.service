@@ -12,6 +12,7 @@ ExecStartPre=/usr/local/bin/mcp-proxy-load-secrets.sh
 ExecStart=/usr/bin/mcp-proxy --config /home/mxadm/.mcp-proxy/config.toml
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mcp-proxy
@@ -24,7 +25,7 @@ Environment=RUST_LOG=tower_mcp::client=error
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/mcp-proxy /var/log/mcp-proxy /home/mxadm/.mcp-proxy /usr/local/bin /home/mxadm/.cortex-scout
+ReadWritePaths=/var/lib/mcp-proxy /var/log/mcp-proxy /home/mxadm/.mcp-proxy /usr/local/bin /home/mxadm/.cortex-scout /home/mxadm/mcp-proxy /home/mxadm/.cache
 ProtectHome=read-only
 BindReadOnlyPaths=/run/user/1000/app/org.keepassxc.KeePassXC
 BindReadOnlyPaths=/run/dbus/system_bus_socket

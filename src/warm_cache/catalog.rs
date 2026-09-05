@@ -170,6 +170,42 @@ impl WarmCatalogStore {
         serde_json::from_str(&contents).ok()
     }
 
+    /// Fuzzy-load: find any catalog file matching a backend name prefix.
+    ///
+    /// Scans the cache directory for `{backend_name}-*.json` files and returns
+    /// the first valid catalog found. This is a fallback when the exact
+    /// `(name, hash)` lookup fails — e.g. because the backend config changed
+    /// since the catalog was created. The returned catalog may be stale but
+    /// is better than nothing (the backend won't appear in `tools/list`
+    /// without *any* catalog).
+    ///
+    /// The caller should re-save the catalog with the current hash so
+    /// subsequent startups hit the fast `load()` path.
+    pub fn load_any_for_backend(&self, backend_name: &str) -> Option<WarmCatalog> {
+        if !is_safe_name(backend_name) {
+            return None;
+        }
+        let prefix = format!("{backend_name}-");
+        let entries = fs::read_dir(&self.cache_dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(&prefix) || !name_str.ends_with(".json") {
+                continue;
+            }
+            let contents = match fs::read_to_string(entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Ok(catalog) = serde_json::from_str::<WarmCatalog>(&contents)
+                && catalog.backend_name == backend_name
+            {
+                return Some(catalog);
+            }
+        }
+        None
+    }
+
     /// Atomically persist a catalog.
     ///
     /// Writes to a temp file in the cache directory, then renames it into place

@@ -899,8 +899,8 @@ async fn g4_endpoint_group_with_only_lazy_stdio_exposes_warm_catalog_tools() {
     // Seed warm catalogs for BOTH lazy backends (namespaced `files_*`/`term_*`).
     let files_cfg = cfg.backends[1].clone();
     let term_cfg = cfg.backends[2].clone();
-    seed_warm_catalog_for(&dir, &files_cfg, "files", "2026-07-28");
-    seed_warm_catalog_for(&dir, &term_cfg, "term", "2026-07-28");
+    seed_warm_catalog_for(&dir, &files_cfg, "files", "_", "2026-07-28");
+    seed_warm_catalog_for(&dir, &term_cfg, "term", "_", "2026-07-28");
 
     let proxy = mcp_proxy::Proxy::from_config(cfg)
         .await
@@ -1000,13 +1000,19 @@ async fn g4_endpoint_group_with_only_lazy_stdio_exposes_warm_catalog_tools() {
     );
 }
 
-/// Seed a warm catalog on disk for an arbitrary backend name (G4 needs two).
-fn seed_warm_catalog_for(dir: &Path, cfg: &BackendConfig, backend_name: &str, version: &str) {
+/// Seed a warm catalog on disk for an arbitrary backend name and separator.
+fn seed_warm_catalog_for(
+    dir: &Path,
+    cfg: &BackendConfig,
+    backend_name: &str,
+    separator: &str,
+    version: &str,
+) {
     let store = WarmCatalogStore::new(dir.to_path_buf());
     let hash = BinaryHasher::hash(cfg);
     let catalog = WarmCatalog::from_probe_result(
         backend_name,
-        "_",
+        separator,
         vec![ping_tool()],
         vec![],
         vec![],
@@ -1310,6 +1316,254 @@ async fn g5_endpoint_group_cache_miss_probes_fs_like_backend() {
         names.len(),
         3,
         "endpoint group `os` must expose exactly 3 warm-catalog tools, got: {names:?}"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// E9: lazy backend spawn failure returns JSON-RPC error with original RequestId
+// ---------------------------------------------------------------------------
+
+/// Regression test for the lazy backend spawn failure error path.
+///
+/// When a lazy backend is configured with a nonexistent command, the proxy
+/// builds successfully (because the backend is lazy and not spawned at startup),
+/// but the first `CallTool` request that triggers `ensure_spawned` must return
+/// a JSON-RPC error response with:
+/// - The correct error message format: "lazy backend 'name' failed to spawn: ..."
+/// - The original RequestId preserved (not hardcoded to 0)
+/// - JSON-RPC error code -32602 (invalid_params)
+///
+/// This test exercises the full path: WarmCatalogService::call ->
+/// LazyBackendRegistry::ensure_spawned -> reload::add_backend ->
+/// stdio_spawn::spawn_stdio_transport -> StdioClientTransport::spawn_command
+#[tokio::test]
+async fn e9_lazy_spawn_failure_returns_jsonrpc_error_with_request_id() {
+    let dir = test_dir("e9");
+    let server = std::env::temp_dir().join(format!(
+        "mcp-min-srv-e9-{}-{}.py",
+        std::process::id(),
+        TEST_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::write(&server, MIN_MCP_SERVER).expect("write server script");
+
+    // Build config with a lazy backend pointing at a NONEXISTENT command.
+    // The dummy eager backend uses the real server so the proxy builds.
+    let cfg = ProxyConfig {
+        proxy: ProxySettings {
+            name: "e9-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            default_spawn_mode: SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+        },
+        backends: vec![
+            // Dummy eager backend (real MCP server) so the shared McpProxy has
+            // at least one backend to build.
+            BackendConfig {
+                name: "__dummy__".to_string(),
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                enabled: true,
+                ..Default::default()
+            },
+            // Lazy backend with a NONEXISTENT command — this will fail to spawn.
+            BackendConfig {
+                name: "bad".to_string(),
+                transport: TransportType::Stdio,
+                command: Some("/nonexistent/binary/that/does/not/exist".to_string()),
+                args: vec![],
+                spawn_mode: SpawnMode::Lazy,
+                idle_timeout_secs: Some(30),
+                enabled: true,
+                ..Default::default()
+            },
+        ],
+        auth: None,
+        performance: mcp_proxy::config::PerformanceConfig::default(),
+        security: mcp_proxy::config::SecurityConfig::default(),
+        cache: mcp_proxy::config::CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: mcp_proxy::config::WarmCacheConfig {
+            enabled: true,
+            dir: Some(dir.to_path_buf()),
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        },
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+
+    // Seed a warm catalog for the lazy backend so the proxy builds and
+    // the tool is visible in tools/list (even though the backend will fail to spawn).
+    let bad_cfg = cfg.backends[1].clone();
+    seed_warm_catalog_for(&dir, &bad_cfg, "bad", "/", "2026-07-28");
+
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds with lazy backend pointing at nonexistent command");
+    let reg = proxy.lazy_registry();
+
+    // Verify the lazy backend is registered Down with its warm catalog loaded.
+    assert_eq!(
+        reg.spawn_state("bad"),
+        SpawnState::Down,
+        "lazy backend must be Down at startup"
+    );
+    let loaded = reg
+        .get("bad")
+        .and_then(|b| b.catalog)
+        .expect("warm catalog must be loaded from disk at startup");
+    assert_eq!(
+        loaded.tools.len(),
+        1,
+        "cached catalog must contain one tool"
+    );
+    assert_eq!(
+        loaded.tools[0].name, "bad/ping",
+        "cached tool must be namespaced as bad/ping"
+    );
+
+    // Serve the proxy on a random port and query it via HTTP.
+    let (router, _handle) = proxy.into_router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
+    let addr = listener.local_addr().unwrap();
+    eprintln!("Test server listening on {}", addr);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    // Give the server a moment to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    // The proxy router handles MCP at the root path "/" when not nested.
+    let base = format!("http://{addr}/");
+
+    // Initialize the session.
+    let init = client
+        .post(&base)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "e9-test", "version": "0.1.0" }
+                }
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("initialize");
+    let init_status = init.status();
+    let init_body = init.text().await.unwrap_or_default();
+    eprintln!(
+        "Initialize response: status={}, body={}",
+        init_status, init_body
+    );
+    assert!(
+        init_status.is_success(),
+        "initialize must succeed: status={}, body={}",
+        init_status,
+        init_body
+    );
+    let _ = client
+        .post(&base)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized"
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await;
+
+    // Now call the lazy backend's tool — this triggers ensure_spawned which
+    // will fail because the command doesn't exist.
+    // Use a specific RequestId (42) to verify it's preserved in the error response.
+    let call_resp = client
+        .post(&base)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                "params": {
+                    "name": "bad/ping",
+                    "arguments": {}
+                }
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("tools/call request");
+
+    assert!(
+        call_resp.status().is_success(),
+        "HTTP 200 even for JSON-RPC error"
+    );
+    let body: serde_json::Value = call_resp.json().await.expect("json response");
+
+    // Verify the JSON-RPC error response structure.
+    assert!(body["error"].is_object(), "response must have error object");
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32602),
+        "error code must be -32602 (invalid_params)"
+    );
+    let error_msg = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert!(
+        error_msg.contains("lazy backend 'bad' failed to spawn"),
+        "error message must contain the lazy backend name and 'failed to spawn': {error_msg}"
+    );
+    assert!(
+        error_msg.contains("nonexistent")
+            || error_msg.contains("No such file")
+            || error_msg.contains("spawn"),
+        "error message should mention the underlying spawn failure: {error_msg}"
+    );
+
+    // CRITICAL: Verify the original RequestId (42) is preserved in the response.
+    // Currently the code hardcodes RequestId::Number(0) — this test documents
+    // the expected behavior and will fail until that's fixed.
+    assert_eq!(
+        body["id"].as_i64(),
+        Some(42),
+        "JSON-RPC response id must match the request id (42), not be hardcoded to 0"
     );
 
     let _ = std::fs::remove_file(&server);

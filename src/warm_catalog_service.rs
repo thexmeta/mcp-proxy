@@ -29,7 +29,6 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use tower_mcp::router::{RouterRequest, RouterResponse};
 use tower_mcp_types::JsonRpcError;
-use tower_mcp_types::protocol::RequestId;
 use tower_mcp_types::protocol::{McpRequest, McpResponse};
 
 use crate::lazy_registry::{LazyBackendRegistry, SpawnState};
@@ -221,6 +220,7 @@ where
         {
             let registry = self.registry.clone();
             let target_owned = target.clone();
+            let request_id = req.id.clone();
             let fut = self.inner.call(req);
             return Box::pin(async move {
                 // Coalesced spawn: concurrent first-calls share one child (FR-006).
@@ -231,7 +231,7 @@ where
                         "lazy spawn failed for action request"
                     );
                     return Ok(RouterResponse {
-                        id: RequestId::Number(0),
+                        id: request_id,
                         inner: Err(JsonRpcError::invalid_params(format!(
                             "lazy backend '{target_owned}' failed to spawn: {e}"
                         ))),

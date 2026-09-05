@@ -972,7 +972,8 @@ fn build_backend_layer(backend: &BackendConfig) -> BackendMiddlewareLayer {
                     .limit_for_period(requests)
                     .refresh_period(Duration::from_secs(period_seconds))
                     .name(format!("{}-ratelimit", name))
-                    .build();
+                    .build()
+                    .expect("failed to build rate limiter layer");
                 let limited = tower::Layer::layer(&layer, svc);
                 svc = BoxCloneService::new(tower_mcp::CatchError::new(limited));
             }
@@ -994,7 +995,8 @@ fn build_backend_layer(backend: &BackendConfig) -> BackendMiddlewareLayer {
                     .wait_duration_in_open(Duration::from_secs(wait_secs))
                     .permitted_calls_in_half_open(half_open)
                     .name(format!("{}-cb", name))
-                    .build();
+                    .build()
+                    .expect("failed to build circuit breaker layer");
                 let limited = tower::Layer::layer(&layer, svc);
                 svc = BoxCloneService::new(tower_mcp::CatchError::new(limited));
             }
