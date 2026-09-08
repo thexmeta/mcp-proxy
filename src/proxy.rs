@@ -113,7 +113,21 @@ pub(crate) async fn build_mcp_proxy_for_backends(
             }
             crate::config::TransportType::Http => {
                 let url = backend.url.as_deref().unwrap();
-                let mut transport = tower_mcp::client::HttpClientTransport::new(url);
+                let mut transport = if let Some(ref http_cfg) = backend.http {
+                    tracing::info!(
+                        name = %backend.name,
+                        connect_timeout = http_cfg.connect_timeout_secs,
+                        request_timeout = http_cfg.timeout_secs,
+                        "Using custom HTTP client config"
+                    );
+                    let client: reqwest::Client = reqwest::ClientBuilder::from(http_cfg).build()?;
+                    let hc_config = tower_mcp::client::HttpClientConfig::from(http_cfg);
+                    tower_mcp::client::HttpClientTransport::with_client_and_config(
+                        url, client, hc_config,
+                    )
+                } else {
+                    tower_mcp::client::HttpClientTransport::new(url)
+                };
                 if let Some(token) = &backend.bearer_token {
                     transport = transport.bearer_token(token);
                 }
@@ -154,6 +168,12 @@ pub(crate) async fn build_mcp_proxy_for_backends(
                      Rebuild with: cargo install mcp-proxy --features websocket"
                 );
             }
+        }
+
+        // Apply per-backend init_timeout if configured
+        if let Some(init_timeout_secs) = backend.init_timeout {
+            builder =
+                builder.backend_init_timeout(std::time::Duration::from_secs(init_timeout_secs));
         }
 
         // Per-backend middleware stack (applied in order: inner -> outer)
@@ -1978,6 +1998,7 @@ while True:
                 protocol_support: crate::config::ProtocolSupportConfig::default(),
                 default_spawn_mode: crate::config::SpawnMode::Eager,
                 default_idle_timeout_secs: None,
+                init_timeout: None,
             },
             backends: vec![
                 // Dummy eager backend (real MCP server) so the shared McpProxy

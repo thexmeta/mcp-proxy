@@ -479,6 +479,290 @@ async fn test_dynamic_add_backend() {
     }
 }
 
+// -----------------------------------------------------------------------
+// TASK004: HttpClientConfig wiring integration tests
+// -----------------------------------------------------------------------
+
+/// Verify HttpClientConfig TOML fields are parsed and accessible from ProxyConfig.
+#[test]
+fn test_http_client_config_wired_through_proxy_config() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "api"
+    transport = "http"
+    url = "http://localhost:9000"
+    [backends.http]
+    connect_timeout_secs = 3
+    timeout_secs = 5
+    pool_idle_timeout_secs = 60
+    pool_max_idle_per_host = 2
+    danger_accept_invalid_certs = true
+    user_agent = "mcp-proxy-test/1.0"
+    "#;
+    let config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    let backend = &config.backends[0];
+    assert_eq!(backend.name, "api");
+    assert!(backend.url.is_some());
+    let http = backend.http.as_ref().expect("http config present");
+    assert_eq!(http.connect_timeout_secs, 3);
+    assert_eq!(http.timeout_secs, 5);
+    assert_eq!(http.pool_idle_timeout_secs, 60);
+    assert_eq!(http.pool_max_idle_per_host, Some(2));
+    assert!(http.danger_accept_invalid_certs);
+    assert_eq!(http.user_agent.as_deref(), Some("mcp-proxy-test/1.0"));
+}
+
+/// Verify the From<&BackendHttpClientConfig> for HttpClientConfig maps timeout correctly.
+#[test]
+fn test_http_client_config_timeout_mapping() {
+    use std::time::Duration;
+    let cfg = mcp_proxy::config::BackendHttpClientConfig {
+        connect_timeout_secs: 2,
+        timeout_secs: 99,
+        pool_idle_timeout_secs: 120,
+        pool_max_idle_per_host: Some(4),
+        danger_accept_invalid_certs: false,
+        user_agent: Some("test".to_string()),
+    };
+    let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+    assert_eq!(hc.request_timeout, Duration::from_secs(99));
+}
+
+/// Verify reqwest::Client can be built from config (smoke test).
+#[test]
+fn test_http_client_config_produces_working_client() {
+    let cfg = mcp_proxy::config::BackendHttpClientConfig {
+        connect_timeout_secs: 1,
+        timeout_secs: 2,
+        pool_idle_timeout_secs: 30,
+        pool_max_idle_per_host: Some(1),
+        danger_accept_invalid_certs: true,
+        user_agent: Some("integration-test".to_string()),
+    };
+    let client: reqwest::Client = reqwest::ClientBuilder::from(&cfg).build().unwrap();
+    let _req = client.get("http://127.0.0.1:1");
+}
+
+/// Verify apply_global_defaults propagates init_timeout from [proxy] to backends.
+#[test]
+fn test_apply_global_defaults_propagates_init_timeout() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 12
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(12));
+}
+
+/// Verify per-backend init_timeout overrides global.
+#[test]
+fn test_apply_global_defaults_per_backend_overrides() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 12
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    init_timeout = 3
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(3));
+}
+
+/// Verify stdio gets 30s default when no global/per-backend set.
+#[test]
+fn test_apply_global_defaults_stdio_fallback() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(30));
+}
+
+/// Verify HTTP gets no init_timeout when no global/per-backend set.
+#[test]
+fn test_apply_global_defaults_http_no_default() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "api"
+    transport = "http"
+    url = "http://localhost:9000"
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert!(config.backends[0].init_timeout.is_none());
+}
+
+/// Verify multiple backends get independent timeouts.
+#[test]
+fn test_apply_global_defaults_multiple_backends() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 7
+    [proxy.listen]
+
+    [[backends]]
+    name = "stdio-be"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+
+    [[backends]]
+    name = "http-be"
+    transport = "http"
+    url = "http://localhost:9000"
+
+    [[backends]]
+    name = "stdio-custom"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    init_timeout = 3
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(7));
+    assert_eq!(config.backends[1].init_timeout, Some(7));
+    assert_eq!(config.backends[2].init_timeout, Some(3));
+}
+
+// -----------------------------------------------------------------------
+// TASK005: Transport error + retry integration tests
+// -----------------------------------------------------------------------
+
+/// Verify valid tool calls work through the full middleware stack.
+#[tokio::test]
+async fn test_transport_error_through_full_stack() {
+    let math_transport = ChannelTransport::new(math_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 2})),
+    )
+    .await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "3"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
+/// Verify concurrent calls across multiple backends work.
+#[tokio::test]
+async fn test_multi_backend_concurrent_calls() {
+    let math_transport = ChannelTransport::new(math_router());
+    let text_transport = ChannelTransport::new(text_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .backend("text", text_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp1 = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
+    let resp2 = call(
+        &mut proxy,
+        tool_call("text/echo", serde_json::json!({"message": "hello"})),
+    )
+    .await;
+    let resp3 = call(&mut proxy, McpRequest::ListTools(Default::default())).await;
+
+    match resp1.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "30"),
+        other => panic!("expected CallTool for math, got: {:?}", other),
+    }
+    match resp2.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "hello"),
+        other => panic!("expected CallTool for text, got: {:?}", other),
+    }
+    match resp3.inner.unwrap() {
+        McpResponse::ListTools(result) => assert_eq!(result.tools.len(), 4),
+        other => panic!("expected ListTools, got: {:?}", other),
+    }
+}
+
+/// Verify backend error propagates without triggering transport reconnect.
+#[tokio::test]
+async fn test_backend_error_no_transport_reconnect() {
+    let math_transport = ChannelTransport::new(math_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp = call(
+        &mut proxy,
+        tool_call("math/nonexistent", serde_json::json!({})),
+    )
+    .await;
+    match &resp.inner {
+        Err(e) => {
+            assert!(e.code != -32000, "should not be transport error: {e}");
+        }
+        Ok(_) => panic!("expected error for nonexistent tool"),
+    }
+
+    // Subsequent calls should still work
+    let resp = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 1})),
+    )
+    .await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "2"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
 // --- Cache stats ---
 
 #[tokio::test]
@@ -1086,6 +1370,7 @@ fn make_proxy_config(protocol_versions: Vec<&str>) -> ProxyConfig {
                 versions: protocol_versions.into_iter().map(String::from).collect(),
                 default_protocol_version: None,
             },
+            init_timeout: None,
         },
         backends: vec![],
         auth: None,
@@ -1688,6 +1973,7 @@ async fn lazy_backend_registered_down_and_not_in_proxy_namespaces() {
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
             protocol_support: ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             // Dummy eager backend (real MCP server) so the shared McpProxy has

@@ -68,6 +68,7 @@ fn lazy_config(dir: &Path, server: &Path) -> ProxyConfig {
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             // Dummy eager backend (real MCP server) so the shared McpProxy has
@@ -539,6 +540,7 @@ async fn g1_global_default_spawn_mode_registers_lazy() {
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             BackendConfig {
@@ -658,6 +660,7 @@ async fn g2_all_lazy_proxy_builds_with_zero_eager_backends() {
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             BackendConfig {
@@ -775,6 +778,7 @@ async fn g3_http_backends_not_excluded_by_lazy_default() {
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             // HTTP backend with NO explicit spawn_mode — inherits "lazy".
@@ -1382,6 +1386,7 @@ async fn e9_lazy_spawn_failure_returns_jsonrpc_error_with_request_id() {
             default_spawn_mode: SpawnMode::Eager,
             default_idle_timeout_secs: None,
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             // Dummy eager backend (real MCP server) so the shared McpProxy has

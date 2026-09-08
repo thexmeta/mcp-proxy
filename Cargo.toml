@@ -1,6 +1,6 @@
 [package]
 name = "mcp-proxy"
-version = "1.4.0"
+version = "1.4.1-b1"
 edition = "2024"
 rust-version = "1.97"
 description = "Standalone MCP proxy -- config-driven reverse proxy with auth, rate limiting, and observability"
@@ -19,7 +19,7 @@ path = "src/main.rs"
 default = ["otel", "metrics", "oauth", "openapi", "websocket", "discovery", "yaml", "skills"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
-oauth = ["tower-mcp/oauth", "tower-mcp/jwks", "dep:reqwest"]
+oauth = ["tower-mcp/oauth", "tower-mcp/jwks"]
 openapi = ["dep:utoipa", "dep:utoipa-axum"]
 websocket = ["dep:tokio-tungstenite", "dep:async-trait"]
 discovery = ["dep:jpx-engine"]
@@ -62,7 +62,7 @@ tokio-tungstenite = { version = "0.29", features = ["connect", "rustls-tls-webpk
 async-trait = { version = "0.1", optional = true }
 futures-util = "0.3"
 jpx-engine = { version = "0.3.5", optional = true }
-reqwest = { version = "0.13", features = ["json", "form"], optional = true }
+reqwest = { version = "0.13", features = ["json", "form"] }
 serde_yaml = { version = "0.9", optional = true }
 redis = { version = "1", features = ["tokio-comp"], optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }

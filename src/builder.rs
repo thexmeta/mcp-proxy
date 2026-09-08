@@ -77,6 +77,7 @@ impl ProxyBuilder {
                     protocol_support: crate::config::ProtocolSupportConfig::default(),
                     default_spawn_mode: crate::config::SpawnMode::Eager,
                     default_idle_timeout_secs: None,
+                    init_timeout: None,
                 },
                 backends: Vec::new(),
                 auth: None,
@@ -293,6 +294,44 @@ impl ProxyBuilder {
     /// Enable Prometheus metrics.
     pub fn metrics(mut self, enabled: bool) -> Self {
         self.config.observability.metrics.enabled = enabled;
+        self
+    }
+
+    /// Set the per-backend HTTP client configuration.
+    ///
+    /// Controls reqwest and tower-mcp HTTP transport settings for the last
+    /// added backend. Only meaningful for HTTP backends.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no backends have been added.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mcp_proxy::builder::ProxyBuilder;
+    /// use mcp_proxy::config::BackendHttpClientConfig;
+    ///
+    /// let config = ProxyBuilder::new("my-proxy")
+    ///     .http_backend("api", "http://api:8080")
+    ///     .http_config(BackendHttpClientConfig {
+    ///         connect_timeout_secs: 5,
+    ///         timeout_secs: 60,
+    ///         ..Default::default()
+    ///     })
+    ///     .into_config();
+    ///
+    /// let http = config.backends[0].http.as_ref().unwrap();
+    /// assert_eq!(http.connect_timeout_secs, 5);
+    /// assert_eq!(http.timeout_secs, 60);
+    /// ```
+    pub fn http_config(mut self, http: BackendHttpClientConfig) -> Self {
+        let backend = self
+            .config
+            .backends
+            .last_mut()
+            .expect("http_config called with no backends");
+        backend.http = Some(http);
         self
     }
 
@@ -553,6 +592,8 @@ fn default_backend() -> BackendConfig {
         spawn_mode: SpawnMode::default(),
         idle_timeout_secs: None,
         cache_key_suffix: None,
+        http: None,
+        init_timeout: None,
     }
 }
 

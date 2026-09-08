@@ -779,6 +779,9 @@ pub(crate) async fn add_backend(
         || backend.hedging.is_some()
         || backend.outlier_detection.is_some();
 
+    // Per-backend init_timeout (already resolved by apply_global_defaults)
+    let init_timeout = backend.init_timeout.map(std::time::Duration::from_secs);
+
     match backend.transport {
         TransportType::Stdio => {
             let kill_timeout = std::time::Duration::from_secs(kill_timeout_secs);
@@ -788,12 +791,17 @@ pub(crate) async fn add_backend(
             if has_middleware {
                 let layer = build_backend_layer(backend);
                 proxy
-                    .add_backend_with_layer(&backend.name, transport, layer)
+                    .add_backend_with_layer_and_timeout(
+                        &backend.name,
+                        transport,
+                        layer,
+                        init_timeout,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             } else {
                 proxy
-                    .add_backend(&backend.name, transport)
+                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
@@ -803,7 +811,21 @@ pub(crate) async fn add_backend(
                 .url
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("http backend requires 'url'"))?;
-            let mut transport = tower_mcp::client::HttpClientTransport::new(url);
+            let mut transport = if let Some(ref http_cfg) = backend.http {
+                tracing::info!(
+                    name = %backend.name,
+                    connect_timeout = http_cfg.connect_timeout_secs,
+                    request_timeout = http_cfg.timeout_secs,
+                    "Using custom HTTP client config"
+                );
+                let client: reqwest::Client = reqwest::ClientBuilder::from(http_cfg).build()?;
+                let hc_config = tower_mcp::client::HttpClientConfig::from(http_cfg);
+                tower_mcp::client::HttpClientTransport::with_client_and_config(
+                    url, client, hc_config,
+                )
+            } else {
+                tower_mcp::client::HttpClientTransport::new(url)
+            };
             if let Some(token) = &backend.bearer_token {
                 transport = transport.bearer_token(token);
             }
@@ -811,12 +833,17 @@ pub(crate) async fn add_backend(
             if has_middleware {
                 let layer = build_backend_layer(backend);
                 proxy
-                    .add_backend_with_layer(&backend.name, transport, layer)
+                    .add_backend_with_layer_and_timeout(
+                        &backend.name,
+                        transport,
+                        layer,
+                        init_timeout,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             } else {
                 proxy
-                    .add_backend(&backend.name, transport)
+                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
@@ -845,12 +872,17 @@ pub(crate) async fn add_backend(
             if has_middleware {
                 let layer = build_backend_layer(backend);
                 proxy
-                    .add_backend_with_layer(&backend.name, transport, layer)
+                    .add_backend_with_layer_and_timeout(
+                        &backend.name,
+                        transport,
+                        layer,
+                        init_timeout,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             } else {
                 proxy
-                    .add_backend(&backend.name, transport)
+                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
@@ -870,6 +902,7 @@ pub(crate) async fn add_backend(
             circuit_breaker = backend.circuit_breaker.is_some(),
             rate_limit = backend.rate_limit.is_some(),
             concurrency = backend.concurrency.is_some(),
+            init_timeout = backend.init_timeout.is_some(),
             "Per-backend middleware applied to hot-reloaded backend"
         );
     }

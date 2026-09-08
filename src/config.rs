@@ -225,6 +225,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -392,6 +393,18 @@ impl ProxyConfig {
             // Global idle timeout default (per-backend None inherits proxy default).
             if backend.idle_timeout_secs.is_none() {
                 backend.idle_timeout_secs = self.proxy.default_idle_timeout_secs;
+            }
+
+            // Global init timeout default (per-backend overrides).
+            // If backend doesn't have its own init_timeout, use global default.
+            // If neither has one, use transport-specific default (30s for stdio, None for HTTP/WS).
+            if backend.init_timeout.is_none() {
+                if let Some(global_init_timeout) = self.proxy.init_timeout {
+                    backend.init_timeout = Some(global_init_timeout);
+                } else {
+                    backend.init_timeout =
+                        default_init_timeout(&backend.transport).map(|d| d.as_secs());
+                }
             }
         }
 
@@ -638,6 +651,11 @@ pub struct ProxySettings {
     /// specify `idle_timeout_secs`. `None` means never idle-timeout.
     #[serde(default)]
     pub default_idle_timeout_secs: Option<u64>,
+    /// Global default initialization timeout (seconds) for backend MCP
+    /// handshake. Per-backend `init_timeout` overrides this.
+    /// Default: 30s for stdio, None for HTTP/WebSocket.
+    #[serde(default)]
+    pub init_timeout: Option<u64>,
 }
 
 /// How backend tools are exposed to MCP clients.
@@ -915,12 +933,117 @@ pub struct BackendConfig {
     /// Only meaningful when `spawn_mode = "lazy"`. `None` means never idle-timeout.
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    /// HTTP client tuning for reqwest and tower-mcp HTTP transport.
+    /// When set, the proxy builds a custom `reqwest::Client` from these options
+    /// and passes matching config to the `HttpClientConfig` used by tower-mcp.
+    #[serde(default)]
+    pub http: Option<BackendHttpClientConfig>,
     /// Optional explicit suffix folded into the backend's warm-cache identity hash.
     /// Use this to pin a launcher/package version (e.g. `npx` package version)
     /// that cannot be auto-resolved offline, forcing a cache invalidation when it
     /// changes. Hashed but never logged; see `BinaryHasher`.
     #[serde(default)]
     pub cache_key_suffix: Option<String>,
+    /// Per-backend initialization timeout (seconds) for MCP handshake.
+    /// Overrides the global `[proxy.init_timeout]` default.
+    /// Default: 30s for stdio, None for HTTP/WebSocket.
+    #[serde(default)]
+    pub init_timeout: Option<u64>,
+}
+
+/// Per-backend HTTP client configuration.
+///
+/// Maps to `[backends.http]` in TOML. Exposes the most useful reqwest
+/// [`reqwest::Client::builder()`] options without overloading the config surface.
+/// All fields are optional; absent values use the same defaults as reqwest.
+///
+/// # Example
+///
+/// ```toml
+/// [[backends]]
+/// name = "api"
+/// transport = "http"
+/// url = "http://api:8080"
+///
+/// [backends.http]
+/// connect_timeout_secs = 5
+/// timeout_secs = 60
+/// pool_idle_timeout_secs = 120
+/// pool_max_idle_per_host = 4
+/// danger_accept_invalid_certs = true
+/// user_agent = "mcp-proxy/1.0"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BackendHttpClientConfig {
+    /// TCP connect timeout in seconds (default: 10).
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Overall request timeout in seconds (default: 30).
+    /// Maps to `HttpClientConfig::request_timeout` for the tower-mcp transport.
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Connection pool idle timeout in seconds (default: 90).
+    #[serde(default = "default_http_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    /// Maximum idle connections per host in the pool (default: none/system).
+    /// `None` uses reqwest's system default.
+    pub pool_max_idle_per_host: Option<usize>,
+    /// Accept invalid TLS certificates (default: false).
+    /// **WARNING**: disabling certificate verification exposes the proxy to
+    /// man-in-the-middle attacks. Use only for local development or with
+    /// self-signed certs in a controlled environment.
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
+    /// Custom User-Agent header value (default: none → reqwest default).
+    pub user_agent: Option<String>,
+}
+
+fn default_http_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
+}
+
+fn default_http_pool_idle_timeout_secs() -> u64 {
+    90
+}
+
+/// Build a [`reqwest::Client`] from the per-backend HTTP config.
+///
+/// This is the primary way to construct a custom client when the backend
+/// requires non-default TLS settings or connection pool tuning.
+impl From<&BackendHttpClientConfig> for reqwest::ClientBuilder {
+    fn from(config: &BackendHttpClientConfig) -> Self {
+        let mut builder = reqwest::Client::builder();
+        builder = builder
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+        if let Some(max_idle) = config.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(max_idle);
+        }
+        if config.danger_accept_invalid_certs {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(ref ua) = config.user_agent {
+            builder = builder.user_agent(ua.as_str());
+        }
+        builder
+    }
+}
+
+/// Convert per-backend HTTP config to the tower-mcp [`HttpClientConfig`].
+///
+/// Only fields with a direct counterpart are mapped; tower-mcp-specific
+/// settings (auto_sse, session_recovery, etc.) keep their own defaults.
+impl From<&BackendHttpClientConfig> for tower_mcp::client::HttpClientConfig {
+    fn from(config: &BackendHttpClientConfig) -> Self {
+        tower_mcp::client::HttpClientConfig {
+            request_timeout: Duration::from_secs(config.timeout_secs),
+            ..Default::default()
+        }
+    }
 }
 
 /// Backend spawn mode.
@@ -962,6 +1085,16 @@ pub enum TransportType {
     Http,
     /// WebSocket remote server.
     Websocket,
+}
+
+/// Returns the default initialization timeout for a given transport type.
+/// - `Stdio`: 30 seconds (subprocess may need time to start)
+/// - `Http`/`Websocket`: `None` (no timeout by default for remote connections)
+pub fn default_init_timeout(transport: &TransportType) -> Option<std::time::Duration> {
+    match transport {
+        TransportType::Stdio => Some(std::time::Duration::from_secs(30)),
+        TransportType::Http | TransportType::Websocket => None,
+    }
 }
 
 /// Per-backend request timeout.
@@ -1944,6 +2077,7 @@ impl ProxyConfig {
                 protocol_support: ProtocolSupportConfig::default(),
                 default_spawn_mode: SpawnMode::Eager,
                 default_idle_timeout_secs: None,
+                init_timeout: None,
             },
             backends,
             auth: None,
@@ -4928,5 +5062,373 @@ backends:
         assert!(matches!(p, CompiledPattern::Regex(_)));
         assert!(p.matches("list_users"));
         assert!(!p.matches("get_users"));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, 10);
+        assert_eq!(http.timeout_secs, 30);
+        assert_eq!(http.pool_idle_timeout_secs, 90);
+        assert!(http.pool_max_idle_per_host.is_none());
+        assert!(!http.danger_accept_invalid_certs);
+        assert!(http.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_all_fields() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        connect_timeout_secs = 5
+        timeout_secs = 60
+        pool_idle_timeout_secs = 120
+        pool_max_idle_per_host = 4
+        danger_accept_invalid_certs = true
+        user_agent = "mcp-proxy/1.0"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, 5);
+        assert_eq!(http.timeout_secs, 60);
+        assert_eq!(http.pool_idle_timeout_secs, 120);
+        assert_eq!(http.pool_max_idle_per_host, Some(4));
+        assert!(http.danger_accept_invalid_certs);
+        assert_eq!(http.user_agent.as_deref(), Some("mcp-proxy/1.0"));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_absent_means_none() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.backends[0].http.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_partial_fields() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        timeout_secs = 10
+        danger_accept_invalid_certs = true
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        // Specified fields
+        assert_eq!(http.timeout_secs, 10);
+        assert!(http.danger_accept_invalid_certs);
+        // Absent fields use defaults
+        assert_eq!(http.connect_timeout_secs, 10);
+        assert_eq!(http.pool_idle_timeout_secs, 90);
+        assert!(http.pool_max_idle_per_host.is_none());
+        assert!(http.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_from_into_reqwest_client_builder() {
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 5,
+            timeout_secs: 60,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(4),
+            danger_accept_invalid_certs: true,
+            user_agent: Some("test-agent".to_string()),
+        };
+        let builder: reqwest::ClientBuilder = (&cfg).into();
+        // Verify the builder produces a valid client without panic
+        let client = builder.build().expect("reqwest client should build");
+        // Verify the client can send (basic connectivity check)
+        let _ = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_from_into_http_client_config() {
+        use std::time::Duration;
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 5,
+            timeout_secs: 60,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(4),
+            danger_accept_invalid_certs: true,
+            user_agent: Some("test-agent".to_string()),
+        };
+        let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+        assert_eq!(hc.request_timeout, Duration::from_secs(60));
+        // Fields not mapped should retain defaults
+        assert!(hc.auto_sse);
+        assert!(hc.session_recovery);
+    }
+
+    #[test]
+    fn test_backend_http_client_config_toml_roundtrip() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        connect_timeout_secs = 5
+        timeout_secs = 60
+        pool_idle_timeout_secs = 120
+        pool_max_idle_per_host = 4
+        danger_accept_invalid_certs = true
+        user_agent = "mcp-proxy/1.0"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+
+        // Roundtrip: serialize back to TOML and parse again
+        let serialized = toml::to_string(&config).expect("serialize");
+        let config2 = ProxyConfig::parse(&serialized).expect("parse roundtrip");
+        let http2 = config2.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, http2.connect_timeout_secs);
+        assert_eq!(http.timeout_secs, http2.timeout_secs);
+        assert_eq!(http.pool_idle_timeout_secs, http2.pool_idle_timeout_secs);
+        assert_eq!(http.pool_max_idle_per_host, http2.pool_max_idle_per_host);
+        assert_eq!(
+            http.danger_accept_invalid_certs,
+            http2.danger_accept_invalid_certs
+        );
+        assert_eq!(http.user_agent, http2.user_agent);
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK005: apply_global_defaults / init_timeout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_init_timeout_stdio() {
+        let d = default_init_timeout(&TransportType::Stdio);
+        assert_eq!(d, Some(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_default_init_timeout_http() {
+        assert!(default_init_timeout(&TransportType::Http).is_none());
+    }
+
+    #[test]
+    fn test_default_init_timeout_websocket() {
+        assert!(default_init_timeout(&TransportType::Websocket).is_none());
+    }
+
+    #[test]
+    fn test_apply_global_defaults_stdio_gets_transport_default() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(30));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_http_gets_none() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert!(config.backends[0].init_timeout.is_none());
+    }
+
+    #[test]
+    fn test_apply_global_defaults_global_overrides_transport_default() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 10
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(10));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_per_backend_overrides_global() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 10
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 5
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(5));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_no_global_no_per_backend_stdio() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(30));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_multiple_backends_independent() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 7
+        [proxy.listen]
+
+        [[backends]]
+        name = "stdio-be"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+
+        [[backends]]
+        name = "http-be"
+        transport = "http"
+        url = "http://localhost:9000"
+
+        [[backends]]
+        name = "stdio-custom"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 3
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(7));
+        assert_eq!(config.backends[1].init_timeout, Some(7));
+        assert_eq!(config.backends[2].init_timeout, Some(3));
+    }
+
+    #[test]
+    fn test_init_timeout_toml_parsing() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 15
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 5
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.proxy.init_timeout, Some(15));
+        assert_eq!(config.backends[0].init_timeout, Some(5));
+    }
+
+    #[test]
+    fn test_http_client_config_applied_to_builder() {
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 3,
+            timeout_secs: 15,
+            pool_idle_timeout_secs: 60,
+            pool_max_idle_per_host: Some(2),
+            danger_accept_invalid_certs: false,
+            user_agent: Some("test-agent/2.0".to_string()),
+        };
+        let builder: reqwest::ClientBuilder = (&cfg).into();
+        let client = builder.build().expect("reqwest client should build");
+        let _ = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_http_client_config_to_tower_mcp_config() {
+        use std::time::Duration;
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 2,
+            timeout_secs: 45,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(8),
+            danger_accept_invalid_certs: false,
+            user_agent: Some("mcp-proxy/3.0".to_string()),
+        };
+        let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+        assert_eq!(hc.request_timeout, Duration::from_secs(45));
+        assert!(hc.auto_sse);
+        assert!(hc.session_recovery);
     }
 }

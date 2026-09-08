@@ -1654,6 +1654,7 @@ fn lazy_live_config(dir: &Path, server: &Path) -> ProxyConfig {
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
+            init_timeout: None,
         },
         backends: vec![
             // Dummy eager backend (real MCP server) so the shared McpProxy has
