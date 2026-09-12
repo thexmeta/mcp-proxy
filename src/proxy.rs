@@ -15,6 +15,7 @@ use tower::Layer;
 use tower::Service;
 use tower::timeout::TimeoutLayer;
 use tower::util::BoxCloneService;
+use tower_http::cors::{Any, CorsLayer};
 use tower_mcp::SessionHandle;
 use tower_mcp::auth::{AuthLayer, StaticBearerValidator};
 use tower_mcp::proxy::McpProxy;
@@ -769,6 +770,45 @@ impl Proxy {
         let router = router.layer(axum::middleware::from_fn(
             crate::mcp_compat::inject_mcp_compat_headers,
         ));
+
+        // CORS layer for browser clients
+        let router = if let Some(cors_config) = &config.security.cors {
+            let mut cors = CorsLayer::new();
+            if let Some(ref origins) = cors_config.allowed_origins {
+                for origin in origins {
+                    cors = cors.allow_origin(origin.parse::<axum::http::HeaderValue>()?);
+                }
+            } else {
+                cors = cors.allow_origin(Any);
+            }
+            if let Some(ref methods) = cors_config.allowed_methods {
+                let methods: Vec<axum::http::Method> = methods
+                    .iter()
+                    .map(|m| m.parse())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid CORS method")?;
+                cors = cors.allow_methods(methods);
+            } else {
+                cors = cors.allow_methods(Any);
+            }
+            if let Some(ref headers) = cors_config.allowed_headers {
+                let headers: Vec<axum::http::HeaderName> = headers
+                    .iter()
+                    .map(|h| h.parse())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid CORS header name")?;
+                cors = cors.allow_headers(headers);
+            } else {
+                cors = cors.allow_headers(Any);
+            }
+            if cors_config.allow_credentials.unwrap_or(false) {
+                cors = cors.allow_credentials(true);
+            }
+            tracing::info!(?cors_config, "CORS enabled");
+            router.layer(cors)
+        } else {
+            router
+        };
 
         // Inbound authentication (axum-level middleware)
         let router = apply_auth(&config, router).await?;

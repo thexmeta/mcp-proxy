@@ -314,6 +314,7 @@ async fn watch_loop(
             }
         };
         new_config.resolve_env_vars();
+        new_config.apply_global_defaults();
 
         let kill_timeout_secs = new_config.proxy.shutdown_kill_timeout_secs;
 
@@ -1056,6 +1057,7 @@ fn build_backend_layer(backend: &BackendConfig) -> BackendMiddlewareLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SpawnMode;
 
     fn http_backend(name: &str, url: &str) -> BackendConfig {
         // Parse from TOML to get all default values automatically
@@ -1234,5 +1236,83 @@ mod tests {
         // Same config called twice must also be stable
         let fp3 = config_fingerprint(&b1);
         assert_eq!(fp1, fp3, "fingerprint must be stable across multiple calls");
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: hot-reload must call apply_global_defaults() so that
+    // init_timeout is resolved for Stdio backends (30s default).
+    // Without this, backend.initialize() has no timeout and hangs forever.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hotreload_stdio_backend_gets_init_timeout_via_apply_global_defaults() {
+        // Simulate a hot-reloaded ProxyConfig where the Stdio backend has no
+        // explicit init_timeout. After apply_global_defaults(), it must get
+        // the transport-specific default (30s for Stdio).
+        let mut config: ProxyConfig = toml::from_str(
+            r#"
+            [proxy]
+            name = "test"
+            version = "1.0"
+
+            [proxy.listen]
+            host = "127.0.0.1"
+            port = 8080
+
+            [[backends]]
+            name = "lazy-stdio"
+            transport = "stdio"
+            command = "echo"
+            spawn_mode = "lazy"
+            "#,
+        )
+        .unwrap();
+
+        // Before apply_global_defaults: init_timeout is None (raw parse).
+        assert!(
+            config.backends[0].init_timeout.is_none(),
+            "raw parse must not set init_timeout"
+        );
+
+        // Simulate what the hot-reload path now does (after the fix).
+        config.apply_global_defaults();
+
+        // After apply_global_defaults: Stdio backend must get 30s init_timeout.
+        assert_eq!(
+            config.backends[0].init_timeout,
+            Some(30),
+            "hot-reloaded Stdio backend must get 30s init_timeout from apply_global_defaults"
+        );
+    }
+
+    #[test]
+    fn test_hotreload_spawn_mode_resolved_by_apply_global_defaults() {
+        // Backend with spawn_mode = Unset must inherit proxy default after apply.
+        let mut config: ProxyConfig = toml::from_str(
+            r#"
+            [proxy]
+            name = "test"
+            version = "1.0"
+            default_spawn_mode = "lazy"
+
+            [proxy.listen]
+            host = "127.0.0.1"
+            port = 8080
+
+            [[backends]]
+            name = "auto"
+            transport = "http"
+            url = "http://localhost:8080"
+            "#,
+        )
+        .unwrap();
+
+        // Before: Unset (raw parse default).
+        assert_eq!(config.backends[0].spawn_mode, SpawnMode::Unset);
+
+        config.apply_global_defaults();
+
+        // After: inherits proxy default_spawn_mode.
+        assert_eq!(config.backends[0].spawn_mode, SpawnMode::Lazy);
     }
 }

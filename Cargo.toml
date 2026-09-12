@@ -1,6 +1,6 @@
 [package]
 name = "mcp-proxy"
-version = "1.4.1-b1"
+version = "1.4.2-b3"
 edition = "2024"
 rust-version = "1.97"
 description = "Standalone MCP proxy -- config-driven reverse proxy with auth, rate limiting, and observability"
@@ -33,6 +33,7 @@ tower-mcp = { version = "0.22.1", features = ["http", "http-client", "proxy", "w
 tower-mcp-types = "0.22.1"
 axum = "0.8"
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tower-resilience = { version = "0.13.0", default-features = false, features = ["circuitbreaker", "ratelimiter", "hedge", "retry"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -71,6 +72,7 @@ tokio-stream = "0.1"
 http-body-util = "0.1.5"
 sha2 = "0.10"
 hex = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 indexmap = "2"

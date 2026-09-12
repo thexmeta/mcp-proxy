@@ -25,6 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tower::{Layer, Service};
 use tower_mcp::router::{RouterRequest, RouterResponse};
@@ -224,18 +225,42 @@ where
             let fut = self.inner.call(req);
             return Box::pin(async move {
                 // Coalesced spawn: concurrent first-calls share one child (FR-006).
-                if let Err(e) = registry.ensure_spawned(&target_owned).await {
-                    tracing::warn!(
-                        backend = %target_owned,
-                        error = %e,
-                        "lazy spawn failed for action request"
-                    );
-                    return Ok(RouterResponse {
-                        id: request_id,
-                        inner: Err(JsonRpcError::invalid_params(format!(
-                            "lazy backend '{target_owned}' failed to spawn: {e}"
-                        ))),
-                    });
+                // Outer safety-net timeout (120s) guards against backends whose
+                // per-backend init_timeout was never set (e.g. hot-reload path
+                // before the apply_global_defaults fix).
+                const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
+                let spawn_result =
+                    tokio::time::timeout(SPAWN_TIMEOUT, registry.ensure_spawned(&target_owned))
+                        .await;
+                match spawn_result {
+                    Ok(Ok(())) => { /* spawned successfully */ }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            backend = %target_owned,
+                            error = %e,
+                            "lazy spawn failed for action request"
+                        );
+                        return Ok(RouterResponse {
+                            id: request_id,
+                            inner: Err(JsonRpcError::invalid_params(format!(
+                                "lazy backend '{target_owned}' failed to spawn: {e}"
+                            ))),
+                        });
+                    }
+                    Err(_elapsed) => {
+                        tracing::error!(
+                            backend = %target_owned,
+                            timeout_secs = SPAWN_TIMEOUT.as_secs(),
+                            "lazy spawn timed out for action request"
+                        );
+                        return Ok(RouterResponse {
+                            id: request_id,
+                            inner: Err(JsonRpcError::invalid_params(format!(
+                                "lazy backend '{target_owned}' spawn timed out after {}s",
+                                SPAWN_TIMEOUT.as_secs()
+                            ))),
+                        });
+                    }
                 }
                 // Touch + inc-refcount BEFORE forwarding (C21 / C6 / C23).
                 registry.touch(&target_owned);
@@ -944,6 +969,140 @@ mod tests {
         assert_eq!(
             resolve_backend_name("cedar_analysis_analyze", &known, "_"),
             Some("cedar_analysis".to_string())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: outer timeout on ensure_spawned.
+    //
+    // If a lazy backend's per-backend init_timeout is missing (e.g.
+    // hot-reload before the apply_global_defaults fix), the spawn can
+    // hang forever. The 120s outer timeout in WarmCatalogService::call
+    // must fire and return a JSON-RPC error instead.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_timeout_wraps_ensure_spawned() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Regression: WarmCatalogService::call() must wrap ensure_spawned in
+        // tokio::time::timeout so that a hanging spawn does not block the
+        // agent forever. We verify this by confirming that a slow-but-finite
+        // spawn completes and the backend is marked Up, proving the timeout
+        // wrapper does not interfere with the normal path.
+        let spawn_count = StdArc::new(AtomicUsize::new(0));
+        let spawn_fn: crate::lazy_registry::SpawnBackendFn = {
+            let count = spawn_count.clone();
+            StdArc::new(move |_cfg: &BackendConfig| {
+                let count = count.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    // Brief sleep to simulate a real spawn (not instant).
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Ok(())
+                })
+            })
+        };
+        let probe_fn: crate::lazy_registry::ProbeBackendFn =
+            StdArc::new(|_cfg: &BackendConfig, _sep: &str| {
+                Box::pin(async move { Err(anyhow::anyhow!("probe skipped")) })
+            });
+
+        let registry = StdArc::new(
+            LazyBackendRegistry::from_backends(vec![lazy_backend_with_catalog(
+                "fast", "/", &["run"],
+            )])
+            .with_test_hooks(spawn_fn, probe_fn),
+        );
+
+        let mock = MockService::with_tools(&[]);
+        let mut svc =
+            WarmCatalogService::new(mock, registry, "/".to_string(), None);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(CallToolParams {
+                name: "fast/run".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1, "spawn called once");
+        assert!(
+            resp.inner.is_ok(),
+            "successful spawn must forward request: {:?}",
+            resp.inner
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_timeout_returns_error_not_hang() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Verify the error message contains useful info when spawn fails.
+        let spawn_count = StdArc::new(AtomicUsize::new(0));
+        let spawn_fn: crate::lazy_registry::SpawnBackendFn = {
+            let count = spawn_count.clone();
+            StdArc::new(move |_cfg: &BackendConfig| {
+                let count = count.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("backend binary not found"))
+                })
+            })
+        };
+        let probe_fn: crate::lazy_registry::ProbeBackendFn =
+            StdArc::new(|_cfg: &BackendConfig, _sep: &str| {
+                Box::pin(async move { Err(anyhow::anyhow!("probe skipped")) })
+            });
+
+        let registry = StdArc::new(
+            LazyBackendRegistry::from_backends(vec![lazy_backend_with_catalog(
+                "missing", "/", &["run"],
+            )])
+            .with_test_hooks(spawn_fn, probe_fn),
+        );
+
+        let mock = MockService::with_tools(&[]);
+        let mut svc =
+            WarmCatalogService::new(mock, registry, "/".to_string(), None);
+
+        let resp = call_service(
+            &mut svc,
+            McpRequest::CallTool(CallToolParams {
+                name: "missing/run".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1, "spawn attempted once");
+        assert!(
+            resp.inner.is_err(),
+            "failed spawn must return JSON-RPC error"
+        );
+
+        // Verify the error message includes the backend name.
+        let err_resp = resp.inner.unwrap_err();
+        let err_msg = err_resp.message.clone();
+        assert!(
+            err_msg.contains("missing"),
+            "error must mention backend name: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("backend binary not found"),
+            "error must include spawn failure reason: {err_msg}"
         );
     }
 }

@@ -463,6 +463,49 @@ cargo install mcp-proxy --no-default-features --features metrics
 
 Config parsing always works regardless of features -- if you reference a disabled feature in your config (e.g., `type = "jwt"` without the `oauth` feature), you'll get a clear error at startup.
 
+## Troubleshooting
+
+### EROFS (Read-only file system) errors
+
+If you see `Read-only file system (os error 30)` when a backend tries to write files, this is likely caused by systemd sandboxing.
+
+**Symptom:**
+```
+fs_write_file({"path": "/home/user/Desktop/test.txt", "content": "test"})
+→ "Read-only file system (os error 30)"
+```
+
+**Cause:**
+
+When running under systemd with `ProtectSystem=strict`, the root filesystem `/` is mounted read-only. Backends using `rust-mcp-filesystem` with `allowed_directories = ["/"]` will fail because cap-std opens `/` as a `Dir` capability and cannot traverse mount boundaries to reach writable paths.
+
+**Detection:**
+
+mcp-proxy detects this at startup and logs warnings:
+```
+WARN Backend has root directory '/' as allowed path, but root filesystem is read-only (likely ProtectSystem=strict). This will cause EROFS errors. Fix: change allowed path to a writable directory like '/home/<user>' or add ReadWritePaths to the systemd unit.
+```
+
+**Fix:**
+
+Option A: Change the backend's allowed directory to a writable path:
+```toml
+# Before (fails with EROFS):
+args = [ "/", "-d", "...", "--allow-write"]
+
+# After (works):
+args = [ "/home/user", "-d", "...", "--allow-write"]
+```
+
+Option B: Add the path to `ReadWritePaths` in the systemd unit:
+```ini
+[Service]
+ProtectSystem=strict
+ReadWritePaths=/home/user
+```
+
+Option C: Remove `ProtectSystem=strict` (not recommended for production).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

@@ -194,6 +194,7 @@ pub mod param_override;
 pub mod rbac;
 pub mod reload;
 pub mod retry;
+pub mod sandbox;
 #[cfg(feature = "skills")]
 pub mod skills;
 pub mod stdio_spawn;

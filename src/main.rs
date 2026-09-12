@@ -85,6 +85,21 @@ async fn main() -> Result<()> {
 
     init_logging(&config);
 
+    // Detect systemd sandbox (ProtectSystem=strict) and warn about EROFS risks.
+    let sandbox_info = mcp_proxy::sandbox::SandboxInfo::detect();
+    if sandbox_info.root_read_only {
+        tracing::warn!(
+            "Root filesystem '/' is mounted read-only (likely systemd ProtectSystem=strict). \
+             Backends using '/' as their root directory will fail with EROFS. \
+             Ensure ReadWritePaths covers all backend root directories."
+        );
+        for backend in &config.backends {
+            if let Some(ref cmd) = backend.command {
+                sandbox_info.validate_backend_args(cmd, &backend.args);
+            }
+        }
+    }
+
     tracing::info!(
         name = %config.proxy.name,
         version = %config.proxy.version,

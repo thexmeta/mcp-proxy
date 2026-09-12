@@ -1529,6 +1529,23 @@ pub struct SecurityConfig {
     /// `admin_token`. With no auth configured at all, the admin API is open
     /// (suitable for local/dev use). Supports `${ENV_VAR}` syntax.
     pub admin_token: Option<String>,
+    /// CORS configuration for browser clients. If omitted, no CORS headers
+    /// are sent (browser-based clients will be blocked by same-origin policy).
+    pub cors: Option<CorsConfig>,
+}
+
+/// Cross-Origin Resource Sharing (CORS) configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CorsConfig {
+    /// List of allowed origins. If omitted, allows any origin (`*`).
+    pub allowed_origins: Option<Vec<String>>,
+    /// HTTP methods to allow. If omitted, allows any method.
+    pub allowed_methods: Option<Vec<String>>,
+    /// HTTP headers to allow. If omitted, allows any header.
+    pub allowed_headers: Option<Vec<String>>,
+    /// Whether to include `Access-Control-Allow-Credentials` header.
+    #[serde(default)]
+    pub allow_credentials: Option<bool>,
 }
 
 /// Logging, metrics, and distributed tracing configuration.

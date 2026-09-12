@@ -82,6 +82,10 @@ Retry -> Hedge -> Concurrency Limit -> Rate Limit
   -> Timeout -> Circuit Breaker -> Outlier Detection -> Backend
 ```
 
+### Sandbox Detection
+
+mcp-proxy detects systemd sandboxing at startup and warns if backend paths are not writable. This prevents EROFS errors when running under `ProtectSystem=strict`. See README.md troubleshooting for details.
+
 ### Endpoint-group middleware stacks
 
 Endpoint-group routes (e.g. `/os/mcp`) build their OWN middleware stack in
