@@ -2,7 +2,7 @@
 title: "ADR-0006: Capability Drift Reconciliation"
 status: "Proposed"
 date: "2026-08-24"
-authors: "mcp-proxy maintainers"
+authors: "Eser Kelleci (@thexmeta) <eserkelleci@gmail.com>"
 tags: ["architecture", "decision", "capabilities", "lazy-spawn"]
 supersedes: ""
 superseded_by: ""

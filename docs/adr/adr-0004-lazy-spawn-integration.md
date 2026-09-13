@@ -2,7 +2,7 @@
 title: "ADR-0004: Lazy Spawn Integration Strategy"
 status: "Proposed"
 date: "2026-08-24"
-authors: "mcp-proxy maintainers"
+authors: "Eser Kelleci (@thexmeta) <eserkelleci@gmail.com>"
 tags: ["architecture", "decision", "tower-mcp", "lazy-spawn"]
 supersedes: ""
 superseded_by: ""

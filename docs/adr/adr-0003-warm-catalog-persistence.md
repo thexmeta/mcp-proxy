@@ -2,7 +2,7 @@
 title: "ADR-0003: Warm Catalog Persistence and Invalidation"
 status: "Proposed"
 date: "2026-08-24"
-authors: "mcp-proxy maintainers"
+authors: "Eser Kelleci (@thexmeta) <eserkelleci@gmail.com>"
 tags: ["architecture", "decision", "caching", "lazy-spawn"]
 supersedes: ""
 superseded_by: ""

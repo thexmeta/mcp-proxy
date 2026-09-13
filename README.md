@@ -1,13 +1,82 @@
-# mcp-proxy
+# mcp-proxy — lazy backend lifecycle fork
 
-[![Crates.io](https://img.shields.io/crates/v/mcp-proxy.svg)](https://crates.io/crates/mcp-proxy)
-[![docs.rs](https://docs.rs/mcp-proxy/badge.svg)](https://docs.rs/mcp-proxy)
-[![CI](https://github.com/joshrotenberg/mcp-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/joshrotenberg/mcp-proxy/actions/workflows/ci.yml)
-[![License](https://img.shields.io/crates/l/mcp-proxy.svg)](LICENSE-MIT)
+A config-driven [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) reverse proxy in Rust. It aggregates multiple MCP backends behind a single endpoint with per-backend middleware, authentication, and observability. Built on [tower-mcp](https://github.com/joshrotenberg/tower-mcp) and the [tower](https://github.com/tower-rs/tower) middleware ecosystem.
 
-A config-driven [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) reverse proxy built in Rust. Aggregates multiple MCP backends behind a single endpoint with per-backend middleware, authentication, and observability.
+This is a fork of [joshrotenberg/mcp-proxy](https://github.com/joshrotenberg/mcp-proxy) carrying an unreleased line of work on **backend lifecycle**. Three changes define it: backends are no longer spawned at startup, their tool catalogs are served from disk while the processes are dead, and each backend runs at most one process no matter how many endpoints expose it.
 
-Built on [tower-mcp](https://github.com/joshrotenberg/tower-mcp) and the [tower](https://github.com/tower-rs/tower) middleware ecosystem.
+Measured against `upstream/main`: 56 source files changed, +13,512 lines; 12 new test files, +9,888 lines of tests. Version in this tree is `1.4.2-b3`, unreleased.
+
+## What this fork adds
+
+### Lazy backend spawning with a persistent warm catalog
+
+A proxy fronting sixteen `npx` and `uvx` servers pays all sixteen cold starts before it can answer one request. Worse, a backend that is not running vanishes from `tools/list`, so the client cannot see a tool it is entitled to call.
+
+Backends marked `spawn_mode = "lazy"` are not spawned at boot. Their catalog is probed once, hashed, and persisted to disk, so `tools/list`, `resources/list`, `resource_templates/list`, and `prompts/list` are answered with **no process running**. The first `tools/call` spawns the backend; concurrent first-calls await the same in-flight future behind a `OnceCell` lock, so exactly one process starts. The catalog survives restarts, and on every spawn the live capability set is reconciled against the persisted one, with `notifications/tools/list_changed` re-emitted on drift.
+
+Two details that took the most thought:
+
+- **Cache identity** is a SHA-256 over the resolved command, args, working directory, and environment variable *keys* — never their values, so no secret reaches the hash or the disk. Hashing `command` alone is useless here: for a launcher like `npx` or `uvx` it is byte-identical across completely unrelated servers. An optional `cache_key_suffix` pins a launcher package version that cannot be resolved offline.
+- **Idle teardown is protocol-dependent.** Stateless `2026-07-28` backends are terminated after `idle_timeout_secs` of inactivity. Session-based `2025-11-25` backends are deliberately kept alive, because their session state cannot be transparently recreated and silently dropping it would surface as an unexplained failure in the client.
+
+See [Lazy Backend Spawning & Warm Cache](#lazy-backend-spawning--warm-cache) for configuration.
+
+### Shared backend pool
+
+Each backend process is spawned exactly once, regardless of how many endpoint groups reference it. The proxy builds one `McpProxy` holding every backend, and each endpoint group layers its own middleware stack and namespace filter on top rather than owning its own connection. A backend shared across three groups is three routes to one process, not three processes.
+
+### Endpoint groups with namespace-isolated filtering
+
+Endpoint groups expose a subset of backends at their own MCP endpoint (`/{path}/mcp`) — role-scoped tool sets without running a second proxy. Membership can be declared from either side (on the group, or as a reverse reference on the backend), a group-aware capability filter enforces the namespace boundary, and a shorthand form (`proxy.endpoint_group_list = ["os", "web"]`) covers the common case where a group exposes everything.
+
+### Protocol and traffic work
+
+- **MCP `2026-07-28` support** alongside `2025-11-25`, negotiated per connection: stateless operation, per-request `_meta`, `server/discover`, and `subscriptions/listen`.
+- **Per-client-identity rate limiting** keyed on `_meta.clientInfo.name`, so one misbehaving client cannot consume a shared backend's budget.
+- **Global backend defaults** (`[proxy.backend_env]`, `[proxy.timeout]`, `[proxy.circuit_breaker]`, `[proxy.retry]`) with per-backend overrides.
+
+### Correctness fixes found by running it
+
+The lazy path held up under unit tests and then broke in three ways against sixteen real backends. Each fix landed with a regression test that fails against the previous code:
+
+1. **Endpoint groups containing only lazy stdio backends exposed zero tools.** The warm-catalog append matched namespaces by splitting the tool name on the separator, but the stored prefix already included the trailing separator, so every append silently no-opped. Replaced with a prefix match.
+2. **Backends without `resources/list` got no warm catalog at all.** The probe aborted on the first capability-listing error, so a server exposing tools but not resources ended up with an empty catalog and disappeared from its group. Resource, template, and prompt listings are now best-effort; only `tools` is treated as critical.
+3. **`tools/call` returned "Unknown tool" when a backend name contained the separator.** Resolution took the first token of the split name, so `electron_cdp_start_app` resolved to backend `electron`, missed the registry, skipped the spawn path, and failed. Replaced with longest-prefix match against registered backends.
+
+All three are being filed upstream as issues with their regression tests attached.
+
+## Design records
+
+The reasoning behind the lazy lifecycle is written down in [`docs/adr/`](docs/adr/) rather than left in commit messages:
+
+- [Warm catalog persistence and invalidation](docs/adr/adr-0003-warm-catalog-persistence.md) — why the catalog is mirrored locally instead of reusing tower-mcp's cache type (it is `pub(crate)`, the leaf types are not), what belongs in the identity hash, and why script content is excluded from it.
+- [Lazy spawn integration](docs/adr/adr-0004-lazy-spawn-integration.md) — why this was built on the existing public `add_backend` surface first, deferring a tower-mcp fork rather than starting with one.
+- [Idle lifecycle and concurrency](docs/adr/adr-0005-idle-lifecycle-concurrency.md) — single-spawn guarantee under concurrent first-calls, and why idle teardown is enabled for stateless backends only.
+- [Capability drift reconciliation](docs/adr/adr-0006-capability-drift.md) — persisted data is the cold-start source of truth, live data is authoritative after spawn, and drift self-heals on the next spawn.
+
+All four are still marked *Proposed*: the implementation landed, the records have not been ratified by upstream.
+
+## Relationship to upstream
+
+Upstream is [joshrotenberg/mcp-proxy](https://github.com/joshrotenberg/mcp-proxy), dual-licensed MIT / Apache-2.0, and remains the place to get a released build.
+
+This fork's default branch is `fork/main` and it does **not** descend from upstream's history. The tree was reconstructed from editor local history after the original checkout was lost, so its root commit is a recovery snapshot with no common ancestor upstream. The work is intact and the diff against `upstream/main` is meaningful; the commit graph simply cannot be replayed onto it. Upstream contributions are therefore prepared as single clean commits branched fresh off `upstream/main`, not as merges from this branch.
+
+Related: [mcp-migration-check](https://github.com/AlpayC/mcp-migration-check) lints MCP servers for protocol migration gaps. Its `MCP010` rule recommends the `tower-mcp` `protocol-2026-07-28` upgrade — the same upgrade this fork performs.
+
+## Building this fork
+
+The published crate and the Homebrew and Docker artifacts below are upstream's and do **not** include this work. To run this tree:
+
+```bash
+git clone -b fork/main https://github.com/thexmeta/mcp-proxy.git
+cd mcp-proxy
+cargo build --release
+```
+
+---
+
+Everything below is the upstream reference documentation, kept as-is.
 
 ## Features
 
