@@ -30,7 +30,7 @@ pub(crate) const PROBE_TIMEOUT_SECS: u64 = 5;
 /// True when a probe error is a proven spawn-conflict fast-fail.
 ///
 /// Only a fast `Spawn` failure whose source carries the fast-fail signal
-/// (`Connection closed` / `failed to initialize`, no timeout text) counts:
+/// (`Connection closed`, no timeout text) counts:
 /// startup/probe timeouts and other transient errors return false and keep
 /// the existing degrade path (fuzzy fallback + retained catalog). Shares
 /// the classification with [`crate::reload::is_fast_spawn_conflict`] so the

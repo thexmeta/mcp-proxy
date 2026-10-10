@@ -1820,6 +1820,29 @@ mod tests {
         );
     }
 
+    /// Regression: a child that answered `initialize` with an unsupported
+    /// version is reachable, not crashed. Its warm catalog must survive.
+    #[tokio::test]
+    async fn protocol_rejection_spawn_error_preserves_catalog() {
+        let (reg, store, _dir) = conflict_registry(anyhow::anyhow!(
+            "failed to initialize: Transport error: server selected protocol version `1999-01-01`, which is not an initialize-lifecycle version this client supports"
+        ));
+
+        let err = reg.ensure_spawned("codebase").await.unwrap_err();
+        assert!(err.to_string().contains("1999-01-01"), "{err}");
+        assert!(
+            reg.get("codebase").and_then(|b| b.catalog).is_some(),
+            "an answered handshake must keep the in-memory catalog"
+        );
+        let hash = crate::warm_cache::BinaryHasher::hash(
+            &reg.get("codebase").expect("entry present").config,
+        );
+        assert!(
+            store.load("codebase", &hash).is_some(),
+            "an answered handshake must keep the on-disk catalog"
+        );
+    }
+
     #[tokio::test]
     async fn transient_spawn_error_preserves_catalog() {
         let (reg, store, _dir) = conflict_registry(anyhow::anyhow!("boom"));

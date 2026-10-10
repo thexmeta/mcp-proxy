@@ -1004,11 +1004,17 @@ async fn rebuild_endpoint_group(
 /// stop hint instead.
 pub(crate) const SPAWN_CONFLICT_MARKER: &str = "spawn conflict";
 
+/// Text tower-mcp puts in an `initialize` error when the server answered with
+/// a protocol version the client does not accept.
+pub(crate) const PROTOCOL_REJECTION_TEXT: &str = "server selected protocol version";
+
 /// Fast-fail spawn-conflict classifier.
 ///
 /// Returns true only when ALL hold:
-/// - the error text carries the fast-fail signal (`Connection closed` or
-///   `failed to initialize`), AND
+/// - the error text carries the fast-fail signal (`Connection closed`). A
+///   handshake the child answered, for example with an unsupported protocol
+///   version or a JSON-RPC error, is not an immediate exit and does not
+///   count, AND
 /// - the error is NOT a timeout (`timed out` / `timeout` anywhere), AND
 /// - `elapsed < init_timeout` (when a bound is configured; `None` means the
 ///   message signal alone decides).
@@ -1025,7 +1031,7 @@ pub(crate) fn is_fast_spawn_conflict(
     if lower.contains("timed out") || lower.contains("timeout") {
         return false;
     }
-    let signal = lower.contains("connection closed") || lower.contains("failed to initialize");
+    let signal = lower.contains("connection closed");
     if !signal {
         return false;
     }
@@ -1050,9 +1056,8 @@ pub(crate) fn spawn_conflict_hint(backend: &BackendConfig) -> String {
         )
     } else {
         format!(
-            "Backend '{}' exited immediately during initialize (possible singleton conflict: {}). \
-             The proxy never kills foreign processes; if another instance holds the singleton, \
-             stop it before retrying.",
+            "Backend '{}' exited immediately during initialize ({}). Check its stderr in the \
+             proxy log. The proxy never kills foreign processes.",
             backend.name, SPAWN_CONFLICT_MARKER
         )
     }
@@ -1085,6 +1090,18 @@ pub(crate) fn map_init_error(
     init_timeout: Option<std::time::Duration>,
 ) -> anyhow::Error {
     let raw = err.to_string();
+    if raw.contains(PROTOCOL_REJECTION_TEXT) {
+        tracing::warn!(
+            backend = %backend.name,
+            error = %raw,
+            "stdio backend answered initialize with a protocol version the proxy does not support"
+        );
+        return anyhow::anyhow!(
+            "backend '{}' protocol version not supported: {}",
+            backend.name,
+            raw
+        );
+    }
     if is_fast_spawn_conflict(&raw, elapsed, init_timeout) {
         let hint = spawn_conflict_hint(backend);
         tracing::warn!(
@@ -1864,6 +1881,46 @@ mod tests {
         .unwrap()
     }
 
+    /// Regression: the child answered `initialize`, so it did not exit. The
+    /// old `failed to initialize` signal classified these as spawn conflicts,
+    /// which invalidated the backend's warm catalog and blamed a singleton.
+    #[test]
+    fn answered_handshake_is_not_a_spawn_conflict() {
+        for raw in [
+            "failed to initialize: Transport error: server selected protocol version `1999-01-01`, which is not an initialize-lifecycle version this client supports; client supports: [\"2025-11-25\"]",
+            "failed to initialize: JSON-RPC error -32603: internal error",
+        ] {
+            assert!(
+                !is_fast_spawn_conflict(
+                    raw,
+                    Duration::from_millis(50),
+                    Some(Duration::from_secs(30))
+                ),
+                "answered handshake misclassified as conflict: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_init_error_names_a_protocol_rejection() {
+        let backend = plain_backend("legacy");
+        let err = map_init_error(
+            &backend,
+            "failed to initialize: Transport error: server selected protocol version `1999-01-01`, which is not an initialize-lifecycle version this client supports",
+            Duration::from_millis(50),
+            Some(Duration::from_secs(30)),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("legacy"), "must name backend: {msg}");
+        assert!(msg.contains("protocol version not supported"), "{msg}");
+        assert!(msg.contains("1999-01-01"), "must keep the version: {msg}");
+        assert!(
+            !msg.contains(SPAWN_CONFLICT_MARKER),
+            "not a conflict: {msg}"
+        );
+        assert!(!msg.contains("singleton"), "no singleton claim: {msg}");
+    }
+
     #[test]
     fn fast_conflict_connection_closed_under_timeout() {
         assert!(is_fast_spawn_conflict(
@@ -1958,6 +2015,10 @@ mod tests {
         assert!(
             !msg.contains("systemctl"),
             "unflagged backend must not invent a stop command: {msg}"
+        );
+        assert!(
+            !msg.contains("singleton"),
+            "unflagged backend must not be blamed on a singleton: {msg}"
         );
     }
 
