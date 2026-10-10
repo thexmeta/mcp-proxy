@@ -6,3 +6,11 @@ proxy*.toml
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/corpus/
+dist/
+nfpm.generated.yaml
+.qartez/
+
+# Vendored Cargo source (used by `cargo vendor`); never commit it.
+# AGENTS.md explicitly forbids modifying or tracking vendored source.
+vendor/
+/docs/plans/
