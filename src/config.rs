@@ -396,6 +396,11 @@ impl ProxyConfig {
                 backend.idle_timeout_secs = self.proxy.default_idle_timeout_secs;
             }
 
+            // Global idle teardown policy (per-backend None inherits proxy default).
+            if backend.idle_teardown.is_none() {
+                backend.idle_teardown = Some(self.proxy.default_idle_teardown);
+            }
+
             // Global init timeout default (per-backend overrides).
             // If backend doesn't have its own init_timeout, use global default.
             // If neither has one, use transport-specific default (30s for stdio, None for HTTP/WS).
@@ -652,6 +657,10 @@ pub struct ProxySettings {
     /// specify `idle_timeout_secs`. `None` means never idle-timeout.
     #[serde(default)]
     pub default_idle_timeout_secs: Option<u64>,
+    /// Default [`IdleTeardown`] policy for lazy backends that don't specify
+    /// `idle_teardown`. Defaults to `stateless`.
+    #[serde(default)]
+    pub default_idle_teardown: IdleTeardown,
     /// Global default initialization timeout (seconds) for backend MCP
     /// handshake. Per-backend `init_timeout` overrides this.
     /// Default: 30s for stdio, None for HTTP/WebSocket.
@@ -940,6 +949,11 @@ pub struct BackendConfig {
     /// Only meaningful when `spawn_mode = "lazy"`. `None` means never idle-timeout.
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    /// Which idle lazy backends may be stopped; see [`IdleTeardown`]. `None`
+    /// inherits `[proxy] default_idle_teardown`. Set `"always"` only for
+    /// backends whose session state is cheap to lose.
+    #[serde(default)]
+    pub idle_teardown: Option<IdleTeardown>,
     /// HTTP client tuning for reqwest and tower-mcp HTTP transport.
     /// When set, the proxy builds a custom `reqwest::Client` from these options
     /// and passes matching config to the `HttpClientConfig` used by tower-mcp.
@@ -1116,6 +1130,22 @@ pub enum SpawnMode {
 /// so the GLOBAL default is backward compatible (not `Unset`).
 fn default_spawn_mode_eager() -> SpawnMode {
     SpawnMode::Eager
+}
+
+/// Which idle lazy backends the idle sweeper may stop (ADR-0007).
+///
+/// A backend that negotiated the stateless 2026-07-28 protocol loses nothing
+/// when its child is stopped. A session-based backend (2025-11-25 and older)
+/// loses its session state: open handles, cached indexes, terminal sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleTeardown {
+    /// Stop only backends that negotiated 2026-07-28 (default).
+    #[default]
+    Stateless,
+    /// Also stop session-based backends after `idle_timeout_secs`. Their
+    /// session state is lost; the next call starts a fresh session.
+    Always,
 }
 
 /// Backend transport protocol.
@@ -2202,6 +2232,7 @@ impl ProxyConfig {
                 protocol_support: ProtocolSupportConfig::default(),
                 default_spawn_mode: SpawnMode::Eager,
                 default_idle_timeout_secs: None,
+                default_idle_teardown: Default::default(),
                 init_timeout: None,
             },
             backends,
@@ -3273,6 +3304,70 @@ mod tests {
         assert!(!backend.singleton_externally_managed);
         assert!(backend.singleton_stop_hint.is_none());
         assert!(backend.singleton_stop_hint_resolved().is_none());
+    }
+
+    #[test]
+    fn idle_teardown_defaults_to_stateless_and_inherits() {
+        let defaults = ProxyConfig::parse(minimal_config()).unwrap();
+        assert_eq!(
+            defaults.proxy.default_idle_teardown,
+            IdleTeardown::Stateless
+        );
+        assert_eq!(
+            defaults.backends[0].idle_teardown,
+            Some(IdleTeardown::Stateless)
+        );
+
+        let toml = r#"
+        [proxy]
+        name = "test"
+        default_idle_teardown = "always"
+        [proxy.listen]
+
+        [[backends]]
+        name = "inherits"
+        transport = "stdio"
+        command = "/usr/bin/some-mcp"
+
+        [[backends]]
+        name = "pinned"
+        transport = "stdio"
+        command = "/usr/bin/some-mcp"
+        idle_teardown = "stateless"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.proxy.default_idle_teardown, IdleTeardown::Always);
+        assert_eq!(
+            config.backends[0].idle_teardown,
+            Some(IdleTeardown::Always),
+            "a backend without the key inherits the proxy default"
+        );
+        assert_eq!(
+            config.backends[1].idle_teardown,
+            Some(IdleTeardown::Stateless),
+            "an explicit backend value wins"
+        );
+    }
+
+    #[test]
+    fn idle_teardown_rejects_unknown_value() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "x"
+        transport = "stdio"
+        command = "/usr/bin/some-mcp"
+        idle_teardown = "sometimes"
+        "#;
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sometimes"),
+            "error should name the bad value: {msg}"
+        );
     }
 
     #[test]

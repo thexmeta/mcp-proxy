@@ -20,6 +20,8 @@ Lazy-spawned backends should release their child process when idle to bound reso
 
 Guard each namespace with a `OnceCell` spawn lock so the first live request spawns exactly once; concurrent callers await the same in-flight future. A `tokio` idle-sweep task tracks last-use and calls `remove_backend` after the idle timeout. Idle-out is enabled for stateless `2026-07-28`; for session-based `2025-11-25` the backend is kept alive (keep-alive) to preserve session state.
 
+> Amended by [ADR-0007](adr-0007-idle-teardown-opt-in.md): a session-based backend can opt into idle-out with `idle_teardown = "always"`.
+
 ## Alternatives
 
 - **No idle-out**: simplest, but unbounded process count defeats the resource goal. Rejected.

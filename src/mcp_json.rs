@@ -143,6 +143,7 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         protocol_version: None,
         spawn_mode: SpawnMode::default(),
         idle_timeout_secs: None,
+        idle_teardown: None,
         cache_key_suffix: None,
         http: None,
         init_timeout: None,

@@ -189,6 +189,15 @@ impl LazyBackendRegistry {
         self.backends.get(name).and_then(|e| e.idle_timeout_secs)
     }
 
+    /// Effective idle-teardown policy for a backend (ADR-0007). A config that
+    /// was never normalized falls back to the default, `stateless`.
+    pub fn idle_teardown(&self, name: &str) -> crate::config::IdleTeardown {
+        self.backends
+            .get(name)
+            .and_then(|e| e.config.idle_teardown)
+            .unwrap_or_default()
+    }
+
     /// Last activity timestamp for a backend, if tracked (C21).
     pub fn last_touch(&self, name: &str) -> Option<Instant> {
         self.backends
@@ -625,8 +634,9 @@ impl LazyBackendRegistry {
     /// Errors from the underlying removal are surfaced as [`anyhow::Error`].
     ///
     /// Guards (in order):
-    /// - **C3**: only stateless `2026-07-28` backends are idle-out; session-based
-    ///   `2025-11-25` (or unknown) backends are kept alive.
+    /// - **C3**: stateless `2026-07-28` backends are idle-out; session-based
+    ///   (or unknown) backends are kept alive unless their `idle_teardown` is
+    ///   `always` (ADR-0007), which accepts losing their session state.
     /// - **Up-only**: a backend that is not [`SpawnState::Up`] is skipped.
     /// - **C6 / C23**: a backend with in-flight requests (`refcount > 0`) is
     ///   skipped so the sweeper never kills a backend mid-request.
@@ -634,10 +644,14 @@ impl LazyBackendRegistry {
     ///   `None` or `0` means keep-alive.
     /// - The backend must have been idle longer than `idle_timeout_secs`.
     pub async fn idle_out(&self, name: &str) -> anyhow::Result<bool> {
-        // Guard 1: only idle-out stateless 2026-07-28 backends (C3).
+        // Guard 1: stateless 2026-07-28 backends idle out (C3). Session-based
+        // or unknown versions are kept alive unless the backend opted in with
+        // `idle_teardown = "always"` (ADR-0007).
         let pv = self.protocol_version(name);
-        if pv.as_deref() != Some("2026-07-28") {
-            return Ok(false); // session-based (2025-11-25) or unknown → keep alive
+        let policy = self.idle_teardown(name);
+        let stateless = pv.as_deref() == Some("2026-07-28");
+        if !stateless && policy != crate::config::IdleTeardown::Always {
+            return Ok(false);
         }
         // Guard 2: must be Up.
         if self.spawn_state(name) != SpawnState::Up {
@@ -674,7 +688,12 @@ impl LazyBackendRegistry {
         };
         if removed {
             self.set_state_down(name);
-            tracing::info!(backend = %name, "Idle-out lazy backend (stateless 2026-07-28)");
+            tracing::info!(
+                backend = %name,
+                protocol_version = pv.as_deref().unwrap_or("unknown"),
+                policy = ?policy,
+                "Idle-out lazy backend"
+            );
             Ok(true)
         } else {
             Ok(false)
@@ -1192,6 +1211,14 @@ mod tests {
     /// Build a registry with one lazy backend configured with `idle_timeout_secs`
     /// and a fake removal hook that records whether idle-out removed it.
     fn idle_registry(idle_timeout_secs: Option<u64>) -> (LazyBackendRegistry, Arc<AtomicUsize>) {
+        idle_registry_with(idle_timeout_secs, None)
+    }
+
+    /// Like [`idle_registry`] with an explicit `idle_teardown` policy.
+    fn idle_registry_with(
+        idle_timeout_secs: Option<u64>,
+        idle_teardown: Option<crate::config::IdleTeardown>,
+    ) -> (LazyBackendRegistry, Arc<AtomicUsize>) {
         let removed = Arc::new(AtomicUsize::new(0));
         let idle_out_fn: IdleOutFn = {
             let removed = removed.clone();
@@ -1207,6 +1234,7 @@ mod tests {
             name: "files".to_string(),
             transport: TransportType::Stdio,
             idle_timeout_secs,
+            idle_teardown,
             ..Default::default()
         };
         let reg = LazyBackendRegistry::from_backends(vec![LazyBackend {
@@ -1250,6 +1278,69 @@ mod tests {
         assert!(!out, "session-based backend must be kept alive (C3)");
         assert_eq!(removed.load(Ordering::SeqCst), 0, "no removal performed");
         assert_eq!(reg.spawn_state("files"), SpawnState::Up, "stays Up");
+    }
+
+    #[tokio::test]
+    async fn idle_out_always_policy_terminates_session_based_backend() {
+        use crate::config::IdleTeardown;
+        let (reg, removed) = idle_registry_with(Some(1), Some(IdleTeardown::Always));
+        reg.mark_up_for_test("files");
+        reg.set_protocol_version_for_test("files", "2025-11-25");
+        reg.set_last_touch_for_test("files", Instant::now() - Duration::from_secs(2));
+
+        let out = reg.idle_out("files").await.unwrap();
+
+        assert!(out, "an opted-in session backend must idle out (ADR-0007)");
+        assert_eq!(removed.load(Ordering::SeqCst), 1, "child terminated once");
+        assert_eq!(reg.spawn_state("files"), SpawnState::Down);
+    }
+
+    #[tokio::test]
+    async fn idle_out_always_policy_covers_unknown_version() {
+        use crate::config::IdleTeardown;
+        let (reg, removed) = idle_registry_with(Some(1), Some(IdleTeardown::Always));
+        reg.mark_up_for_test("files");
+        reg.set_last_touch_for_test("files", Instant::now() - Duration::from_secs(2));
+
+        assert!(reg.idle_out("files").await.unwrap());
+        assert_eq!(removed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_out_explicit_stateless_keeps_session_backend() {
+        use crate::config::IdleTeardown;
+        let (reg, removed) = idle_registry_with(Some(1), Some(IdleTeardown::Stateless));
+        reg.mark_up_for_test("files");
+        reg.set_protocol_version_for_test("files", "2024-11-05");
+        reg.set_last_touch_for_test("files", Instant::now() - Duration::from_secs(10));
+
+        assert!(!reg.idle_out("files").await.unwrap());
+        assert_eq!(removed.load(Ordering::SeqCst), 0);
+        assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    }
+
+    /// The opt-in only lifts the protocol guard; in-flight requests and the
+    /// timeout still protect the backend.
+    #[tokio::test]
+    async fn idle_out_always_policy_keeps_the_other_guards() {
+        use crate::config::IdleTeardown;
+        let (busy, busy_removed) = idle_registry_with(Some(1), Some(IdleTeardown::Always));
+        busy.mark_up_for_test("files");
+        busy.set_protocol_version_for_test("files", "2025-11-25");
+        busy.set_last_touch_for_test("files", Instant::now() - Duration::from_secs(2));
+        busy.inc_refcount("files");
+        assert!(!busy.idle_out("files").await.unwrap(), "in-flight request");
+        assert_eq!(busy_removed.load(Ordering::SeqCst), 0);
+
+        let (no_timeout, nt_removed) = idle_registry_with(None, Some(IdleTeardown::Always));
+        no_timeout.mark_up_for_test("files");
+        no_timeout.set_protocol_version_for_test("files", "2025-11-25");
+        no_timeout.set_last_touch_for_test("files", Instant::now() - Duration::from_secs(10));
+        assert!(
+            !no_timeout.idle_out("files").await.unwrap(),
+            "no timeout set"
+        );
+        assert_eq!(nt_removed.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -889,6 +889,10 @@ fn config_fingerprint(backend: &BackendConfig) -> String {
         "singleton_stop_hint",
         serde_json::to_value(&backend.singleton_stop_hint).unwrap_or_default(),
     );
+    put(
+        "idle_teardown",
+        serde_json::to_value(backend.idle_teardown).unwrap_or_default(),
+    );
     let sorted_json = serde_json::Value::Object(obj);
 
     // Convert serde_json::Value → TOML string for the fingerprint.
@@ -1919,6 +1923,24 @@ mod tests {
             "not a conflict: {msg}"
         );
         assert!(!msg.contains("singleton"), "no singleton claim: {msg}");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_idle_teardown_changes() {
+        let base = crate::config::BackendConfig {
+            name: "x".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            ..Default::default()
+        };
+        let mut stateless = base.clone();
+        stateless.idle_teardown = Some(crate::config::IdleTeardown::Stateless);
+        let mut always = base;
+        always.idle_teardown = Some(crate::config::IdleTeardown::Always);
+        assert_ne!(
+            config_fingerprint(&stateless),
+            config_fingerprint(&always),
+            "an idle_teardown change must reach hot reload"
+        );
     }
 
     #[test]

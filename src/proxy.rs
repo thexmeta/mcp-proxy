@@ -710,7 +710,8 @@ impl Proxy {
 
         // Start the idle sweeper for lazy backends (Wave 6). Polls every 5s; the
         // per-backend `idle_timeout_secs` gates actual idle-out. Session-based
-        // (2025-11-25) backends are never idle-out (kept alive, C3).
+        // backends are kept alive (C3) unless they set `idle_teardown = "always"`
+        // (ADR-0007).
         lazy_registry.start_sweeper(5);
 
         let proxy_for_admin = shared_proxy.clone();
@@ -2414,6 +2415,7 @@ while True:
                 protocol_support: crate::config::ProtocolSupportConfig::default(),
                 default_spawn_mode: crate::config::SpawnMode::Eager,
                 default_idle_timeout_secs: None,
+                default_idle_teardown: Default::default(),
                 init_timeout: None,
             },
             backends: vec![

@@ -113,6 +113,32 @@ url = "http://mcp-server:8080"
 # max_backoff_ms = 5000
 
 # =============================================================================
+# Lazy Spawn and Idle Teardown (stdio backends)
+# =============================================================================
+# A lazy backend starts on its first call and serves its cached tool list (the
+# warm catalog) while stopped. See docs/adr/adr-0007-idle-teardown-opt-in.md.
+#
+# Proxy-wide defaults (add to the [proxy] table):
+# default_spawn_mode = "lazy"          # "eager" (default) or "lazy"
+# default_idle_timeout_secs = 600      # stop an idle lazy backend; unset = never
+# default_idle_teardown = "stateless"  # "stateless" (default) or "always"
+#
+# Per backend (overrides the defaults):
+# [[backends]]
+# name = "docs-index"
+# transport = "stdio"
+# command = "my-mcp-server"
+# spawn_mode = "lazy"
+# idle_timeout_secs = 300
+# # "stateless": stop only if the backend negotiated MCP 2026-07-28, which
+# #              keeps no session state. Session-based backends stay up.
+# # "always":    also stop session-based backends. Their session state (open
+# #              terminals, browser tabs, loaded indexes) is lost and the next
+# #              call starts fresh. Keep terminal and browser backends on
+# #              "stateless".
+# idle_teardown = "always"
+
+# =============================================================================
 # Endpoint Groups
 # =============================================================================
 # Create separate MCP endpoints at {path}/mcp exposing subsets of backends.

@@ -1653,6 +1653,7 @@ fn lazy_live_config(dir: &Path, server: &Path) -> ProxyConfig {
             endpoint_group_list: vec![],
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
