@@ -366,14 +366,17 @@ pub mod bearer_scope;
 pub mod builder;
 pub mod cache;
 pub mod canary;
+pub mod client_rate_limit;
 pub mod coalesce;
 pub mod composite;
 pub mod config;
 mod config_env;
 mod config_validation;
 mod config_view;
+pub mod discover;
 #[cfg(feature = "discovery")]
 pub mod discovery;
+pub mod endpoint_router;
 pub mod failover;
 pub mod filter;
 pub mod inject;
@@ -381,11 +384,15 @@ pub mod inject;
 pub mod introspection;
 mod invocation;
 mod management;
+pub mod lazy_registry;
+pub mod mcp_compat;
 pub mod mcp_json;
+pub mod meta_validation;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod mirror;
 pub mod outcome;
+pub mod mrtr;
 pub mod outlier;
 pub mod param_override;
 #[cfg(feature = "oauth")]
@@ -393,12 +400,18 @@ pub mod rbac;
 pub mod reload;
 mod reload_policy;
 pub mod retry;
+pub mod sandbox;
 #[cfg(feature = "skills")]
 pub mod skills;
 pub mod telemetry;
+pub mod stdio_spawn;
+pub mod subscriptions;
 #[cfg(feature = "oauth")]
 pub mod token;
+pub mod tool_group;
 pub mod validation;
+pub mod warm_cache;
+pub mod warm_catalog_service;
 #[cfg(feature = "websocket")]
 pub mod ws_transport;
 
@@ -413,3 +426,6 @@ pub use builder::ProxyBuilder;
 pub use config::ProxyConfig;
 pub use lifecycle::ShutdownHandle;
 pub use proxy::Proxy;
+pub use proxy::apply_2026_layers;
+pub use proxy::build_dynamic_endpoint_group_router;
+pub use proxy::build_protocol_support;

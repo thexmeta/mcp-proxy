@@ -1,0 +1,437 @@
+//! One-shot capability probe for lazy backends.
+//!
+//! [`ProbeRunner::probe`] spawns a stdio backend, performs the MCP initialize
+//! handshake, lists all capabilities, and returns a namespaced [`WarmCatalog`].
+//! It is timeout-bounded so a hung server never blocks proxy startup.
+
+use std::time::Duration;
+
+use tokio::process::Command;
+use tower_mcp::client::{McpClient, StdioClientTransport};
+
+use crate::config::BackendConfig;
+use crate::warm_cache::BinaryHasher;
+use crate::warm_cache::catalog::WarmCatalog;
+
+/// Error returned when a capability probe fails or times out.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeError {
+    /// The probe exceeded its time budget.
+    #[error("capability probe for backend '{0}' timed out after {1}s")]
+    Timeout(String, u64),
+    /// The backend failed to spawn or initialize.
+    #[error("capability probe for backend '{0}' failed: {1}")]
+    Spawn(String, #[source] anyhow::Error),
+}
+
+/// Default probe timeout in seconds (NFR-003: never block startup on a hung server).
+pub(crate) const PROBE_TIMEOUT_SECS: u64 = 5;
+
+/// True when a probe error is a proven spawn-conflict fast-fail.
+///
+/// Only a fast `Spawn` failure whose source carries the fast-fail signal
+/// (`Connection closed` / `failed to initialize`, no timeout text) counts:
+/// startup/probe timeouts and other transient errors return false and keep
+/// the existing degrade path (fuzzy fallback + retained catalog). Shares
+/// the classification with [`crate::reload::is_fast_spawn_conflict`] so the
+/// startup-probe path and the lazy-spawn path agree on the signal.
+pub(crate) fn is_conflict_probe_error(err: &ProbeError) -> bool {
+    match err {
+        ProbeError::Timeout(_, _) => false,
+        ProbeError::Spawn(_, source) => {
+            let raw = source.to_string();
+            crate::reload::is_fast_spawn_conflict(
+                &raw,
+                // Startup probe has no configured init bound visible here;
+                // message-signal-only classification is the strict subset
+                // (a conflict classified here always classifies under any
+                // elapsed bound that excludes timeouts).
+                std::time::Duration::ZERO,
+                None,
+            )
+        }
+    }
+}
+
+/// Runs a one-shot capability probe against a stdio backend.
+pub struct ProbeRunner;
+
+impl ProbeRunner {
+    /// Probe `backend`, returning a namespaced [`WarmCatalog`] of its capabilities.
+    ///
+    /// Spawns the backend, performs `initialize`, lists tools/resources/templates/prompts,
+    /// then shuts the child down. Bounded by a `PROBE_TIMEOUT_SECS` timeout.
+    pub async fn probe(
+        backend: &BackendConfig,
+        separator: &str,
+    ) -> Result<WarmCatalog, ProbeError> {
+        tokio::time::timeout(
+            Duration::from_secs(PROBE_TIMEOUT_SECS),
+            Self::probe_inner(backend, separator),
+        )
+        .await
+        .map_err(|_| ProbeError::Timeout(backend.name.clone(), PROBE_TIMEOUT_SECS))?
+    }
+
+    async fn probe_inner(
+        backend: &BackendConfig,
+        separator: &str,
+    ) -> Result<WarmCatalog, ProbeError> {
+        let command = backend.command.as_deref().unwrap_or_default();
+        let args: Vec<&str> = backend.args.iter().map(|s| s.as_str()).collect();
+        let mut cmd = Command::new(command);
+        cmd.args(&args);
+        for (key, value) in &backend.env {
+            cmd.env(key, value);
+        }
+        if let Some(ref working_dir) = backend.working_dir {
+            cmd.current_dir(working_dir);
+        }
+
+        let transport = StdioClientTransport::spawn_command(&mut cmd)
+            .await
+            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
+
+        let client = McpClient::connect_with_handler(transport, ())
+            .await
+            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
+
+        let init = client
+            .initialize("mcp-proxy", env!("CARGO_PKG_VERSION"))
+            .await
+            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
+
+        // Tools are the critical capability — if listing tools fails the probe
+        // cannot produce a useful warm catalog, so propagate that error.
+        let tools = client
+            .list_all_tools()
+            .await
+            .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
+
+        // Resources / templates / prompts are best-effort: many servers (e.g.
+        // rust-mcp-filesystem) expose tools but NOT resources, and respond to
+        // `resources/list` with a "Server does not support resources" error.
+        // A failure here must NOT abort the whole probe — we still want the
+        // tools in the warm catalog. Capture an empty list and log instead.
+        let resources = match client.list_all_resources().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: resources/list unsupported, skipping"
+                );
+                vec![]
+            }
+        };
+        let resource_templates = match client.list_all_resource_templates().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: resource templates unsupported, skipping"
+                );
+                vec![]
+            }
+        };
+        let prompts = match client.list_all_prompts().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: prompts/list unsupported, skipping"
+                );
+                vec![]
+            }
+        };
+
+        // Best-effort shutdown so the child exits cleanly; ignore errors so we
+        // still return the captured catalog.
+        match client.shutdown().await {
+            Ok(()) => {
+                tracing::info!(
+                    name = %backend.name,
+                    "Warm catalog probe: shutdown sent"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    name = %backend.name,
+                    error = %e,
+                    "Warm catalog probe: shutdown failed (child may have already exited)"
+                );
+            }
+        }
+
+        Ok(WarmCatalog::from_probe_result(
+            &backend.name,
+            separator,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+            Some(init.protocol_version),
+            BinaryHasher::hash(backend),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn probe_error_display_contains_timed_out() {
+        let msg = format!("{}", ProbeError::Timeout("x".to_string(), 5));
+        assert!(msg.contains("timed out"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn probe_error_display_contains_backend_name() {
+        let msg = format!(
+            "{}",
+            ProbeError::Spawn("svc".to_string(), anyhow::anyhow!("boom"))
+        );
+        assert!(msg.contains("svc"), "unexpected message: {msg}");
+        assert!(msg.contains("boom"), "unexpected message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn probe_builds_command_with_env_and_working_dir() {
+        // `echo` exits immediately and does not speak MCP, so initialize fails.
+        // This still exercises the full command-building path (command, args,
+        // env, working_dir) and proves the probe degrades to a ProbeError
+        // rather than panicking.
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let backend = BackendConfig {
+            name: "echo-backend".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("echo".to_string()),
+            args: vec!["hi".to_string()],
+            env,
+            working_dir: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
+
+        let res = ProbeRunner::probe(&backend, "/").await;
+        assert!(res.is_err(), "echo is not an MCP server; probe must error");
+    }
+
+    #[tokio::test]
+    async fn probe_respects_timeout_bound() {
+        // `sleep 30` never speaks MCP; the probe must time out well before that.
+        let backend = BackendConfig {
+            name: "sleeper".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("sleep".to_string()),
+            args: vec!["30".to_string()],
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let res = ProbeRunner::probe(&backend, "/").await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "sleep is not an MCP server; probe must error");
+        // Allow generous slack over the 5s budget for CI scheduling jitter.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "probe took {elapsed:?}, expected < 8s (timeout bound violated)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_returns_timeout_error() {
+        // `sleep 30` never speaks MCP; the probe must time out and surface a
+        // `ProbeError::Timeout` (not a spawn/IO error).
+        let backend = BackendConfig {
+            name: "sleeper".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("sleep".to_string()),
+            args: vec!["30".to_string()],
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let res = ProbeRunner::probe(&backend, "/").await;
+        let elapsed = start.elapsed();
+
+        match res {
+            Err(ProbeError::Timeout(name, secs)) => {
+                assert_eq!(name, "sleeper");
+                assert_eq!(secs, PROBE_TIMEOUT_SECS);
+            }
+            other => panic!("expected ProbeError::Timeout, got {other:?}"),
+        }
+        // Bound the elapsed time to prove the timeout actually fired.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "probe took {elapsed:?}, expected < 8s (timeout bound violated)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_spawn_failure_returns_spawn_error() {
+        // A command that cannot be spawned must surface `ProbeError::Spawn`.
+        let backend = BackendConfig {
+            name: "ghost".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("this-command-does-not-exist-xyz".to_string()),
+            ..Default::default()
+        };
+
+        let res = ProbeRunner::probe(&backend, "/").await;
+        match res {
+            Err(ProbeError::Spawn(name, _)) => assert_eq!(name, "ghost"),
+            other => panic!("expected ProbeError::Spawn, got {other:?}"),
+        }
+    }
+
+    /// A minimal MCP stdio server that answers the probe handshake and returns
+    /// one namespaced tool. Spawned as a child via `python3` so the probe can
+    /// complete a real `initialize` + `tools/list` round-trip.
+    #[tokio::test]
+    async fn probe_success_returns_namespaced_tools_and_version() {
+        let script = r#"
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":"2025-11-25",
+            "capabilities":{"tools":{"listChanged":False},"resources":{}},
+            "serverInfo":{"name":"probe-test","version":"0.1.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+            {"name":"read","description":"read file","inputSchema":{"type":"object"}}]}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resourceTemplates":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+        let backend = BackendConfig {
+            name: "probe-backend".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("python3".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            ..Default::default()
+        };
+
+        let res = ProbeRunner::probe(&backend, "/").await;
+        let cat = res.expect("probe of a real MCP server must succeed");
+
+        // Tools are namespaced as {backend_name}{separator}{local_name}.
+        assert_eq!(cat.backend_name, "probe-backend");
+        assert_eq!(cat.tools.len(), 1, "expected exactly one tool");
+        assert_eq!(cat.tools[0].name, "probe-backend/read");
+        // Negotiated protocol version is captured from initialize.
+        assert_eq!(
+            cat.protocol_version.as_deref(),
+            Some("2025-11-25"),
+            "negotiated protocol version must be captured"
+        );
+        // The catalog carries the real backend identity hash.
+        assert_eq!(cat.identity_hash, BinaryHasher::hash(&backend));
+    }
+
+    /// Regression test: a server that exposes tools but does NOT support
+    /// `resources/list` (e.g. rust-mcp-filesystem, which responds with
+    /// "Server does not support resources") must still produce a warm catalog
+    /// containing its tools. Previously the probe aborted on the resources
+    /// error and the backend got NO warm catalog, so its tools were missing
+    /// from endpoint groups (e.g. `os` group showed only `term_*`, not `fs_*`).
+    #[tokio::test]
+    async fn probe_succeeds_when_resources_unsupported() {
+        let script = r#"
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":"2025-11-25",
+            "capabilities":{"tools":{"listChanged":False}},
+            "serverInfo":{"name":"no-resources","version":"0.1.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+            {"name":"read_file","description":"read","inputSchema":{"type":"object"}},
+            {"name":"write_file","description":"write","inputSchema":{"type":"object"}}]}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support resources (required for resources/list)"}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support resources"}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{
+            "code":-32603,"message":"Server does not support prompts"}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+        let backend = BackendConfig {
+            name: "no-res-backend".to_string(),
+            transport: crate::config::TransportType::Stdio,
+            command: Some("python3".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            ..Default::default()
+        };
+
+        let res = ProbeRunner::probe(&backend, "/").await;
+        let cat = res.expect("probe must succeed even when resources unsupported");
+
+        // Tools are captured despite the resources error.
+        assert_eq!(cat.tools.len(), 2, "both tools must be captured");
+        assert_eq!(cat.tools[0].name, "no-res-backend/read_file");
+        assert_eq!(cat.tools[1].name, "no-res-backend/write_file");
+        // Resources/prompts are empty (skipped, not fatal).
+        assert!(
+            cat.resources.is_empty(),
+            "resources must be empty (unsupported)"
+        );
+        assert!(
+            cat.resource_templates.is_empty(),
+            "resource templates must be empty (unsupported)"
+        );
+        assert!(
+            cat.prompts.is_empty(),
+            "prompts must be empty (unsupported)"
+        );
+    }
+}

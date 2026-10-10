@@ -82,10 +82,28 @@ async fn main() -> Result<()> {
 
         let hot_reload = config.proxy.hot_reload;
 
-        let proxy = Proxy::from_config(config).await?;
+        let hot_reload = config.proxy.hot_reload;
+        let watchers = config.proxy.watchers.clone();
+
+        // Detect systemd sandbox (ProtectSystem=strict) and warn about EROFS risks.
+        let sandbox_info = mcp_proxy::sandbox::SandboxInfo::detect();
+        if sandbox_info.root_read_only {
+            tracing::warn!(
+                "Root filesystem '/' is mounted read-only (likely systemd ProtectSystem=strict). \
+                 Backends using '/' as their root directory will fail with EROFS. \
+                 Ensure ReadWritePaths covers all backend root directories."
+            );
+            for backend in &config.backends {
+                if let Some(ref cmd) = backend.command {
+                    sandbox_info.validate_backend_args(cmd, &backend.args);
+                }
+            }
+        }
+
+        let mut proxy = Proxy::from_config(config).await?;
 
         if hot_reload {
-            proxy.enable_hot_reload(cli.config.clone());
+            proxy.enable_hot_reload(cli.config.clone(), watchers);
         }
 
         proxy.serve().await
@@ -265,6 +283,14 @@ impl Logging {
 fn init_logging(config: &ProxyConfig) -> Result<Logging> {
     let env_filter = logging_filter(config);
 
+    // Build EnvFilter: if RUST_LOG is set, use it exclusively (user has full control).
+    // Otherwise, use config defaults.
+    let env_filter = if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::try_from_default_env().expect("valid RUST_LOG")
+    } else {
+        tracing_subscriber::EnvFilter::new(&config_filter)
+    };
+
     #[cfg(feature = "otel")]
     if config.observability.tracing.enabled {
         use opentelemetry::trace::TracerProvider;
@@ -293,7 +319,7 @@ fn init_logging(config: &ProxyConfig) -> Result<Logging> {
         };
 
         tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new(&env_filter))
+            .with(env_filter)
             .with(fmt_layer)
             .with(otel_layer)
             .init();

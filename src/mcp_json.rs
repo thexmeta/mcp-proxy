@@ -28,6 +28,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::config::SpawnMode;
+
 use crate::config::{BackendConfig, TransportType};
 
 /// Top-level `.mcp.json` structure.
@@ -115,6 +117,7 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         outlier_detection: None,
         hedging: None,
         cache: None,
+        working_dir: None,
         default_args: serde_json::Map::new(),
         inject_args: Vec::new(),
         param_overrides: Vec::new(),
@@ -131,8 +134,21 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         canary_of: None,
         weight: 100,
         aliases: Vec::new(),
+        rename_all: Vec::new(),
         mirror_of: None,
         mirror_percent: 100,
+        enabled: true,
+        endpoint_groups: Vec::new(),
+        tool_groups: Vec::new(),
+        protocol_version: None,
+        spawn_mode: SpawnMode::default(),
+        idle_timeout_secs: None,
+        cache_key_suffix: None,
+        http: None,
+        init_timeout: None,
+        force_kill: false,
+        singleton_externally_managed: false,
+        singleton_stop_hint: None,
     })
 }
 

@@ -57,11 +57,27 @@ impl ProxyBuilder {
                     },
                     instructions: None,
                     shutdown_timeout_seconds: 30,
+                    shutdown_kill_timeout_secs: 2,
+                    force_kill: false,
                     hot_reload: false,
                     import_backends: None,
                     rate_limit: None,
+                    client_rate_limit: None,
                     tool_discovery: false,
                     tool_exposure: crate::config::ToolExposure::default(),
+                    expose_grouped_in_default: true,
+                    endpoint_groups: Vec::new(),
+                    tool_groups: Vec::new(),
+                    backend_env: std::collections::HashMap::new(),
+                    timeout: None,
+                    circuit_breaker: None,
+                    retry: None,
+                    endpoint_group_list: Vec::new(),
+                    watchers: crate::config::default_watchers(),
+                    protocol_support: crate::config::ProtocolSupportConfig::default(),
+                    default_spawn_mode: crate::config::SpawnMode::Eager,
+                    default_idle_timeout_secs: None,
+                    init_timeout: None,
                 },
                 backends: Vec::new(),
                 auth: None,
@@ -70,6 +86,7 @@ impl ProxyBuilder {
                 cache: CacheBackendConfig::default(),
                 observability: ObservabilityConfig::default(),
                 composite_tools: Vec::new(),
+                warm_cache: crate::config::WarmCacheConfig::default(),
                 source_path: None,
             },
         }
@@ -105,6 +122,13 @@ impl ProxyBuilder {
     /// Set the graceful shutdown timeout (default: 30s).
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.config.proxy.shutdown_timeout_seconds = timeout.as_secs();
+        self
+    }
+
+    /// Set the timeout (seconds) after SIGTERM before SIGKILL is sent to
+    /// stdio backend child processes (default: 2s).
+    pub fn shutdown_kill_timeout(mut self, timeout: Duration) -> Self {
+        self.config.proxy.shutdown_kill_timeout_secs = timeout.as_secs();
         self
     }
 
@@ -271,6 +295,44 @@ impl ProxyBuilder {
     /// Enable Prometheus metrics.
     pub fn metrics(mut self, enabled: bool) -> Self {
         self.config.observability.metrics.enabled = enabled;
+        self
+    }
+
+    /// Set the per-backend HTTP client configuration.
+    ///
+    /// Controls reqwest and tower-mcp HTTP transport settings for the last
+    /// added backend. Only meaningful for HTTP backends.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no backends have been added.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mcp_proxy::builder::ProxyBuilder;
+    /// use mcp_proxy::config::BackendHttpClientConfig;
+    ///
+    /// let config = ProxyBuilder::new("my-proxy")
+    ///     .http_backend("api", "http://api:8080")
+    ///     .http_config(BackendHttpClientConfig {
+    ///         connect_timeout_secs: 5,
+    ///         timeout_secs: 60,
+    ///         ..Default::default()
+    ///     })
+    ///     .into_config();
+    ///
+    /// let http = config.backends[0].http.as_ref().unwrap();
+    /// assert_eq!(http.connect_timeout_secs, 5);
+    /// assert_eq!(http.timeout_secs, 60);
+    /// ```
+    pub fn http_config(mut self, http: BackendHttpClientConfig) -> Self {
+        let backend = self
+            .config
+            .backends
+            .last_mut()
+            .expect("http_config called with no backends");
+        backend.http = Some(http);
         self
     }
 
@@ -505,6 +567,7 @@ fn default_backend() -> BackendConfig {
         outlier_detection: None,
         hedging: None,
         cache: None,
+        working_dir: None,
         default_args: serde_json::Map::new(),
         inject_args: Vec::new(),
         param_overrides: Vec::new(),
@@ -521,8 +584,21 @@ fn default_backend() -> BackendConfig {
         canary_of: None,
         weight: 100,
         aliases: Vec::new(),
+        rename_all: Vec::new(),
         mirror_of: None,
         mirror_percent: 100,
+        enabled: true,
+        endpoint_groups: Vec::new(),
+        tool_groups: Vec::new(),
+        protocol_version: None,
+        spawn_mode: SpawnMode::default(),
+        idle_timeout_secs: None,
+        cache_key_suffix: None,
+        http: None,
+        init_timeout: None,
+        force_kill: false,
+        singleton_externally_managed: false,
+        singleton_stop_hint: None,
     }
 }
 

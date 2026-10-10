@@ -189,6 +189,54 @@ struct ProxyInfo {
     active_sessions: usize,
 }
 
+/// Response structure for endpoint group listing.
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct EndpointGroupListResponse {
+    endpoint_groups: Vec<EndpointGroupInfo>,
+}
+
+/// Information about a single endpoint group.
+#[derive(Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct EndpointGroupInfo {
+    /// Group name.
+    pub name: String,
+    /// HTTP path prefix for this group.
+    pub path: String,
+    /// Backend names that belong to this group.
+    pub backends: Vec<String>,
+    /// Optional: specific tools to expose from these backends.
+    pub tools: Vec<String>,
+    /// Optional description for documentation/discovery.
+    pub description: Option<String>,
+    /// Enable BM25-based tool discovery for this endpoint group.
+    pub tool_discovery: bool,
+    /// The full MCP endpoint URL path for this group.
+    pub mcp_endpoint: String,
+}
+
+/// Response structure for tool group listing.
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ToolGroupListResponse {
+    tool_groups: Vec<ToolGroupInfo>,
+}
+
+/// Information about a single tool group.
+#[derive(Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ToolGroupInfo {
+    /// Group name (appears as prefix in tool names, e.g., `search/web_search`).
+    pub name: String,
+    /// Tools to include in this group.
+    pub tools: Vec<String>,
+    /// Optional description for documentation.
+    pub description: Option<String>,
+    /// If true, tools also appear at their original names (backward compatibility).
+    pub mirror_to_original: bool,
+}
+
 /// Per-backend metadata passed in from config at startup.
 #[derive(Clone)]
 pub struct BackendMeta {
@@ -848,6 +896,185 @@ struct UpdateBackendRequest {
     bearer_token: Option<String>,
 }
 
+/// Handler for enabling a backend.
+async fn handle_enable_backend(
+    Extension(config_path): Extension<Option<std::path::PathBuf>>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    handle_toggle_backend(config_path, name, true).await
+}
+
+/// Handler for disabling a backend.
+async fn handle_disable_backend(
+    Extension(config_path): Extension<Option<std::path::PathBuf>>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    handle_toggle_backend(config_path, name, false).await
+}
+
+/// Toggle a backend's enabled state by updating the config file.
+async fn handle_toggle_backend(
+    config_path: Option<std::path::PathBuf>,
+    name: String,
+    enabled: bool,
+) -> (StatusCode, Json<BackendOpResponse>) {
+    let Some(path) = config_path else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(BackendOpResponse {
+                ok: false,
+                message: "No config file path available (running in --from-mcp-json mode?)"
+                    .to_string(),
+            }),
+        );
+    };
+
+    // Read current config
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to read config: {e}"),
+                }),
+            );
+        }
+    };
+
+    // Parse config
+    let mut config: crate::config::ProxyConfig = match crate::config::ProxyConfig::parse(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to parse config: {e}"),
+                }),
+            );
+        }
+    };
+
+    // Find and update the backend
+    let backend = match config.backends.iter_mut().find(|b| b.name == name) {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Backend '{}' not found", name),
+                }),
+            );
+        }
+    };
+
+    // Check if already in desired state
+    if backend.enabled == enabled {
+        return (
+            StatusCode::OK,
+            Json(BackendOpResponse {
+                ok: true,
+                message: format!(
+                    "Backend '{}' already {}",
+                    name,
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            }),
+        );
+    }
+
+    // Update enabled state
+    backend.enabled = enabled;
+
+    // Write updated config back to file
+    let updated_content = match toml::to_string_pretty(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackendOpResponse {
+                    ok: false,
+                    message: format!("Failed to serialize config: {e}"),
+                }),
+            );
+        }
+    };
+
+    if let Err(e) = std::fs::write(&path, updated_content) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackendOpResponse {
+                ok: false,
+                message: format!("Failed to write config: {e}"),
+            }),
+        );
+    }
+
+    // Hot reload will pick up the file change and apply it
+    (
+        StatusCode::OK,
+        Json(BackendOpResponse {
+            ok: true,
+            message: format!(
+                "Backend '{}' {} (hot reload will apply changes)",
+                name,
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        }),
+    )
+}
+
+/// Toggle a backend's enabled state by updating the config file.
+/// This is a public helper that can be used by both HTTP handlers and MCP tools.
+pub async fn toggle_backend_in_config(
+    config_path: &std::path::Path,
+    name: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    // Read current config
+    let content =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+
+    // Parse config
+    let mut config: crate::config::ProxyConfig = crate::config::ProxyConfig::parse(&content)
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    // Find and update the backend
+    let backend = config
+        .backends
+        .iter_mut()
+        .find(|b| b.name == name)
+        .ok_or_else(|| format!("Backend '{}' not found", name))?;
+
+    // Check if already in desired state
+    if backend.enabled == enabled {
+        return Ok(format!(
+            "Backend '{}' already {}",
+            name,
+            if enabled { "enabled" } else { "disabled" }
+        ));
+    }
+
+    // Update enabled state
+    backend.enabled = enabled;
+
+    // Write updated config back to file
+    let updated_content =
+        toml::to_string_pretty(&config).map_err(|e| format!("Failed to serialize config: {e}"))?;
+
+    std::fs::write(config_path, updated_content)
+        .map_err(|e| format!("Failed to write config: {e}"))?;
+
+    Ok(format!(
+        "Backend '{}' {} (hot reload will apply changes)",
+        name,
+        if enabled { "enabled" } else { "disabled" }
+    ))
+}
+
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/admin/backends/{name}/health",
@@ -1083,6 +1310,99 @@ async fn handle_circuit_breakers(
     Json(statuses)
 }
 
+/// Handler for listing all endpoint groups.
+async fn handle_endpoint_groups(
+    Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+    Extension(group_backends): Extension<
+        std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    >,
+) -> Json<EndpointGroupListResponse> {
+    let groups = endpoint_groups
+        .iter()
+        .map(|g| {
+            let mut backends = group_backends.get(&g.name).cloned().unwrap_or_default();
+            backends.sort();
+            backends.dedup();
+            EndpointGroupInfo {
+                name: g.name.clone(),
+                path: g.path.clone(),
+                backends,
+                tools: g.tools.clone(),
+                description: g.description.clone(),
+                tool_discovery: g.tool_discovery,
+                mcp_endpoint: format!("{}/mcp", g.path.trim_start_matches('/')),
+            }
+        })
+        .collect();
+    Json(EndpointGroupListResponse {
+        endpoint_groups: groups,
+    })
+}
+
+/// Handler for getting a single endpoint group by name.
+async fn handle_endpoint_group(
+    Extension(endpoint_groups): Extension<std::sync::Arc<Vec<crate::config::EndpointGroupConfig>>>,
+    Extension(group_backends): Extension<
+        std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    >,
+    Path(name): Path<String>,
+) -> Result<Json<EndpointGroupInfo>, StatusCode> {
+    let group = endpoint_groups
+        .iter()
+        .find(|g| g.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let mut backends = group_backends.get(&name).cloned().unwrap_or_default();
+    backends.sort();
+    backends.dedup();
+
+    Ok(Json(EndpointGroupInfo {
+        name: group.name.clone(),
+        path: group.path.clone(),
+        backends,
+        tools: group.tools.clone(),
+        description: group.description.clone(),
+        tool_discovery: group.tool_discovery,
+        mcp_endpoint: format!("{}/mcp", group.path.trim_start_matches('/')),
+    }))
+}
+
+/// Handler for listing all tool groups.
+async fn handle_tool_groups(
+    Extension(tool_groups): Extension<std::sync::Arc<Vec<crate::config::ToolGroupConfig>>>,
+) -> Json<ToolGroupListResponse> {
+    let groups = tool_groups
+        .iter()
+        .map(|g| ToolGroupInfo {
+            name: g.name.clone(),
+            tools: g.tools.clone(),
+            description: g.description.clone(),
+            mirror_to_original: g.mirror_to_original,
+        })
+        .collect();
+    Json(ToolGroupListResponse {
+        tool_groups: groups,
+    })
+}
+
+/// Handler for getting a single tool group by name.
+async fn handle_tool_group(
+    Extension(tool_groups): Extension<std::sync::Arc<Vec<crate::config::ToolGroupConfig>>>,
+    Path(name): Path<String>,
+) -> Result<Json<ToolGroupInfo>, StatusCode> {
+    let group = tool_groups
+        .iter()
+        .find(|g| g.name == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ToolGroupInfo {
+        name: group.name.clone(),
+        tools: group.tools.clone(),
+        description: group.description.clone(),
+        mirror_to_original: group.mirror_to_original,
+    }))
+}
+
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct CircuitBreakerStatus {
@@ -1248,12 +1568,45 @@ pub(crate) fn admin_router_with_policy(
 ) -> Router {
     let config_toml = std::sync::Arc::new(crate::config_view::redacted_config_toml(config));
 
+    // Extract only the data needed for endpoint/tool group handlers.
+    // `group_backends` precomputes effective group membership (UNION of
+    // explicit + reverse-referenced backends) so handlers need no Clone.
+    let group_backends: std::collections::HashMap<String, Vec<String>> = config
+        .proxy
+        .endpoint_groups
+        .iter()
+        .map(|g| {
+            let members: Vec<String> = config
+                .backends
+                .iter()
+                .filter(|b| g.backends.contains(&b.name) || b.endpoint_groups.contains(&g.name))
+                .map(|b| b.name.clone())
+                .collect();
+            (g.name.clone(), members)
+        })
+        .collect();
+    let endpoint_groups = std::sync::Arc::new(config.proxy.endpoint_groups.clone());
+    let group_backends = std::sync::Arc::new(group_backends);
+    let tool_groups = std::sync::Arc::new(config.proxy.tool_groups.clone());
+
     let router = register_admin_routes()
+        // Endpoint group endpoints
+        .route("/endpoint-groups", get(handle_endpoint_groups))
+        .route("/endpoint-groups/{name}", get(handle_endpoint_group))
+        // Tool group endpoints
+        .route("/tool-groups", get(handle_tool_groups))
+        .route("/tool-groups/{name}", get(handle_tool_group))
+        // Management enable/disable endpoints
+        .route("/backends/{name}/enable", post(handle_enable_backend))
+        .route("/backends/{name}/disable", post(handle_disable_backend))
         .layer(Extension(state))
         .layer(Extension(session_handle))
         .layer(Extension(cache_handle))
         .layer(Extension(proxy))
         .layer(Extension(config_toml))
+        .layer(Extension(endpoint_groups))
+        .layer(Extension(group_backends))
+        .layer(Extension(tool_groups))
         .layer(Extension(config_path))
         .layer(Extension(Arc::new(cb_handles)))
         .layer(Extension(reload_policy));

@@ -19,12 +19,18 @@ use mcp_proxy::alias::{AliasMap, AliasService};
 use mcp_proxy::cache::CacheService;
 use mcp_proxy::canary::CanaryService;
 use mcp_proxy::coalesce::CoalesceService;
-use mcp_proxy::config::{BackendCacheConfig, CacheBackendConfig};
+use mcp_proxy::config::{BackendCacheConfig, CacheBackendConfig, WarmCacheConfig};
 use mcp_proxy::config::{BackendFilter, InjectArgsConfig, NameFilter};
+use mcp_proxy::config::{ListenConfig, ObservabilityConfig, PerformanceConfig, SecurityConfig};
+use mcp_proxy::config::{ProtocolSupportConfig, ProxyConfig, ProxySettings};
+use mcp_proxy::discover::DiscoverService;
 use mcp_proxy::filter::CapabilityFilterService;
 use mcp_proxy::inject::{InjectArgsService, InjectionRules};
+use mcp_proxy::meta_validation::MetaValidationService;
 use mcp_proxy::mirror::MirrorService;
 use mcp_proxy::validation::{ValidationConfig, ValidationService};
+use tower_mcp_types::protocol::ClientCapabilities;
+use tower_mcp_types::protocol::{Implementation, RequestMeta};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AddInput {
@@ -84,6 +90,75 @@ fn text_router() -> McpRouter {
         .server_info("text-server", "1.0.0")
         .tool(echo)
         .tool(upper)
+}
+
+// ---------------------------------------------------------------------------
+// Local MockService for MetaValidationService / DiscoverService unit tests
+// (mcp_proxy::test_util is #[cfg(test)] and unavailable in integration tests)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct MockService {
+    tools: Vec<tower_mcp::protocol::ToolDefinition>,
+}
+
+impl MockService {
+    fn with_tools(names: &[&str]) -> Self {
+        let tools = names
+            .iter()
+            .map(|name| tower_mcp::protocol::ToolDefinition {
+                name: name.to_string(),
+                title: None,
+                description: Some(format!("{name} tool")),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icons: None,
+                annotations: None,
+                execution: None,
+                meta: None,
+            })
+            .collect();
+        Self { tools }
+    }
+}
+
+impl tower::Service<RouterRequest> for MockService {
+    type Response = RouterResponse;
+    type Error = Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RouterResponse, Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: RouterRequest) -> Self::Future {
+        let id = req.id.clone();
+        let tools = self.tools.clone();
+        Box::pin(async move {
+            let inner = match req.inner {
+                McpRequest::ListTools(_) => Ok(McpResponse::ListTools(
+                    tower_mcp::protocol::ListToolsResult {
+                        tools,
+                        next_cursor: None,
+                        ttl_ms: None,
+                        cache_scope: None,
+                        meta: None,
+                    },
+                )),
+                McpRequest::CallTool(params) => Ok(McpResponse::CallTool(
+                    tower_mcp::protocol::CallToolResult::text(format!("called: {}", params.name)),
+                )),
+                McpRequest::Ping => Ok(McpResponse::Pong(Default::default())),
+                _ => Ok(McpResponse::Pong(Default::default())),
+            };
+            Ok(RouterResponse { id, inner })
+        })
+    }
 }
 
 async fn build_proxy() -> McpProxy {
@@ -216,11 +291,10 @@ async fn test_proxy_with_filter_denies_call() {
 #[tokio::test]
 async fn test_proxy_with_alias_renames_tools() {
     let proxy = build_proxy().await;
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(proxy, aliases);
 
@@ -401,6 +475,290 @@ async fn test_dynamic_add_backend() {
     let resp = call(&mut proxy, tool_call("extra/ping", serde_json::json!({}))).await;
     match resp.inner.unwrap() {
         McpResponse::CallTool(result) => assert_eq!(result.all_text(), "pong"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
+// -----------------------------------------------------------------------
+// TASK004: HttpClientConfig wiring integration tests
+// -----------------------------------------------------------------------
+
+/// Verify HttpClientConfig TOML fields are parsed and accessible from ProxyConfig.
+#[test]
+fn test_http_client_config_wired_through_proxy_config() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "api"
+    transport = "http"
+    url = "http://localhost:9000"
+    [backends.http]
+    connect_timeout_secs = 3
+    timeout_secs = 5
+    pool_idle_timeout_secs = 60
+    pool_max_idle_per_host = 2
+    danger_accept_invalid_certs = true
+    user_agent = "mcp-proxy-test/1.0"
+    "#;
+    let config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    let backend = &config.backends[0];
+    assert_eq!(backend.name, "api");
+    assert!(backend.url.is_some());
+    let http = backend.http.as_ref().expect("http config present");
+    assert_eq!(http.connect_timeout_secs, 3);
+    assert_eq!(http.timeout_secs, 5);
+    assert_eq!(http.pool_idle_timeout_secs, 60);
+    assert_eq!(http.pool_max_idle_per_host, Some(2));
+    assert!(http.danger_accept_invalid_certs);
+    assert_eq!(http.user_agent.as_deref(), Some("mcp-proxy-test/1.0"));
+}
+
+/// Verify the From<&BackendHttpClientConfig> for HttpClientConfig maps timeout correctly.
+#[test]
+fn test_http_client_config_timeout_mapping() {
+    use std::time::Duration;
+    let cfg = mcp_proxy::config::BackendHttpClientConfig {
+        connect_timeout_secs: 2,
+        timeout_secs: 99,
+        pool_idle_timeout_secs: 120,
+        pool_max_idle_per_host: Some(4),
+        danger_accept_invalid_certs: false,
+        user_agent: Some("test".to_string()),
+    };
+    let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+    assert_eq!(hc.request_timeout, Duration::from_secs(99));
+}
+
+/// Verify reqwest::Client can be built from config (smoke test).
+#[test]
+fn test_http_client_config_produces_working_client() {
+    let cfg = mcp_proxy::config::BackendHttpClientConfig {
+        connect_timeout_secs: 1,
+        timeout_secs: 2,
+        pool_idle_timeout_secs: 30,
+        pool_max_idle_per_host: Some(1),
+        danger_accept_invalid_certs: true,
+        user_agent: Some("integration-test".to_string()),
+    };
+    let client: reqwest::Client = reqwest::ClientBuilder::from(&cfg).build().unwrap();
+    let _req = client.get("http://127.0.0.1:1");
+}
+
+/// Verify apply_global_defaults propagates init_timeout from [proxy] to backends.
+#[test]
+fn test_apply_global_defaults_propagates_init_timeout() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 12
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(12));
+}
+
+/// Verify per-backend init_timeout overrides global.
+#[test]
+fn test_apply_global_defaults_per_backend_overrides() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 12
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    init_timeout = 3
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(3));
+}
+
+/// Verify stdio gets 30s default when no global/per-backend set.
+#[test]
+fn test_apply_global_defaults_stdio_fallback() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "files"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(30));
+}
+
+/// Verify HTTP gets no init_timeout when no global/per-backend set.
+#[test]
+fn test_apply_global_defaults_http_no_default() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    [proxy.listen]
+
+    [[backends]]
+    name = "api"
+    transport = "http"
+    url = "http://localhost:9000"
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert!(config.backends[0].init_timeout.is_none());
+}
+
+/// Verify multiple backends get independent timeouts.
+#[test]
+fn test_apply_global_defaults_multiple_backends() {
+    let toml = r#"
+    [proxy]
+    name = "test"
+    init_timeout = 7
+    [proxy.listen]
+
+    [[backends]]
+    name = "stdio-be"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+
+    [[backends]]
+    name = "http-be"
+    transport = "http"
+    url = "http://localhost:9000"
+
+    [[backends]]
+    name = "stdio-custom"
+    transport = "stdio"
+    command = "echo"
+    args = ["hello"]
+    init_timeout = 3
+    "#;
+    let mut config = mcp_proxy::config::ProxyConfig::parse(toml).unwrap();
+    config.apply_global_defaults();
+    assert_eq!(config.backends[0].init_timeout, Some(7));
+    assert_eq!(config.backends[1].init_timeout, Some(7));
+    assert_eq!(config.backends[2].init_timeout, Some(3));
+}
+
+// -----------------------------------------------------------------------
+// TASK005: Transport error + retry integration tests
+// -----------------------------------------------------------------------
+
+/// Verify valid tool calls work through the full middleware stack.
+#[tokio::test]
+async fn test_transport_error_through_full_stack() {
+    let math_transport = ChannelTransport::new(math_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 2})),
+    )
+    .await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "3"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
+/// Verify concurrent calls across multiple backends work.
+#[tokio::test]
+async fn test_multi_backend_concurrent_calls() {
+    let math_transport = ChannelTransport::new(math_router());
+    let text_transport = ChannelTransport::new(text_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .backend("text", text_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp1 = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
+    let resp2 = call(
+        &mut proxy,
+        tool_call("text/echo", serde_json::json!({"message": "hello"})),
+    )
+    .await;
+    let resp3 = call(&mut proxy, McpRequest::ListTools(Default::default())).await;
+
+    match resp1.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "30"),
+        other => panic!("expected CallTool for math, got: {:?}", other),
+    }
+    match resp2.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "hello"),
+        other => panic!("expected CallTool for text, got: {:?}", other),
+    }
+    match resp3.inner.unwrap() {
+        McpResponse::ListTools(result) => assert_eq!(result.tools.len(), 4),
+        other => panic!("expected ListTools, got: {:?}", other),
+    }
+}
+
+/// Verify backend error propagates without triggering transport reconnect.
+#[tokio::test]
+async fn test_backend_error_no_transport_reconnect() {
+    let math_transport = ChannelTransport::new(math_router());
+    let mut proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", math_transport)
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let resp = call(
+        &mut proxy,
+        tool_call("math/nonexistent", serde_json::json!({})),
+    )
+    .await;
+    match &resp.inner {
+        Err(e) => {
+            assert!(e.code != -32000, "should not be transport error: {e}");
+        }
+        Ok(_) => panic!("expected error for nonexistent tool"),
+    }
+
+    // Subsequent calls should still work
+    let resp = call(
+        &mut proxy,
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 1})),
+    )
+    .await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "2"),
         other => panic!("expected CallTool, got: {:?}", other),
     }
 }
@@ -908,11 +1266,10 @@ async fn test_full_middleware_stack() {
         read_only_only: false,
     }];
 
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
 
     let validation = ValidationConfig {
@@ -971,4 +1328,748 @@ async fn test_full_middleware_stack() {
         }
         other => panic!("expected ListTools, got: {:?}", other),
     }
+}
+
+// ===========================================================================
+// Wave 5: MCP 2026-07-28 Stateless Protocol Tests (T5.1, T5.3, T5.4)
+// ===========================================================================
+
+/// Helper: build a ProxyConfig for DiscoverLayer tests.
+fn make_proxy_config(protocol_versions: Vec<&str>) -> ProxyConfig {
+    ProxyConfig {
+        proxy: ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            protocol_support: ProtocolSupportConfig {
+                versions: protocol_versions.into_iter().map(String::from).collect(),
+                default_protocol_version: None,
+            },
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: ObservabilityConfig::default(),
+    }
+}
+
+/// Helper: build a RouterRequest with optional RequestMeta in extensions.
+fn request_with_meta(inner: McpRequest, meta: Option<RequestMeta>) -> RouterRequest {
+    let mut extensions = Extensions::new();
+    if let Some(m) = meta {
+        extensions.insert(m);
+    }
+    RouterRequest {
+        id: RequestId::Number(1),
+        inner,
+        extensions,
+    }
+}
+
+/// Helper: create a standard 2026-07-28 RequestMeta.
+fn meta_2026() -> RequestMeta {
+    RequestMeta {
+        progress_token: None,
+        protocol_version: Some("2026-07-28".into()),
+        client_info: Some(Implementation {
+            name: "test-client".into(),
+            version: "1.0.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: Some(ClientCapabilities::default()),
+        log_level: None,
+    }
+}
+
+// --- T5.1: Stateless request handling ---
+
+#[tokio::test]
+async fn test_stateless_list_tools_no_session_handshake() {
+    // 2026-07-28 is stateless: no initialize/initialized handshake required.
+    // Verify that a ListTools request works immediately.
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::ListTools(result) => {
+            assert_eq!(result.tools.len(), 4);
+        }
+        other => panic!("expected ListTools, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_stateless_call_tool_no_session() {
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 7, "b": 3})),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "10"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_stateless_ping_no_session() {
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(McpRequest::Ping, Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+// --- T5.1: Protocol version in _meta ---
+
+#[tokio::test]
+async fn test_protocol_version_2026_in_meta_accepted() {
+    let mut proxy = build_proxy().await;
+    let meta = RequestMeta {
+        protocol_version: Some("2026-07-28".into()),
+        ..meta_2026()
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+#[tokio::test]
+async fn test_protocol_version_2025_in_meta_accepted() {
+    // 2025-11-25 requests also work (backward compat)
+    let mut proxy = build_proxy().await;
+    let meta = RequestMeta {
+        protocol_version: Some("2025-11-25".into()),
+        ..meta_2026()
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+#[tokio::test]
+async fn test_no_meta_accepted_for_legacy_clients() {
+    // Requests without _meta are accepted (backward compat for 2025-03-26)
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+// --- T5.1: MetaValidationService ---
+
+#[tokio::test]
+async fn test_meta_validation_passes_with_complete_2026_meta() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let mut svc = MetaValidationService::new(mock);
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = svc.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+#[tokio::test]
+async fn test_meta_validation_rejects_missing_client_info() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let mut svc = MetaValidationService::new(mock);
+    let meta = RequestMeta {
+        protocol_version: Some("2026-07-28".into()),
+        client_info: None, // Missing!
+        client_capabilities: Some(ClientCapabilities::default()),
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = svc.call(req).await.expect("infallible");
+    let err = resp.inner.unwrap_err();
+    assert!(
+        err.message.contains("client_info"),
+        "should mention client_info: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn test_meta_validation_rejects_missing_client_capabilities() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let mut svc = MetaValidationService::new(mock);
+    let meta = RequestMeta {
+        protocol_version: Some("2026-07-28".into()),
+        client_info: Some(Implementation {
+            name: "test".into(),
+            version: "1.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: None, // Missing!
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = svc.call(req).await.expect("infallible");
+    let err = resp.inner.unwrap_err();
+    assert!(
+        err.message.contains("client_capabilities"),
+        "should mention client_capabilities: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn test_meta_validation_skips_non_2026_requests() {
+    // 2025-11-25 requests should not be validated by MetaValidationService
+    let mock = MockService::with_tools(&["tool1"]);
+    let mut svc = MetaValidationService::new(mock);
+    let meta = RequestMeta {
+        protocol_version: Some("2025-11-25".into()),
+        client_info: None, // Missing, but shouldn't matter for 2025
+        client_capabilities: None,
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = svc.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok(), "2025-11-25 should not be validated");
+}
+
+#[tokio::test]
+async fn test_meta_validation_skips_requests_without_meta() {
+    // Requests without _meta should pass through (legacy clients)
+    let mock = MockService::with_tools(&["tool1"]);
+    let mut svc = MetaValidationService::new(mock);
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp = svc.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+// --- T5.1: DiscoverService ---
+
+#[tokio::test]
+async fn test_discover_returns_2026_version_in_supported() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28", "2025-11-25"]);
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &None);
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "should include 2026-07-28: {:?}",
+                result.supported_versions
+            );
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2025-11-25"),
+                "should include 2025-11-25: {:?}",
+                result.supported_versions
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_discover_returns_tools_capability() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28"]);
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &None);
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(
+                result.capabilities.tools.is_some(),
+                "should have tools capability"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_discover_with_custom_instructions() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28"]);
+    let instructions = Some("Be helpful and concise.".to_string());
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &instructions);
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert_eq!(
+                result.instructions.as_deref(),
+                Some("Be helpful and concise."),
+                "should include instructions"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_discover_non_discover_request_passes_through() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28"]);
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &None);
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp = svc.call(req).await.expect("infallible");
+    // Should pass through to mock service, not handle as Discover
+    match resp.inner.unwrap() {
+        McpResponse::ListTools(result) => {
+            assert_eq!(result.tools.len(), 1);
+        }
+        other => panic!("expected ListTools, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_discover_default_versions_when_empty_config() {
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = ProxyConfig {
+        proxy: ProxySettings {
+            protocol_support: ProtocolSupportConfig {
+                versions: vec![], // Empty!
+                default_protocol_version: None,
+            },
+            ..make_proxy_config(vec![]).proxy
+        },
+        ..make_proxy_config(vec![])
+    };
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &None);
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            // When config is empty, should return defaults
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "default should include 2026-07-28: {:?}",
+                result.supported_versions
+            );
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2025-11-25"),
+                "default should include 2025-11-25: {:?}",
+                result.supported_versions
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+// --- T5.1: Discover + MetaValidation composition ---
+
+#[tokio::test]
+async fn test_discover_with_meta_validation_composition() {
+    // Simulate production stack: DiscoverLayer wraps MetaValidationService
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28", "2025-11-25"]);
+    let meta_validated = MetaValidationService::new(mock);
+    let mut svc = DiscoverService::new(meta_validated, &config.proxy.protocol_support, &None);
+
+    // 2026-07-28 request with complete meta → Discover should respond directly
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(result.capabilities.tools.is_some());
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_meta_validation_blocks_before_discover() {
+    // When meta validation fails, it should block even Discover requests
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28"]);
+    let meta_validated = MetaValidationService::new(mock);
+    let mut svc = DiscoverService::new(meta_validated, &config.proxy.protocol_support, &None);
+
+    // Invalid 2026-07-28 meta (missing client_info)
+    let bad_meta = RequestMeta {
+        protocol_version: Some("2026-07-28".into()),
+        client_info: None,
+        client_capabilities: Some(ClientCapabilities::default()),
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(bad_meta.clone()),
+    );
+    let _resp = svc.call(req).await.expect("infallible");
+    // Discover is checked first by DiscoverService, then passes to inner
+    // So Discover should still respond (it checks before inner)
+    // But for non-Discover requests, meta validation applies
+    let req2 = request_with_meta(McpRequest::ListTools(Default::default()), Some(bad_meta));
+    let resp2 = svc.call(req2).await.expect("infallible");
+    assert!(
+        resp2.inner.is_err(),
+        "meta validation should block ListTools"
+    );
+}
+
+// --- T5.4: Backward compatibility with 2025-11-25 ---
+
+#[tokio::test]
+async fn test_2025_list_tools_without_meta_works() {
+    // Legacy clients (2025-03-26 or 2025-11-25) send requests without _meta
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::ListTools(result) => {
+            assert_eq!(result.tools.len(), 4);
+        }
+        other => panic!("expected ListTools, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_2025_call_tool_without_meta_works() {
+    let mut proxy = build_proxy().await;
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 2, "b": 3})),
+        None,
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => assert_eq!(result.all_text(), "5"),
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_2025_with_partial_meta_works() {
+    // 2025-11-25 with _meta but without all required 2026 fields
+    let mut proxy = build_proxy().await;
+    let meta = RequestMeta {
+        protocol_version: Some("2025-11-25".into()),
+        client_info: Some(Implementation {
+            name: "legacy-client".into(),
+            version: "0.9.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: None, // Not required for 2025
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok(), "2025 partial meta should work");
+}
+
+#[tokio::test]
+async fn test_2025_discover_still_works() {
+    // 2025-11-25 clients can still use Discover — it's handled by DiscoverService,
+    // not by the raw McpProxy. Verify DiscoverService responds to a Discover request
+    // even when no protocol_version is set (backward compat).
+    let mock = MockService::with_tools(&["tool1"]);
+    let config = make_proxy_config(vec!["2026-07-28", "2025-11-25"]);
+    let mut svc = DiscoverService::new(mock, &config.proxy.protocol_support, &None);
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "discover should list all supported versions"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+// --- T5.3: Conformance suite placeholder ---
+
+#[test]
+fn conformance_server_checks_placeholder() {
+    // TODO(T5.3): Replace with actual MCP conformance suite integration.
+    // The conformance suite binary (mcp-conformance) provides 39 server checks.
+    // Once available, spawn the binary and validate results.
+    // See: https://github.com/modelcontextprotocol/conformance-tests
+    eprintln!(
+        "PLACEHOLDER: MCP server conformance suite (39 checks) not yet integrated. \
+         Will be implemented when the conformance test binary is available."
+    );
+}
+
+#[test]
+fn conformance_client_checks_placeholder() {
+    // TODO(T5.3): Replace with actual MCP conformance suite integration.
+    // The conformance suite provides 265 client checks.
+    eprintln!(
+        "PLACEHOLDER: MCP client conformance suite (265 checks) not yet integrated. \
+         Will be implemented when the conformance test binary is available."
+    );
+}
+
+// ===========================================================================
+// Lazy backend registration regression (fast, in-process python server)
+// ===========================================================================
+
+use mcp_proxy::Proxy;
+use mcp_proxy::config::{BackendConfig, SpawnMode, TransportType};
+use mcp_proxy::lazy_registry::SpawnState;
+use mcp_proxy::warm_cache::{BinaryHasher, WarmCatalog, WarmCatalogStore};
+
+/// Minimal newline-delimited MCP stdio server (Python stdlib only). Exposes one
+/// `ping` tool and advertises protocol version `2026-07-28`. tower-mcp's
+/// `StdioClientTransport` speaks newline-delimited JSON (one object per line +
+/// `\n`); a Content-Length-framed server DEADLOCKS.
+const MIN_MCP_SERVER: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+while True:
+    req = read()
+    if req is None:
+        break
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        # Echo the offered version like a real server; 2026-07-28 is not an initialize-lifecycle version.
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":(req.get("params") or {}).get("protocolVersion","2025-11-25"),"capabilities":{"tools":{}},"serverInfo":{"name":"min-server","version":"1.0.0"}}})
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Return pong","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong"}],"isError":False}})
+    elif method == "resources/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
+    elif method == "prompts/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
+    elif method == "shutdown":
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+        break
+    else:
+        send({"jsonrpc":"2.0","id":mid,"result":{}})
+"#;
+
+/// A namespaced `ping` tool definition for the seeded warm catalog.
+fn ping_tool() -> tower_mcp_types::protocol::ToolDefinition {
+    tower_mcp_types::protocol::ToolDefinition {
+        name: "ping".to_string(),
+        title: None,
+        description: Some("Return pong".to_string()),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        icons: None,
+        annotations: None,
+        execution: None,
+        meta: None,
+    }
+}
+
+/// Regression: a lazy backend is registered in the lazy registry (Down) but is
+/// NOT eagerly added to the proxy's routing namespaces, and its warm catalog
+/// (seeded on disk) is loaded at startup and contains the namespaced tool.
+#[tokio::test]
+async fn lazy_backend_registered_down_and_not_in_proxy_namespaces() {
+    let dir = std::env::temp_dir().join(format!(
+        "mcp-proxy-int-lazy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create cache dir");
+    let server = dir.join("mcp-min-srv-int.py");
+    std::fs::write(&server, MIN_MCP_SERVER).expect("write server script");
+
+    let cfg = ProxyConfig {
+        proxy: ProxySettings {
+            name: "lazy-int-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            protocol_support: ProtocolSupportConfig::default(),
+            init_timeout: None,
+        },
+        backends: vec![
+            // Dummy eager backend (real MCP server) so the shared McpProxy has
+            // at least one backend to build. `enabled: true` is REQUIRED.
+            BackendConfig {
+                name: "__dummy__".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            // Lazy stdio backend under test.
+            BackendConfig {
+                name: "files".to_string(),
+                enabled: true,
+                transport: TransportType::Stdio,
+                command: Some("python3".to_string()),
+                args: vec![server.to_string_lossy().to_string()],
+                spawn_mode: SpawnMode::Lazy,
+                idle_timeout_secs: Some(30),
+                ..Default::default()
+            },
+        ],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig {
+            enabled: true,
+            dir: Some(dir.clone()),
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        },
+        source_path: None,
+        observability: ObservabilityConfig::default(),
+    };
+
+    // Seed a warm catalog on disk BEFORE building the proxy.
+    let files_cfg = cfg
+        .backends
+        .iter()
+        .find(|b| b.name == "files")
+        .expect("files backend present")
+        .clone();
+    let hash = BinaryHasher::hash(&files_cfg);
+    let catalog = WarmCatalog::from_probe_result(
+        "files",
+        "/",
+        vec![ping_tool()],
+        vec![],
+        vec![],
+        vec![],
+        Some("2026-07-28".to_string()),
+        hash,
+    );
+    WarmCatalogStore::new(dir.clone())
+        .save(&catalog)
+        .expect("seed warm catalog on disk");
+
+    let proxy = Proxy::from_config(cfg).await.expect("proxy builds");
+    let reg = proxy.lazy_registry();
+
+    // Registered by name in the lazy registry.
+    assert!(
+        reg.names().contains(&"files".to_string()),
+        "lazy backend 'files' must be registered in the lazy registry"
+    );
+    // Down at startup (not eagerly spawned).
+    assert_eq!(
+        reg.spawn_state("files"),
+        SpawnState::Down,
+        "lazy backend must be Down at startup"
+    );
+    // NOT eagerly added to the proxy's routing namespaces.
+    assert!(
+        !reg.proxy_has_namespace("files"),
+        "lazy backend must not be eagerly added to the proxy namespaces"
+    );
+    // Loaded warm catalog contains the namespaced tool.
+    let loaded = reg
+        .get("files")
+        .and_then(|b| b.catalog)
+        .expect("warm catalog must be loaded from disk at startup");
+    assert_eq!(
+        loaded.tools.len(),
+        1,
+        "loaded catalog must contain one tool"
+    );
+    assert_eq!(
+        loaded.tools[0].name, "files/ping",
+        "loaded tool must be namespaced as files/ping"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
