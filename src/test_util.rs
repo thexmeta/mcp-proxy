@@ -98,6 +98,35 @@ impl Service<RouterRequest> for ErrorMockService {
     }
 }
 
+/// A mock service that returns a -32000 transport error (as produced by
+/// `transport_error_frame` in tower-mcp's HTTP transport).
+#[derive(Clone)]
+pub struct TransportErrorMockService;
+
+impl Service<RouterRequest> for TransportErrorMockService {
+    type Response = RouterResponse;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<RouterResponse, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: RouterRequest) -> Self::Future {
+        let id = req.id.clone();
+        Box::pin(async move {
+            Ok(RouterResponse {
+                id,
+                inner: Err(tower_mcp_types::JsonRpcError {
+                    code: -32000,
+                    message: "connection refused".to_string(),
+                    data: None,
+                }),
+            })
+        })
+    }
+}
+
 /// Helper to send an MCP request through any service that implements
 /// `Service<RouterRequest, Response=RouterResponse, Error=Infallible>`.
 pub async fn call_service<S>(svc: &mut S, request: McpRequest) -> RouterResponse

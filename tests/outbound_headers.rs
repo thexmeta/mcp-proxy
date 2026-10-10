@@ -111,6 +111,7 @@ async fn websocket_headers_reach_handshake() {
         &format!("ws://{addr}"),
         Some("unused-bearer"),
         &headers,
+        None,
     )
     .await
     .unwrap();

@@ -226,6 +226,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -255,9 +256,164 @@ pub struct ProxyConfig {
     /// Composite tools that fan out to multiple backend tools.
     #[serde(default)]
     pub composite_tools: Vec<CompositeToolConfig>,
+    /// Warm tool-cache configuration for lazy/on-demand backend spawning.
+    #[serde(default)]
+    pub warm_cache: WarmCacheConfig,
     /// Path to the config file (set during load, not serialized).
     #[serde(skip)]
     pub source_path: Option<std::path::PathBuf>,
+}
+
+/// Warm tool-cache configuration for lazy/on-demand backend spawning.
+///
+/// Governs where warm catalogs are persisted and how long they remain valid.
+/// Consumed by later waves of the warm-cache feature; Wave 1 only adds the
+/// fields with safe defaults so existing configs keep deserializing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WarmCacheConfig {
+    /// Whether the warm cache is enabled. Default: false (opt-in, backward compatible).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory for warm catalog JSON files. `None` uses a platform default
+    /// (e.g. `<cache_dir>/mcp-proxy/warm`) when enabled.
+    #[serde(default)]
+    pub dir: Option<std::path::PathBuf>,
+    /// Maximum age (seconds) of a warm catalog before it is treated as stale.
+    /// `0` means "never expire by age" (only invalidated by identity-hash change).
+    #[serde(default)]
+    pub ttl_secs: u64,
+    /// If true, a changed backend identity hash invalidates (prunes) the old catalog.
+    #[serde(default = "default_true")]
+    pub invalidate_on_hash_change: bool,
+}
+
+impl Default for WarmCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            ttl_secs: 0,
+            invalidate_on_hash_change: true,
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// Expand shorthand `endpoint_group_list` entries into full `EndpointGroupConfig` structs.
+    ///
+    /// Each string entry becomes an endpoint group with:
+    /// - `name` = the entry string
+    /// - `path` = `/{entry}`
+    /// - `backends` = all enabled backend names
+    ///
+    /// Explicit `[[proxy.endpoint_groups]]` entries with the same name override
+    /// the shorthand-generated ones. A warning is logged for each override.
+    pub fn expand_endpoint_group_list(&mut self) {
+        if self.proxy.endpoint_group_list.is_empty() {
+            return;
+        }
+
+        let existing_names: HashSet<String> = self
+            .proxy
+            .endpoint_groups
+            .iter()
+            .map(|g| g.name.clone())
+            .collect();
+
+        for entry in &self.proxy.endpoint_group_list {
+            if existing_names.contains(entry.as_str()) {
+                tracing::warn!(
+                    endpoint_group = %entry,
+                    "endpoint_group_list entry '{}' overridden by explicit [[proxy.endpoint_groups]]",
+                    entry
+                );
+                continue;
+            }
+
+            let group = EndpointGroupConfig {
+                name: entry.clone(),
+                path: format!("/{entry}"),
+                // Shorthand groups start with empty backends. Membership is
+                // determined by reverse references: backends that declare
+                // endpoint_groups = ["<group_name>"] in their config. This
+                // ensures GroupFilterService only allows the correct tools.
+                backends: Vec::new(),
+                tools: Vec::new(),
+                description: Some("Auto-generated endpoint group from shorthand".to_string()),
+                tool_discovery: false,
+            };
+
+            tracing::info!(
+                endpoint_group = %entry,
+                path = %group.path,
+                backends = ?group.backends,
+                "Expanding endpoint_group_list shorthand into endpoint group"
+            );
+
+            self.proxy.endpoint_groups.push(group);
+        }
+    }
+
+    /// Merge global proxy-level middleware defaults into per-backend configs.
+    ///
+    /// For each backend, if a per-backend field is `None`, the global default
+    /// from `[proxy]` is applied. Per-backend values always take precedence.
+    ///
+    /// Also merges `[proxy.backend_env]` into each backend's `env` map
+    /// (per-backend env vars override global ones).
+    pub fn apply_global_defaults(&mut self) {
+        for backend in &mut self.backends {
+            // Merge global env vars (per-backend takes precedence)
+            for (key, value) in &self.proxy.backend_env {
+                backend
+                    .env
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+
+            // Global timeout (per-backend overrides)
+            if backend.timeout.is_none() {
+                backend.timeout = self.proxy.timeout.clone();
+            }
+
+            // Global circuit breaker (per-backend overrides)
+            if backend.circuit_breaker.is_none() {
+                backend.circuit_breaker = self.proxy.circuit_breaker.clone();
+            }
+
+            // Global retry (per-backend overrides)
+            if backend.retry.is_none() {
+                backend.retry = self.proxy.retry.clone();
+            }
+
+            // Global spawn mode default (per-backend Unset inherits proxy default).
+            if backend.spawn_mode == SpawnMode::Unset {
+                backend.spawn_mode = self.proxy.default_spawn_mode.clone();
+            }
+
+            // Global idle timeout default (per-backend None inherits proxy default).
+            if backend.idle_timeout_secs.is_none() {
+                backend.idle_timeout_secs = self.proxy.default_idle_timeout_secs;
+            }
+
+            // Global init timeout default (per-backend overrides).
+            // If backend doesn't have its own init_timeout, use global default.
+            // If neither has one, use transport-specific default (30s for stdio, None for HTTP/WS).
+            if backend.init_timeout.is_none() {
+                if let Some(global_init_timeout) = self.proxy.init_timeout {
+                    backend.init_timeout = Some(global_init_timeout);
+                } else {
+                    backend.init_timeout =
+                        default_init_timeout(&backend.transport).map(|d| d.as_secs());
+                }
+            }
+        }
+
+        // force_kill overrides shutdown_kill_timeout_secs to 0 (immediate SIGKILL).
+        if self.proxy.force_kill {
+            self.proxy.shutdown_kill_timeout_secs = 0;
+        }
+    }
 }
 
 /// Fan-out strategy for composite tools.
@@ -297,6 +453,82 @@ pub struct CompositeToolConfig {
     pub strategy: CompositeStrategy,
 }
 
+/// Configuration for an HTTP endpoint group.
+///
+/// Endpoint groups expose a subset of backends at a custom HTTP path prefix.
+/// Each group gets its own MCP endpoint at `{path}/mcp` (e.g., `/search/mcp`).
+///
+/// # Example
+///
+/// ```toml
+/// [[endpoint_groups]]
+/// name = "search"
+/// path = "/search"
+/// backends = ["context7", "deepwiki", "tavily", "exa"]
+/// description = "Unified search across knowledge sources"
+/// tool_discovery = true
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EndpointGroupConfig {
+    /// Unique group name (used internally for references).
+    pub name: String,
+    /// HTTP path prefix for this group (must start with "/").
+    /// The MCP endpoint will be available at `{path}/mcp`.
+    pub path: String,
+    /// Backend names that belong to this group.
+    /// May be empty if membership is declared via each backend's own
+    /// `endpoint_groups` field (reverse reference).
+    #[serde(default)]
+    pub backends: Vec<String>,
+    /// Optional: specific tools to expose from these backends.
+    /// Format: `"backend/tool"` or `"backend/*"` for all tools.
+    /// If empty, all tools from the grouped backends are exposed.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Optional description for documentation/discovery.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Enable BM25-based tool discovery for this endpoint group.
+    /// Adds `proxy/search_tools`, `proxy/similar_tools`, `proxy/tool_categories`
+    /// scoped to this group's tools.
+    #[serde(default)]
+    pub tool_discovery: bool,
+}
+
+/// Configuration for a virtual tool namespace group.
+///
+/// Tool groups organize tools under a common prefix in `ListTools` responses
+/// without creating separate HTTP endpoints. Useful for LLM tool discovery.
+///
+/// # Example
+///
+/// ```toml
+/// [[tool_groups]]
+/// name = "search"
+/// tools = ["context7/*", "deepwiki/*", "tavily/web_search", "exa/web_search_exa"]
+/// description = "All search tools"
+/// mirror_to_original = true
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolGroupConfig {
+    /// Group name (appears as prefix in tool names, e.g., `search/web_search`).
+    pub name: String,
+    /// Tools to include in this group.
+    /// Format: `"backend/tool"` or `"backend/*"` for all tools from a backend.
+    pub tools: Vec<String>,
+    /// Optional description for documentation.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// If true, tools also appear at their original names (backward compatibility).
+    /// If false, tools only appear under the group prefix.
+    #[serde(default = "default_true")]
+    pub mirror_to_original: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Core proxy identity and server settings.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProxySettings {
@@ -315,6 +547,16 @@ pub struct ProxySettings {
     /// Graceful shutdown timeout in seconds (default: 30)
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_seconds: u64,
+    /// Timeout (seconds) after SIGTERM before sending SIGKILL to stdio
+    /// backend child processes. Default: 2. Set to 0 to skip SIGTERM and
+    /// kill immediately.
+    #[serde(default = "default_shutdown_kill_timeout")]
+    pub shutdown_kill_timeout_secs: u64,
+    /// Force-kill all backend processes immediately on shutdown (skip SIGTERM).
+    /// When true, `shutdown_kill_timeout_secs` is treated as 0.
+    /// Useful for fast restarts when backends are slow to exit.
+    #[serde(default)]
+    pub force_kill: bool,
     /// Enable hot reload: watch config file for new backends
     #[serde(default)]
     pub hot_reload: bool,
@@ -323,6 +565,9 @@ pub struct ProxySettings {
     pub import_backends: Option<String>,
     /// Global rate limit applied to all requests before per-backend dispatch.
     pub rate_limit: Option<GlobalRateLimitConfig>,
+    /// Per-client-identity rate limit. For 2026-07-28, identifies clients by
+    /// `_meta.clientInfo.name`. For older protocols, all requests share one bucket.
+    pub client_rate_limit: Option<ClientRateLimitConfig>,
     /// Enable BM25-based tool discovery and search (default: false).
     /// Adds `proxy/search_tools`, `proxy/similar_tools`, and
     /// `proxy/tool_categories` tools for finding tools across backends.
@@ -337,6 +582,81 @@ pub struct ProxySettings {
     ///   Implies `tool_discovery = true`.
     #[serde(default)]
     pub tool_exposure: ToolExposure,
+
+    /// Whether backends assigned to endpoint_groups are also exposed at the default /mcp endpoint.
+    /// When false, grouped backends are only accessible via their endpoint group paths.
+    /// Default: true (backward compatible).
+    #[serde(default = "default_true")]
+    pub expose_grouped_in_default: bool,
+
+    /// HTTP endpoint groups (path-based routing).
+    /// Each group creates a separate MCP endpoint at `{path}/mcp`.
+    #[serde(default)]
+    pub endpoint_groups: Vec<EndpointGroupConfig>,
+
+    /// Virtual tool namespace groups (for MCP discovery).
+    /// Groups organize tools under a common prefix in ListTools responses.
+    #[serde(default)]
+    pub tool_groups: Vec<ToolGroupConfig>,
+
+    /// Global environment variables passed to ALL stdio backend processes.
+    /// Per-backend `[backends.env]` values take precedence over these.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [proxy.backend_env]
+    /// LOG_LEVEL = "ERROR"
+    /// MCP_LOG_LEVEL = "ERROR"
+    /// ```
+    #[serde(default)]
+    pub backend_env: HashMap<String, String>,
+
+    /// Global timeout applied to ALL backends. Per-backend `[backends.timeout]`
+    /// overrides this for that specific backend.
+    #[serde(default)]
+    pub timeout: Option<TimeoutConfig>,
+
+    /// Global circuit breaker applied to ALL backends. Per-backend
+    /// `[backends.circuit_breaker]` overrides this for that specific backend.
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+
+    /// Global retry policy applied to ALL backends. Per-backend
+    /// `[backends.retry]` overrides this for that specific backend.
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+
+    /// Shorthand for endpoint groups: auto-creates groups at `/{name}/mcp`.
+    /// Each entry creates an endpoint group with all enabled backends visible.
+    /// Detailed `[[proxy.endpoint_groups]]` entries override these by name.
+    #[serde(default)]
+    pub endpoint_group_list: Vec<String>,
+
+    /// File watcher configuration for hot reload. Tried in order until one works.
+    /// Default: [Inotify, Mtime { interval_seconds: 30 }, Signal]
+    #[serde(default = "default_watchers")]
+    pub watchers: Vec<WatcherConfig>,
+
+    /// Protocol version support configuration.
+    /// Controls which MCP protocol versions the HTTP server accepts.
+    #[serde(default)]
+    pub protocol_support: ProtocolSupportConfig,
+
+    /// Default spawn mode for backends that don't specify one.
+    /// Backends with `spawn_mode = "unset"` (the per-backend default) inherit
+    /// this value. Defaults to `Eager` (backward compatible).
+    #[serde(default = "default_spawn_mode_eager")]
+    pub default_spawn_mode: SpawnMode,
+    /// Default idle timeout (seconds) for lazily-spawned backends that don't
+    /// specify `idle_timeout_secs`. `None` means never idle-timeout.
+    #[serde(default)]
+    pub default_idle_timeout_secs: Option<u64>,
+    /// Global default initialization timeout (seconds) for backend MCP
+    /// handshake. Per-backend `init_timeout` overrides this.
+    /// Default: 30s for stdio, None for HTTP/WebSocket.
+    #[serde(default)]
+    pub init_timeout: Option<u64>,
 }
 
 /// How backend tools are exposed to MCP clients.
@@ -366,6 +686,75 @@ pub enum ToolExposure {
     Search,
 }
 
+/// Protocol version support configuration.
+///
+/// Controls which MCP protocol versions the HTTP server accepts.
+/// By default, both 2026-07-28 and 2025-11-25 are enabled for backward
+/// compatibility. Specify versions to restrict to specific versions.
+///
+/// # Examples
+///
+/// ```toml
+/// [proxy.protocol_support]
+/// versions = ["2026-07-28", "2025-11-25"]
+/// default_protocol_version = "2026-07-28"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ProtocolSupportConfig {
+    /// List of protocol versions to enable.
+    /// Valid values: "2026-07-28", "2025-11-25"
+    #[serde(default)]
+    pub versions: Vec<String>,
+    /// Default protocol version for new connections when the client does not
+    /// specify one. Must be one of the enabled versions. If not set, the
+    /// highest enabled version is used.
+    #[serde(default)]
+    pub default_protocol_version: Option<String>,
+}
+
+/// Configuration for a config file watcher.
+///
+/// The proxy tries watchers in order until one successfully detects a change.
+/// The default watchers are: inotify (OS-level), mtime polling (30s interval), and SIGHUP signal.
+///
+/// # Examples
+///
+/// ```toml
+/// [proxy]
+/// watchers = [
+///   { type = "inotify" },
+///   { type = "mtime", interval_seconds = 30 },
+///   { type = "signal" }
+/// ]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WatcherConfig {
+    /// OS-level file watcher using inotify (Linux), kqueue (macOS/BSD), or ReadDirectoryChangesW (Windows).
+    /// Most efficient but may not work in all environments (e.g., some containers, network filesystems).
+    Inotify,
+    /// Lightweight polling watcher that checks file modification time at a fixed interval.
+    /// Works everywhere but uses more CPU and has latency up to the interval.
+    Mtime {
+        /// Polling interval in seconds (default: 30).
+        #[serde(default = "default_mtime_interval")]
+        interval_seconds: u64,
+    },
+    /// Signal-based watcher that triggers reload on SIGHUP.
+    /// Useful for manual reloads or integration with external watchers (e.g., systemd, Docker).
+    Signal,
+}
+
+/// Default polling interval for Mtime watcher (30 seconds).
+fn default_mtime_interval() -> u64 {
+    30
+}
+
+/// Default value for backend enabled field (true for backward compatibility).
+fn default_enabled() -> bool {
+    true
+}
+
 /// Global rate limit configuration applied across all backends.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GlobalRateLimitConfig {
@@ -374,6 +763,26 @@ pub struct GlobalRateLimitConfig {
     /// Period length in seconds (default: 1).
     #[serde(default = "default_rate_period")]
     pub period_seconds: u64,
+}
+
+/// Per-client-identity rate limit configuration.
+///
+/// For 2026-07-28 protocol, clients are identified by `_meta.clientInfo.name`.
+/// For older protocols, clients get a shared anonymous identity.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ClientRateLimitConfig {
+    /// Maximum requests per client per window.
+    pub max_requests: usize,
+    /// Window duration in seconds (default: 60).
+    #[serde(default = "default_rate_period")]
+    pub window_seconds: u64,
+    /// How often to clean up idle client entries in seconds (default: 300).
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_seconds: u64,
+}
+
+fn default_cleanup_interval() -> u64 {
+    300
 }
 
 /// HTTP server listen address.
@@ -388,11 +797,16 @@ pub struct ListenConfig {
 }
 
 /// Configuration for a single backend MCP server.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// Unique backend name, used as the namespace prefix for its tools/resources.
     pub name: String,
+    /// Whether this backend is enabled.
+    /// Disabled backends are skipped during startup and hot reload.
+    /// Default: true (for backward compatibility).
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Transport protocol to use when connecting to this backend.
     pub transport: TransportType,
     /// Command for stdio backends
@@ -405,6 +819,10 @@ pub struct BackendConfig {
     /// Environment variables for subprocess backends
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Working directory for stdio backends.
+    /// If not set, the proxy's current working directory is used.
+    #[serde(default)]
+    pub working_dir: Option<std::path::PathBuf>,
     /// Per-backend timeout
     pub timeout: Option<TimeoutConfig>,
     /// Per-backend circuit breaker
@@ -442,6 +860,10 @@ pub struct BackendConfig {
     /// Tool aliases: rename tools exposed by this backend
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
+    /// Pattern-based bulk tool renaming rules.
+    /// Each rule matches multiple tools by pattern and renames them via template.
+    #[serde(default)]
+    pub rename_all: Vec<RenameAllConfig>,
     /// Default arguments injected into all tool calls for this backend.
     /// Merged into tool call arguments (does not overwrite existing keys).
     #[serde(default)]
@@ -494,13 +916,214 @@ pub struct BackendConfig {
     /// Higher values receive proportionally more traffic.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Endpoint groups this backend belongs to (by group name).
+    /// Alternative to declaring backends in EndpointGroupConfig.backends.
+    #[serde(default)]
+    pub endpoint_groups: Vec<String>,
+    /// Tool groups this backend's tools belong to (by group name).
+    /// Alternative to declaring tools in ToolGroupConfig.tools.
+    #[serde(default)]
+    pub tool_groups: Vec<String>,
+    /// Protocol version to use when connecting to this backend (for WebSocket/HTTP).
+    /// If not set, the proxy will attempt to negotiate the highest supported version.
+    /// For WebSocket, this sets the `Sec-WebSocket-Protocol: mcp.version.{version}` header.
+    /// For HTTP, this sets the `MCP-Protocol-Version` header.
+    /// Valid values: "2026-07-28", "2025-11-25"
+    pub protocol_version: Option<String>,
+    /// Spawn mode for this backend.
+    /// `Eager` (default) keeps the backend process running continuously.
+    /// `Lazy` (later waves) allows the backend to be spawned on-demand and torn
+    /// down when idle, serving a warm tool catalog from disk while dead.
+    #[serde(default)]
+    pub spawn_mode: SpawnMode,
+    /// Idle timeout in seconds before a lazily-spawned backend is torn down.
+    /// Only meaningful when `spawn_mode = "lazy"`. `None` means never idle-timeout.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// HTTP client tuning for reqwest and tower-mcp HTTP transport.
+    /// When set, the proxy builds a custom `reqwest::Client` from these options
+    /// and passes matching config to the `HttpClientConfig` used by tower-mcp.
+    #[serde(default)]
+    pub http: Option<BackendHttpClientConfig>,
+    /// Optional explicit suffix folded into the backend's warm-cache identity hash.
+    /// Use this to pin a launcher/package version (e.g. `npx` package version)
+    /// that cannot be auto-resolved offline, forcing a cache invalidation when it
+    /// changes. Hashed but never logged; see `BinaryHasher`.
+    #[serde(default)]
+    pub cache_key_suffix: Option<String>,
+    /// Per-backend initialization timeout (seconds) for MCP handshake.
+    /// Overrides the global `[proxy.init_timeout]` default.
+    /// Default: 30s for stdio, None for HTTP/WebSocket.
+    #[serde(default)]
+    pub init_timeout: Option<u64>,
+    /// Force-kill this backend's stdio child immediately on shutdown
+    /// (skip SIGTERM, SIGKILL without grace). Default: `false`.
+    /// Effective mode is `proxy.force_kill OR backend.force_kill`, resolved
+    /// at spawn time into `kill_timeout` (`Duration::ZERO` = SIGKILL
+    /// immediately; nonzero = bounded graceful SIGTERM then SIGKILL fallback).
+    #[serde(default)]
+    pub force_kill: bool,
+    /// Externally-managed singleton policy flag.
+    ///
+    /// When true, this backend is an independently-daemonized singleton
+    /// (e.g. a self-daemonizing server) that the proxy does not own. The
+    /// proxy must never signal its process — regardless of `force_kill` —
+    /// and surfaces [`singleton_stop_hint`](Self::singleton_stop_hint) as an
+    /// advisory hint in spawn-conflict errors only.
+    ///
+    /// Default: false (proxy-owned child, normal lifecycle).
+    #[serde(default)]
+    pub singleton_externally_managed: bool,
+    /// Advisory stop-command hint for an externally-managed singleton.
+    ///
+    /// Surfaced in spawn-conflict error text/logs only; the proxy never
+    /// executes it. Required (non-empty) when
+    /// [`singleton_externally_managed`](Self::singleton_externally_managed)
+    /// is true.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [[backends]]
+    /// name = "codebase"
+    /// transport = "stdio"
+    /// command = "/usr/bin/codebase-memory-mcp"
+    /// singleton_externally_managed = true
+    /// singleton_stop_hint = "systemctl --user stop codebase-memory"
+    /// ```
+    #[serde(default)]
+    pub singleton_stop_hint: Option<String>,
+}
+
+/// Per-backend HTTP client configuration.
+///
+/// Maps to `[backends.http]` in TOML. Exposes the most useful reqwest
+/// [`reqwest::Client::builder()`] options without overloading the config surface.
+/// All fields are optional; absent values use the same defaults as reqwest.
+///
+/// # Example
+///
+/// ```toml
+/// [[backends]]
+/// name = "api"
+/// transport = "http"
+/// url = "http://api:8080"
+///
+/// [backends.http]
+/// connect_timeout_secs = 5
+/// timeout_secs = 60
+/// pool_idle_timeout_secs = 120
+/// pool_max_idle_per_host = 4
+/// danger_accept_invalid_certs = true
+/// user_agent = "mcp-proxy/1.0"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BackendHttpClientConfig {
+    /// TCP connect timeout in seconds (default: 10).
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Overall request timeout in seconds (default: 30).
+    /// Maps to `HttpClientConfig::request_timeout` for the tower-mcp transport.
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Connection pool idle timeout in seconds (default: 90).
+    #[serde(default = "default_http_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    /// Maximum idle connections per host in the pool (default: none/system).
+    /// `None` uses reqwest's system default.
+    pub pool_max_idle_per_host: Option<usize>,
+    /// Accept invalid TLS certificates (default: false).
+    /// **WARNING**: disabling certificate verification exposes the proxy to
+    /// man-in-the-middle attacks. Use only for local development or with
+    /// self-signed certs in a controlled environment.
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
+    /// Custom User-Agent header value (default: none → reqwest default).
+    pub user_agent: Option<String>,
+}
+
+fn default_http_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
+}
+
+fn default_http_pool_idle_timeout_secs() -> u64 {
+    90
+}
+
+/// Build a [`reqwest::Client`] from the per-backend HTTP config.
+///
+/// This is the primary way to construct a custom client when the backend
+/// requires non-default TLS settings or connection pool tuning.
+impl From<&BackendHttpClientConfig> for reqwest::ClientBuilder {
+    fn from(config: &BackendHttpClientConfig) -> Self {
+        let mut builder = reqwest::Client::builder();
+        builder = builder
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+        if let Some(max_idle) = config.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(max_idle);
+        }
+        if config.danger_accept_invalid_certs {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(ref ua) = config.user_agent {
+            builder = builder.user_agent(ua.as_str());
+        }
+        builder
+    }
+}
+
+/// Convert per-backend HTTP config to the tower-mcp [`HttpClientConfig`](tower_mcp::client::HttpClientConfig).
+///
+/// Only fields with a direct counterpart are mapped; tower-mcp-specific
+/// settings (auto_sse, session_recovery, etc.) keep their own defaults.
+impl From<&BackendHttpClientConfig> for tower_mcp::client::HttpClientConfig {
+    fn from(config: &BackendHttpClientConfig) -> Self {
+        tower_mcp::client::HttpClientConfig {
+            request_timeout: Duration::from_secs(config.timeout_secs),
+            ..Default::default()
+        }
+    }
+}
+
+/// Backend spawn mode.
+///
+/// Controls whether a backend process runs continuously (`Eager`) or is spawned
+/// on demand and allowed to idle out (`Lazy`). `Lazy` is consumed by later waves
+/// of the warm-cache feature; Wave 1 only adds the field with a safe default.
+///
+/// `Unset` is the per-backend default: it inherits the proxy-level
+/// `default_spawn_mode` (which itself defaults to `Eager`). After config
+/// normalization ([`ProxyConfig::apply_global_defaults`]) no backend retains
+/// `Unset` — it is resolved to `Eager` or `Lazy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpawnMode {
+    /// Not specified; inherits the proxy-level `default_spawn_mode` (Eager).
+    #[default]
+    Unset,
+    /// Keep the backend process running continuously (default, backward compatible).
+    Eager,
+    /// Spawn on demand; tear down when idle. Serves warm catalog from disk while dead.
+    Lazy,
+}
+
+/// Serde default for [`ProxySettings::default_spawn_mode`]: resolves to `Eager`
+/// so the GLOBAL default is backward compatible (not `Unset`).
+fn default_spawn_mode_eager() -> SpawnMode {
+    SpawnMode::Eager
 }
 
 /// Backend transport protocol.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     /// Subprocess communicating via stdin/stdout.
+    #[default]
     Stdio,
     /// HTTP+SSE remote server.
     Http,
@@ -508,15 +1131,25 @@ pub enum TransportType {
     Websocket,
 }
 
+/// Returns the default initialization timeout for a given transport type.
+/// - `Stdio`: 30 seconds (subprocess may need time to start)
+/// - `Http`/`Websocket`: `None` (no timeout by default for remote connections)
+pub fn default_init_timeout(transport: &TransportType) -> Option<std::time::Duration> {
+    match transport {
+        TransportType::Stdio => Some(std::time::Duration::from_secs(30)),
+        TransportType::Http | TransportType::Websocket => None,
+    }
+}
+
 /// Per-backend request timeout.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TimeoutConfig {
     /// Timeout duration in seconds.
     pub seconds: u64,
 }
 
 /// Per-backend circuit breaker configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitBreakerConfig {
     /// Failure rate threshold (0.0-1.0) to trip open (default: 0.5)
     #[serde(default = "default_failure_rate")]
@@ -533,7 +1166,7 @@ pub struct CircuitBreakerConfig {
 }
 
 /// Per-backend rate limiting configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     /// Maximum requests per period
     pub requests: usize,
@@ -543,7 +1176,7 @@ pub struct RateLimitConfig {
 }
 
 /// Per-backend concurrency limit configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConcurrencyConfig {
     /// Maximum concurrent requests.
     pub max_concurrent: usize,
@@ -617,6 +1250,7 @@ pub struct InjectArgsConfig {
 /// hide = ["path"]
 /// defaults = { path = "/home/docs" }
 /// rename = { recursive = "deep_search" }
+/// instructions = "Execute SQL queries safely. Use read-only mode for SELECT."
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ParamOverrideConfig {
@@ -636,6 +1270,10 @@ pub struct ParamOverrideConfig {
     /// mapped back to the original before forwarding to the backend.
     #[serde(default)]
     pub rename: HashMap<String, String>,
+    /// Override the tool's description (instructions) shown to clients.
+    /// If set, this replaces the tool's `description` field in ListTools responses.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// Request hedging configuration.
@@ -810,7 +1448,7 @@ pub struct RoleMappingConfig {
 }
 
 /// Tool alias: exposes a backend tool under a different name.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AliasConfig {
     /// Original tool name (backend-local, without namespace prefix)
     pub from: String,
@@ -818,8 +1456,47 @@ pub struct AliasConfig {
     pub to: String,
 }
 
+/// Pattern-based bulk tool renaming rule.
+///
+/// Matches multiple tool names using glob or regex patterns and renames them
+/// according to a replacement template. Supports capture group references
+/// (`$1`, `$2`, etc.) for regex patterns.
+///
+/// # Examples
+///
+/// Strip a prefix from all tools:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "tavily_*"
+/// to = ""
+/// ```
+///
+/// Add a prefix to all tools:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "*"
+/// to = "search_$0"
+/// ```
+///
+/// Regex with capture groups:
+/// ```toml
+/// [[backends.aliases.renameall]]
+/// from = "re:^tavily_(.+)$"
+/// to = "search_$1"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RenameAllConfig {
+    /// Pattern to match backend-local tool names.
+    /// Supports glob patterns (`*`, `?`) and regex patterns (prefix with `re:`).
+    pub from: String,
+    /// Replacement template for matched tool names.
+    /// For regex patterns, `$1`, `$2`, etc. refer to capture groups.
+    /// For glob patterns, `$0` refers to the entire matched string.
+    pub to: String,
+}
+
 /// Per-backend response cache configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BackendCacheConfig {
     /// TTL for cached resource reads in seconds (0 = disabled)
     #[serde(default)]
@@ -896,6 +1573,23 @@ pub struct SecurityConfig {
     /// `admin_token`. With no auth configured at all, the admin API is open
     /// (suitable for local/dev use). Supports `${ENV_VAR}` syntax.
     pub admin_token: Option<String>,
+    /// CORS configuration for browser clients. If omitted, no CORS headers
+    /// are sent (browser-based clients will be blocked by same-origin policy).
+    pub cors: Option<CorsConfig>,
+}
+
+/// Cross-Origin Resource Sharing (CORS) configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CorsConfig {
+    /// List of allowed origins. If omitted, allows any origin (`*`).
+    pub allowed_origins: Option<Vec<String>>,
+    /// HTTP methods to allow. If omitted, allows any method.
+    pub allowed_methods: Option<Vec<String>>,
+    /// HTTP headers to allow. If omitted, allows any header.
+    pub allowed_headers: Option<Vec<String>>,
+    /// Whether to include `Access-Control-Allow-Credentials` header.
+    #[serde(default)]
+    pub allow_credentials: Option<bool>,
 }
 
 /// Logging, metrics, and distributed tracing configuration.
@@ -1049,12 +1743,27 @@ fn default_shutdown_timeout() -> u64 {
     30
 }
 
+fn default_shutdown_kill_timeout() -> u64 {
+    2
+}
+
 fn default_otlp_endpoint() -> String {
     "http://localhost:4317".to_string()
 }
 
 fn default_service_name() -> String {
     "mcp-proxy".to_string()
+}
+
+/// Default hot-reload watchers, tried in order.
+pub fn default_watchers() -> Vec<WatcherConfig> {
+    vec![
+        WatcherConfig::Inotify,
+        WatcherConfig::Mtime {
+            interval_seconds: 30,
+        },
+        WatcherConfig::Signal,
+    ]
 }
 
 /// Resolved filter rules for a backend's capabilities.
@@ -1074,12 +1783,16 @@ pub struct BackendFilter {
     pub read_only_only: bool,
 }
 
-/// A compiled pattern for name matching -- either a glob or a regex.
+/// A compiled pattern for name matching -- either a literal substring,
+/// a glob, or a regex.
 ///
 /// Constructed internally by [`NameFilter::allow_list`] and
 /// [`NameFilter::deny_list`].
 #[derive(Debug, Clone)]
 pub enum CompiledPattern {
+    /// A literal substring pattern (no wildcards, no `re:` prefix).
+    /// Matches via `str::contains` -- every occurrence is replaced.
+    Literal(String),
     /// A glob pattern (matched via `glob_match`).
     Glob(String),
     /// A pre-compiled regex pattern (from `re:` prefix).
@@ -1088,20 +1801,26 @@ pub enum CompiledPattern {
 
 impl CompiledPattern {
     /// Compile a pattern string. Patterns prefixed with `re:` are treated as
-    /// regular expressions; all others are treated as glob patterns.
-    fn compile(pattern: &str) -> Result<Self> {
+    /// regular expressions; plain strings without glob metacharacters (`*`, `?`)
+    /// are treated as literal substrings (match via `contains`); everything else
+    /// is a glob pattern.
+    pub fn compile(pattern: &str) -> Result<Self> {
         if let Some(re_pat) = pattern.strip_prefix("re:") {
             let re = regex::Regex::new(re_pat)
                 .with_context(|| format!("invalid regex in filter pattern: {pattern}"))?;
             Ok(Self::Regex(re))
+        } else if !pattern.contains('*') && !pattern.contains('?') {
+            // Plain string with no glob metacharacters → literal substring match
+            Ok(Self::Literal(pattern.to_string()))
         } else {
             Ok(Self::Glob(pattern.to_string()))
         }
     }
 
     /// Check if this pattern matches the given name.
-    fn matches(&self, name: &str) -> bool {
+    pub fn matches(&self, name: &str) -> bool {
         match self {
+            Self::Literal(pat) => name.contains(pat.as_str()),
             Self::Glob(pat) => glob_match::glob_match(pat, name),
             Self::Regex(re) => re.is_match(name),
         }
@@ -1199,6 +1918,32 @@ impl NameFilter {
 }
 
 impl BackendConfig {
+    /// Effective force-kill mode for this backend.
+    ///
+    /// OR semantics: the global `proxy.force_kill` forces immediate kill for
+    /// all backends; otherwise each backend opts in individually via its own
+    /// `force_kill` field (default `false`).
+    pub fn effective_force_kill(&self, global_force_kill: bool) -> bool {
+        global_force_kill || self.force_kill
+    }
+
+    /// Resolve the spawn-time `kill_timeout` for this backend.
+    ///
+    /// `Duration::ZERO` means SIGKILL immediately (no graceful timeout);
+    /// nonzero means bounded graceful SIGTERM wait then SIGKILL fallback
+    /// (see [`crate::stdio_spawn::spawn_stdio_transport`]).
+    pub fn effective_kill_timeout(
+        &self,
+        global_force_kill: bool,
+        global_kill_timeout_secs: u64,
+    ) -> std::time::Duration {
+        if self.effective_force_kill(global_force_kill) {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(global_kill_timeout_secs)
+        }
+    }
+
     /// Build a [`BackendFilter`] from this backend's expose/hide lists.
     /// Returns `None` if no filtering is configured.
     ///
@@ -1262,6 +2007,89 @@ impl BackendConfig {
             read_only_only: self.read_only_only,
         }))
     }
+
+    /// Resolved advisory stop-command hint for an externally-managed singleton.
+    ///
+    /// Returns the trimmed hint when this backend is flagged
+    /// [`singleton_externally_managed`](Self::singleton_externally_managed)
+    /// and the hint is non-empty after trimming; `None` otherwise.
+    /// Pure accessor for the `actionable-spawn-error` task's error mapping.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mcp_proxy::config::BackendConfig;
+    ///
+    /// let backend: BackendConfig = toml::from_str(
+    ///     r#"
+    ///     name = "codebase"
+    ///     transport = "stdio"
+    ///     command = "/usr/bin/codebase-memory-mcp"
+    ///     singleton_externally_managed = true
+    ///     singleton_stop_hint = "systemctl --user stop codebase-memory"
+    ///     "#,
+    /// )
+    /// .unwrap();
+    /// assert_eq!(
+    ///     backend.singleton_stop_hint_resolved(),
+    ///     Some("systemctl --user stop codebase-memory")
+    /// );
+    /// ```
+    pub fn singleton_stop_hint_resolved(&self) -> Option<&str> {
+        if !self.singleton_externally_managed {
+            return None;
+        }
+        self.singleton_stop_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+    }
+}
+
+/// Normalize a host:port pair for self-reference comparison.
+///
+/// - `localhost` → `127.0.0.1`
+/// - `0.0.0.0` → `127.0.0.1` (wildcard listens on all interfaces, including loopback)
+/// - `::` / `[::]` → `127.0.0.1` (IPv6 wildcard)
+/// - `[::1]` → `127.0.0.1` (IPv6 loopback)
+fn normalize_addr(host: &str, port: u16) -> String {
+    let normalized_host = match host {
+        "localhost" | "0.0.0.0" | "::" | "[::]" | "[::1]" => "127.0.0.1",
+        other => other,
+    };
+    format!("{normalized_host}:{port}")
+}
+
+/// Extract host and port from an HTTP/HTTPS URL string.
+///
+/// Returns `None` if parsing fails or the URL has no host.
+fn parse_host_port(url_str: &str) -> Option<(String, u16)> {
+    // Strip scheme
+    let without_scheme = url_str
+        .strip_prefix("https://")
+        .or_else(|| url_str.strip_prefix("http://"))?;
+    // Take everything before the first '/' or '?' or '#'
+    let authority = without_scheme.split(['/', '?', '#']).next()?;
+    // Split host and port
+    if let Some(colon_pos) = authority.rfind(':') {
+        let host_part = &authority[..colon_pos];
+        let port_str = &authority[colon_pos + 1..];
+        // Strip brackets for IPv6: [::1]:8080
+        let host = host_part
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host_part);
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        // No explicit port — use scheme default
+        let default_port = if url_str.starts_with("https://") {
+            443
+        } else {
+            80
+        };
+        Some((authority.to_string(), default_port))
+    }
 }
 
 impl ProxyConfig {
@@ -1309,6 +2137,8 @@ impl ProxyConfig {
         }
 
         config.source_path = Some(path.to_path_buf());
+        config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -1341,7 +2171,7 @@ impl ProxyConfig {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "mcp-proxy".to_string());
 
-        let config = Self {
+        let mut config = Self {
             proxy: ProxySettings {
                 name,
                 version: default_version(),
@@ -1352,11 +2182,27 @@ impl ProxyConfig {
                 },
                 instructions: None,
                 shutdown_timeout_seconds: default_shutdown_timeout(),
+                shutdown_kill_timeout_secs: default_shutdown_kill_timeout(),
+                force_kill: false,
                 hot_reload: false,
                 import_backends: None,
                 rate_limit: None,
+                client_rate_limit: None,
                 tool_discovery: false,
                 tool_exposure: ToolExposure::default(),
+                expose_grouped_in_default: true,
+                endpoint_groups: Vec::new(),
+                tool_groups: Vec::new(),
+                backend_env: std::collections::HashMap::new(),
+                timeout: None,
+                circuit_breaker: None,
+                retry: None,
+                endpoint_group_list: Vec::new(),
+                watchers: default_watchers(),
+                protocol_support: ProtocolSupportConfig::default(),
+                default_spawn_mode: SpawnMode::Eager,
+                default_idle_timeout_secs: None,
+                init_timeout: None,
             },
             backends,
             auth: None,
@@ -1365,9 +2211,11 @@ impl ProxyConfig {
             cache: CacheBackendConfig::default(),
             observability: ObservabilityConfig::default(),
             composite_tools: Vec::new(),
+            warm_cache: WarmCacheConfig::default(),
             source_path: Some(path.to_path_buf()),
         };
 
+        config.expand_endpoint_group_list();
         config.validate()?;
         Ok(config)
     }
@@ -1394,7 +2242,9 @@ impl ProxyConfig {
     /// assert_eq!(config.backends.len(), 1);
     /// ```
     pub fn parse(toml: &str) -> Result<Self> {
-        let config: Self = toml::from_str(toml).context("parsing config")?;
+        let mut config: Self = toml::from_str(toml).context("parsing config")?;
+        config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -1422,7 +2272,9 @@ impl ProxyConfig {
     /// ```
     #[cfg(feature = "yaml")]
     pub fn parse_yaml(yaml: &str) -> Result<Self> {
-        let config: Self = yaml_serde::from_str(yaml).context("parsing YAML config")?;
+        let mut config: Self = yaml_serde::from_str(yaml).context("parsing YAML config")?;
+        config.expand_endpoint_group_list();
+        config.apply_global_defaults();
         config.validate()?;
         Ok(config)
     }
@@ -1667,6 +2519,23 @@ impl ProxyConfig {
                     backend.name
                 );
             }
+
+            // Singleton policy: an externally-managed backend must carry a
+            // non-empty advisory stop hint so spawn-conflict errors can tell
+            // the operator how to stop the foreign daemon. The hint is
+            // advisory only — the proxy never kills foreign daemons,
+            // regardless of force_kill.
+            if backend.singleton_externally_managed
+                && backend
+                    .singleton_stop_hint
+                    .as_deref()
+                    .is_none_or(|hint| hint.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "backend '{}': singleton_stop_hint must be non-empty when singleton_externally_managed is true",
+                    backend.name
+                );
+            }
         }
 
         // Validate mirror_of references
@@ -1730,6 +2599,36 @@ impl ProxyConfig {
                 }
                 if !composite_names.insert(&ct.name) {
                     anyhow::bail!("duplicate composite_tools name '{}'", ct.name);
+                }
+            }
+        }
+
+        // Check for self-referencing HTTP backends (connection loop detection)
+        {
+            let listen_host = &self.proxy.listen.host;
+            let listen_port = self.proxy.listen.port;
+            // Normalize the listen address for comparison
+            let listen_addr = normalize_addr(listen_host, listen_port);
+
+            for backend in &self.backends {
+                if backend.transport != TransportType::Http {
+                    continue;
+                }
+                if let Some((url_str, Some((host, port)))) =
+                    backend.url.as_ref().map(|u| (u, parse_host_port(u)))
+                {
+                    let backend_addr = normalize_addr(&host, port);
+                    if backend_addr == listen_addr {
+                        anyhow::bail!(
+                            "backend '{}' has URL '{}' which points to the proxy's own \
+                             listen address {}:{} — this creates a connection loop. \
+                             Use the actual backend server URL instead.",
+                            backend.name,
+                            url_str,
+                            listen_host,
+                            listen_port
+                        );
+                    }
                 }
             }
         }
@@ -1828,6 +2727,21 @@ impl ProxyConfig {
                     }
                 }
             }
+        }
+
+        // Warn when all backends are lazy and warm cache is disabled — tools/list
+        // will return empty until backends are spawned on demand.
+        let all_lazy = !self.backends.is_empty()
+            && self
+                .backends
+                .iter()
+                .all(|b| b.spawn_mode == SpawnMode::Lazy);
+        if all_lazy && !self.warm_cache.enabled {
+            tracing::warn!(
+                "all backends are lazy but warm_cache is disabled — \
+                 tools/list will return empty until backends are spawned on demand. \
+                 Enable warm_cache to serve cached capabilities at startup."
+            );
         }
 
         Ok(())
@@ -2057,6 +2971,81 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_support_config_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [proxy.protocol_support]
+        versions = ["2026-07-28", "2025-11-25"]
+        default_protocol_version = "2026-07-28"
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(
+            config.proxy.protocol_support.versions,
+            vec!["2026-07-28", "2025-11-25"]
+        );
+        assert_eq!(
+            config
+                .proxy
+                .protocol_support
+                .default_protocol_version
+                .as_deref(),
+            Some("2026-07-28")
+        );
+    }
+
+    #[test]
+    fn test_protocol_support_config_empty_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.proxy.protocol_support.versions.is_empty());
+        assert!(
+            config
+                .proxy
+                .protocol_support
+                .default_protocol_version
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_backend_protocol_version() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        port = 9090
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://localhost:8080"
+        protocol_version = "2026-07-28"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(
+            config.backends[0].protocol_version.as_deref(),
+            Some("2026-07-28")
+        );
+    }
+
+    #[test]
     fn test_parse_full_config() {
         let toml = r#"
         [proxy]
@@ -2178,6 +3167,208 @@ mod tests {
     }
 
     #[test]
+    fn test_shutdown_kill_timeout_default() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 2); // default
+        assert!(!config.proxy.force_kill); // default
+    }
+
+    #[test]
+    fn test_force_kill_parses_from_toml() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        force_kill = true
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.proxy.force_kill);
+        // parse() calls apply_global_defaults(), which overrides to 0
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_shutdown_kill_timeout_custom() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        shutdown_kill_timeout_secs = 5
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 5);
+    }
+
+    #[test]
+    fn test_force_kill_overrides_timeout() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        shutdown_kill_timeout_secs = 5
+        force_kill = true
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert!(config.proxy.force_kill);
+        assert_eq!(config.proxy.shutdown_kill_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_backend_force_kill_default_false_and_or_semantics() {
+        use std::time::Duration;
+
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "echo"
+        transport = "stdio"
+        command = "echo"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let backend = &config.backends[0];
+        assert!(
+            !backend.force_kill,
+            "per-backend force_kill must default to false"
+        );
+        // Neither set: nonzero graceful timeout preserved.
+        assert_eq!(
+            backend.effective_kill_timeout(false, 2),
+            Duration::from_secs(2)
+        );
+        // Backend-only opt-in: ZERO (SIGKILL immediate).
+        let forced: BackendConfig = toml::from_str(
+            "name = \"echo\"\ntransport = \"stdio\"\ncommand = \"echo\"\nforce_kill = true\n",
+        )
+        .unwrap();
+        assert!(forced.effective_force_kill(false));
+        assert_eq!(forced.effective_kill_timeout(false, 2), Duration::ZERO);
+        // Global forces immediate kill for all backends (OR semantics).
+        assert!(backend.effective_force_kill(true));
+        assert_eq!(backend.effective_kill_timeout(true, 2), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_singleton_policy_defaults_off() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        let backend = &config.backends[0];
+        assert!(!backend.singleton_externally_managed);
+        assert!(backend.singleton_stop_hint.is_none());
+        assert!(backend.singleton_stop_hint_resolved().is_none());
+    }
+
+    #[test]
+    fn test_singleton_policy_parses_with_hint() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "codebase"
+        transport = "stdio"
+        command = "/usr/bin/codebase-memory-mcp"
+        singleton_externally_managed = true
+        singleton_stop_hint = "systemctl --user stop codebase-memory"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let backend = &config.backends[0];
+        assert!(backend.singleton_externally_managed);
+        assert_eq!(
+            backend.singleton_stop_hint_resolved(),
+            Some("systemctl --user stop codebase-memory")
+        );
+    }
+
+    #[test]
+    fn test_singleton_policy_rejects_empty_hint_when_managed() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "codebase"
+        transport = "stdio"
+        command = "/usr/bin/codebase-memory-mcp"
+        singleton_externally_managed = true
+        "#;
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("singleton_stop_hint"),
+            "expected singleton_stop_hint validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_singleton_policy_rejects_blank_hint_when_managed() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "codebase"
+        transport = "stdio"
+        command = "/usr/bin/codebase-memory-mcp"
+        singleton_externally_managed = true
+        singleton_stop_hint = "   "
+        "#;
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("singleton_stop_hint"),
+            "expected singleton_stop_hint validation error, got: {err}"
+        );
+        // Accessor treats blank hints as absent.
+        let backend: BackendConfig = toml::from_str(
+            r#"
+            name = "codebase"
+            transport = "stdio"
+            command = "/usr/bin/codebase-memory-mcp"
+            singleton_externally_managed = true
+            singleton_stop_hint = "   "
+            "#,
+        )
+        .unwrap();
+        assert!(backend.singleton_stop_hint_resolved().is_none());
+    }
+
+    #[test]
+    fn test_singleton_policy_hint_ignored_when_not_managed() {
+        // A hint on a proxy-owned backend is harmless but never surfaced:
+        // the accessor returns None unless the flag is set.
+        let backend: BackendConfig = toml::from_str(
+            r#"
+            name = "echo"
+            transport = "stdio"
+            command = "echo"
+            singleton_stop_hint = "systemctl --user stop echo"
+            "#,
+        )
+        .unwrap();
+        assert!(!backend.singleton_externally_managed);
+        assert!(backend.singleton_stop_hint_resolved().is_none());
+    }
+
+    #[test]
     fn test_parse_bearer_auth() {
         let toml = r#"
         [proxy]
@@ -2257,6 +3448,96 @@ mod tests {
             }
             other => panic!("expected Jwt auth, got: {:?}", other),
         }
+    }
+
+    // ========================================================================
+    // Self-referencing HTTP backend validation
+    // ========================================================================
+
+    #[test]
+    fn test_reject_self_referencing_http_backend() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://127.0.0.1:3300/mcp"
+        "#;
+
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connection loop") || msg.contains("own listen address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_localhost_self_reference() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 8080
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://localhost:8080/mcp"
+        "#;
+
+        let err = ProxyConfig::parse(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connection loop") || msg.contains("own listen address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_allow_different_port() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://127.0.0.1:8080/mcp"
+        "#;
+
+        // Should parse and validate successfully
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.backends[0].name, "remote");
+    }
+
+    #[test]
+    fn test_allow_external_url() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "external"
+        transport = "http"
+        url = "https://api.example.com/mcp"
+        "#;
+
+        // Should parse and validate successfully
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.backends[0].name, "external");
     }
 
     // ========================================================================
@@ -2640,6 +3921,7 @@ mod tests {
         [proxy]
         name = "od-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "flaky"
@@ -2670,6 +3952,7 @@ mod tests {
         [proxy]
         name = "od-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "flaky"
@@ -2696,6 +3979,7 @@ mod tests {
         [proxy]
         name = "mirror-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -2722,6 +4006,7 @@ mod tests {
         [proxy]
         name = "mirror-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -2839,6 +4124,7 @@ mod tests {
         [proxy]
         name = "hedge-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -2865,6 +4151,7 @@ mod tests {
         [proxy]
         name = "hedge-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -2936,12 +4223,116 @@ mod tests {
         assert!(!filter.tool_filter.allows("write"));
     }
 
+    // ========================================================================
+    // Endpoint group shorthand expansion
+    // ========================================================================
+
+    #[test]
+    fn test_endpoint_group_list_expands_to_groups() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        endpoint_group_list = ["os", "web"]
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+
+        [[backends]]
+        name = "browser"
+        transport = "http"
+        url = "http://localhost:9222"
+        "#;
+
+        let config = ProxyConfig::parse(toml).unwrap();
+        // Shorthand expansion should create 2 endpoint groups
+        assert_eq!(config.proxy.endpoint_groups.len(), 2);
+
+        let os_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "os")
+            .unwrap();
+        assert_eq!(os_group.path, "/os");
+        // Shorthand groups have empty backends — membership is via reverse
+        // references (backends with endpoint_groups = ["os"] in their config).
+        assert!(os_group.backends.is_empty());
+
+        let web_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "web")
+            .unwrap();
+        assert_eq!(web_group.path, "/web");
+        assert!(web_group.backends.is_empty());
+    }
+
+    #[test]
+    fn test_endpoint_group_list_merges_with_explicit_groups() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        endpoint_group_list = ["os", "web"]
+        [proxy.listen]
+
+        [[proxy.endpoint_groups]]
+        name = "os"
+        path = "/custom-os"
+        backends = ["files"]
+        description = "Custom OS group"
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+
+        [[backends]]
+        name = "browser"
+        transport = "http"
+        url = "http://localhost:9222"
+        "#;
+
+        let config = ProxyConfig::parse(toml).unwrap();
+        // Explicit "os" should override the shorthand "os"
+        let os_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "os")
+            .unwrap();
+        assert_eq!(os_group.path, "/custom-os");
+        assert_eq!(os_group.backends, vec!["files"]);
+        assert_eq!(os_group.description.as_deref(), Some("Custom OS group"));
+
+        // Shorthand "web" should still be present (empty backends)
+        let web_group = config
+            .proxy
+            .endpoint_groups
+            .iter()
+            .find(|g| g.name == "web")
+            .unwrap();
+        assert_eq!(web_group.path, "/web");
+        assert!(web_group.backends.is_empty());
+    }
+
+    #[test]
+    fn test_endpoint_group_list_empty_is_noop() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        assert!(config.proxy.endpoint_group_list.is_empty());
+        assert!(config.proxy.endpoint_groups.is_empty());
+    }
+
     #[test]
     fn test_parse_inject_args() {
         let toml = r#"
         [proxy]
         name = "inject-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "db"
@@ -3265,6 +4656,7 @@ mod tests {
         [proxy]
         name = "override-gw"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3295,6 +4687,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3319,6 +4712,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3347,6 +4741,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -3372,6 +4767,7 @@ mod tests {
         [proxy]
         name = "bad"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "fs"
@@ -4152,7 +5548,9 @@ backends:
     #[test]
     fn yaml_file_extensions_load_through_the_config_loader() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "proxy: {name: yaml-file, listen: {}}\nbackends:\n  - {name: api, transport: http, url: 'http://localhost:8080'}\n";
+        // Port 9090: the default listen address is 127.0.0.1:8080, and a
+        // backend that points back at the proxy itself is rejected.
+        let content = "proxy: {name: yaml-file, listen: {}}\nbackends:\n  - {name: api, transport: http, url: 'http://localhost:9090'}\n";
         for extension in ["yaml", "yml"] {
             let path = dir.path().join(format!("proxy.{extension}"));
             std::fs::write(&path, content).unwrap();
@@ -4161,7 +5559,7 @@ backends:
             assert_eq!(config.source_path.as_ref(), Some(&path));
             assert_eq!(
                 config.backends[0].url.as_deref(),
-                Some("http://localhost:8080")
+                Some("http://localhost:9090")
             );
         }
     }
@@ -4289,5 +5687,401 @@ backends:
         assert_eq!(config.backends[0].priority, 0);
         assert_eq!(config.backends[1].priority, 10);
         assert_eq!(config.backends[2].priority, 5);
+    }
+
+    #[test]
+    fn test_compiled_pattern_literal_variant() {
+        // Plain string without wildcards → Literal
+        let p = CompiledPattern::compile("-").unwrap();
+        assert!(matches!(p, CompiledPattern::Literal(_)));
+        assert!(p.matches("set-prop"));
+        assert!(p.matches("a-b-c"));
+        assert!(!p.matches("nodash"));
+    }
+
+    #[test]
+    fn test_compiled_pattern_glob_variant() {
+        // String with * → Glob
+        let p = CompiledPattern::compile("read_*").unwrap();
+        assert!(matches!(p, CompiledPattern::Glob(_)));
+        assert!(p.matches("read_file"));
+        assert!(!p.matches("write_file"));
+    }
+
+    #[test]
+    fn test_compiled_pattern_regex_variant() {
+        // String with re: prefix → Regex
+        let p = CompiledPattern::compile("re:^list_.*$").unwrap();
+        assert!(matches!(p, CompiledPattern::Regex(_)));
+        assert!(p.matches("list_users"));
+        assert!(!p.matches("get_users"));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_defaults() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, 10);
+        assert_eq!(http.timeout_secs, 30);
+        assert_eq!(http.pool_idle_timeout_secs, 90);
+        assert!(http.pool_max_idle_per_host.is_none());
+        assert!(!http.danger_accept_invalid_certs);
+        assert!(http.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_all_fields() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        connect_timeout_secs = 5
+        timeout_secs = 60
+        pool_idle_timeout_secs = 120
+        pool_max_idle_per_host = 4
+        danger_accept_invalid_certs = true
+        user_agent = "mcp-proxy/1.0"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, 5);
+        assert_eq!(http.timeout_secs, 60);
+        assert_eq!(http.pool_idle_timeout_secs, 120);
+        assert_eq!(http.pool_max_idle_per_host, Some(4));
+        assert!(http.danger_accept_invalid_certs);
+        assert_eq!(http.user_agent.as_deref(), Some("mcp-proxy/1.0"));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_absent_means_none() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert!(config.backends[0].http.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_partial_fields() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        timeout_secs = 10
+        danger_accept_invalid_certs = true
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+        // Specified fields
+        assert_eq!(http.timeout_secs, 10);
+        assert!(http.danger_accept_invalid_certs);
+        // Absent fields use defaults
+        assert_eq!(http.connect_timeout_secs, 10);
+        assert_eq!(http.pool_idle_timeout_secs, 90);
+        assert!(http.pool_max_idle_per_host.is_none());
+        assert!(http.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_backend_http_client_config_from_into_reqwest_client_builder() {
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 5,
+            timeout_secs: 60,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(4),
+            danger_accept_invalid_certs: true,
+            user_agent: Some("test-agent".to_string()),
+        };
+        let builder: reqwest::ClientBuilder = (&cfg).into();
+        // Verify the builder produces a valid client without panic
+        let client = builder.build().expect("reqwest client should build");
+        // Verify the client can send (basic connectivity check)
+        let _ = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_backend_http_client_config_from_into_http_client_config() {
+        use std::time::Duration;
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 5,
+            timeout_secs: 60,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(4),
+            danger_accept_invalid_certs: true,
+            user_agent: Some("test-agent".to_string()),
+        };
+        let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+        assert_eq!(hc.request_timeout, Duration::from_secs(60));
+        // Fields not mapped should retain defaults
+        assert!(hc.auto_sse);
+        assert!(hc.session_recovery);
+    }
+
+    #[test]
+    fn test_backend_http_client_config_toml_roundtrip() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        [backends.http]
+        connect_timeout_secs = 5
+        timeout_secs = 60
+        pool_idle_timeout_secs = 120
+        pool_max_idle_per_host = 4
+        danger_accept_invalid_certs = true
+        user_agent = "mcp-proxy/1.0"
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        let http = config.backends[0].http.as_ref().unwrap();
+
+        // Roundtrip: serialize back to TOML and parse again
+        let serialized = toml::to_string(&config).expect("serialize");
+        let config2 = ProxyConfig::parse(&serialized).expect("parse roundtrip");
+        let http2 = config2.backends[0].http.as_ref().unwrap();
+        assert_eq!(http.connect_timeout_secs, http2.connect_timeout_secs);
+        assert_eq!(http.timeout_secs, http2.timeout_secs);
+        assert_eq!(http.pool_idle_timeout_secs, http2.pool_idle_timeout_secs);
+        assert_eq!(http.pool_max_idle_per_host, http2.pool_max_idle_per_host);
+        assert_eq!(
+            http.danger_accept_invalid_certs,
+            http2.danger_accept_invalid_certs
+        );
+        assert_eq!(http.user_agent, http2.user_agent);
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK005: apply_global_defaults / init_timeout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_init_timeout_stdio() {
+        let d = default_init_timeout(&TransportType::Stdio);
+        assert_eq!(d, Some(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_default_init_timeout_http() {
+        assert!(default_init_timeout(&TransportType::Http).is_none());
+    }
+
+    #[test]
+    fn test_default_init_timeout_websocket() {
+        assert!(default_init_timeout(&TransportType::Websocket).is_none());
+    }
+
+    #[test]
+    fn test_apply_global_defaults_stdio_gets_transport_default() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(30));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_http_gets_none() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "api"
+        transport = "http"
+        url = "http://localhost:9000"
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert!(config.backends[0].init_timeout.is_none());
+    }
+
+    #[test]
+    fn test_apply_global_defaults_global_overrides_transport_default() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 10
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(10));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_per_backend_overrides_global() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 10
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 5
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(5));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_no_global_no_per_backend_stdio() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(30));
+    }
+
+    #[test]
+    fn test_apply_global_defaults_multiple_backends_independent() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 7
+        [proxy.listen]
+
+        [[backends]]
+        name = "stdio-be"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+
+        [[backends]]
+        name = "http-be"
+        transport = "http"
+        url = "http://localhost:9000"
+
+        [[backends]]
+        name = "stdio-custom"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 3
+        "#;
+        let mut config = ProxyConfig::parse(toml).unwrap();
+        config.apply_global_defaults();
+        assert_eq!(config.backends[0].init_timeout, Some(7));
+        assert_eq!(config.backends[1].init_timeout, Some(7));
+        assert_eq!(config.backends[2].init_timeout, Some(3));
+    }
+
+    #[test]
+    fn test_init_timeout_toml_parsing() {
+        let toml = r#"
+        [proxy]
+        name = "test"
+        init_timeout = 15
+        [proxy.listen]
+
+        [[backends]]
+        name = "files"
+        transport = "stdio"
+        command = "echo"
+        args = ["hello"]
+        init_timeout = 5
+        "#;
+        let config = ProxyConfig::parse(toml).unwrap();
+        assert_eq!(config.proxy.init_timeout, Some(15));
+        assert_eq!(config.backends[0].init_timeout, Some(5));
+    }
+
+    #[test]
+    fn test_http_client_config_applied_to_builder() {
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 3,
+            timeout_secs: 15,
+            pool_idle_timeout_secs: 60,
+            pool_max_idle_per_host: Some(2),
+            danger_accept_invalid_certs: false,
+            user_agent: Some("test-agent/2.0".to_string()),
+        };
+        let builder: reqwest::ClientBuilder = (&cfg).into();
+        let client = builder.build().expect("reqwest client should build");
+        let _ = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_http_client_config_to_tower_mcp_config() {
+        use std::time::Duration;
+        let cfg = BackendHttpClientConfig {
+            connect_timeout_secs: 2,
+            timeout_secs: 45,
+            pool_idle_timeout_secs: 120,
+            pool_max_idle_per_host: Some(8),
+            danger_accept_invalid_certs: false,
+            user_agent: Some("mcp-proxy/3.0".to_string()),
+        };
+        let hc: tower_mcp::client::HttpClientConfig = (&cfg).into();
+        assert_eq!(hc.request_timeout, Duration::from_secs(45));
+        assert!(hc.auto_sse);
+        assert!(hc.session_recovery);
     }
 }

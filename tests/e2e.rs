@@ -21,10 +21,17 @@ use mcp_proxy::alias::{AliasMap, AliasService};
 use mcp_proxy::cache::CacheService;
 use mcp_proxy::config::{
     BackendCacheConfig, BackendFilter, CacheBackendConfig, InjectArgsConfig, NameFilter,
+    PerformanceConfig, ProtocolSupportConfig, ProxyConfig, SecurityConfig, WarmCacheConfig,
 };
+use mcp_proxy::discover::DiscoverLayer;
 use mcp_proxy::filter::CapabilityFilterService;
 use mcp_proxy::inject::{InjectArgsService, InjectionRules};
 use mcp_proxy::validation::{ValidationConfig, ValidationService};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use tower::Layer;
+use tower_mcp::client::HttpClientTransport;
+use tower_mcp_types::protocol::{Implementation, RequestMeta};
 
 // ---------------------------------------------------------------------------
 // Test backend routers
@@ -120,7 +127,9 @@ fn slow_router() -> McpRouter {
 // Test helpers
 // ---------------------------------------------------------------------------
 
-async fn build_proxy() -> McpProxy {
+/// Build a bare test proxy without Discover middleware.
+/// Use this for tests that need to call add_backend() dynamically.
+async fn build_bare_proxy() -> McpProxy {
     McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
@@ -132,8 +141,71 @@ async fn build_proxy() -> McpProxy {
         .expect("proxy should build")
 }
 
-async fn build_proxy_with_error_backend() -> McpProxy {
-    McpProxy::builder("test-proxy", "1.0.0")
+/// Build a test proxy with the Discover middleware wrapped around it.
+/// This simulates the full middleware stack used in production.
+async fn build_proxy() -> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    // Wrap with Discover middleware (same as production middleware stack)
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support,
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
+}
+
+async fn build_proxy_with_error_backend()
+-> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
         .await
@@ -141,11 +213,59 @@ async fn build_proxy_with_error_backend() -> McpProxy {
         .await
         .build_strict()
         .await
-        .expect("proxy should build")
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support,
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
 }
 
-async fn build_proxy_with_slow_backend() -> McpProxy {
-    McpProxy::builder("test-proxy", "1.0.0")
+async fn build_proxy_with_slow_backend()
+-> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
         .separator("/")
         .backend("math", ChannelTransport::new(math_router()))
         .await
@@ -153,7 +273,54 @@ async fn build_proxy_with_slow_backend() -> McpProxy {
         .await
         .build_strict()
         .await
-        .expect("proxy should build")
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig::default();
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support,
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
 }
 
 async fn call<S>(svc: &mut S, request: McpRequest) -> RouterResponse
@@ -177,6 +344,38 @@ fn tool_call(name: &str, args: serde_json::Value) -> McpRequest {
         meta: None,
         task: None,
     })
+}
+
+/// Helper: build a RouterRequest with optional RequestMeta in extensions.
+fn request_with_meta(inner: McpRequest, meta: Option<RequestMeta>) -> RouterRequest {
+    let mut extensions = Extensions::new();
+    if let Some(m) = meta {
+        extensions.insert(m);
+    }
+    RouterRequest {
+        id: RequestId::Number(1),
+        inner,
+        extensions,
+    }
+}
+
+/// Helper: create a standard 2026-07-28 RequestMeta.
+fn meta_2026() -> RequestMeta {
+    RequestMeta {
+        progress_token: None,
+        protocol_version: Some("2026-07-28".into()),
+        client_info: Some(Implementation {
+            name: "test-client".into(),
+            version: "1.0.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: Some(tower_mcp_types::protocol::ClientCapabilities::default()),
+        log_level: None,
+    }
 }
 
 fn get_tool_names(resp: &RouterResponse) -> Vec<String> {
@@ -250,6 +449,39 @@ async fn e2e_ping_succeeds() {
     match resp.inner.unwrap() {
         McpResponse::Pong(_) => {}
         other => panic!("expected Pong, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn e2e_discover_returns_capabilities() {
+    let mut proxy = build_proxy().await;
+    let resp = call(
+        &mut proxy,
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+    )
+    .await;
+    eprintln!("Discover response: {:?}", resp);
+    assert!(resp.inner.is_ok());
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            // Verify supported_versions includes 2026-07-28
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "should support 2026-07-28, got: {:?}",
+                result.supported_versions
+            );
+            // Verify capabilities are present
+            assert!(
+                result.capabilities.tools.is_some(),
+                "should have tools capability"
+            );
+            // Verify instructions are present (optional but good to check)
+            assert!(
+                result.instructions.is_some() || result.instructions.is_none(),
+                "instructions field exists"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
     }
 }
 
@@ -371,14 +603,17 @@ async fn e2e_filter_allowlist_only_permits_listed_tools() {
 #[tokio::test]
 async fn e2e_alias_renames_in_list_and_call() {
     let proxy = build_proxy().await;
-    let aliases = AliasMap::new(vec![
-        ("math/".to_string(), "add".to_string(), "sum".to_string()),
-        (
-            "text/".to_string(),
-            "upper".to_string(),
-            "uppercase".to_string(),
-        ),
-    ])
+    let aliases = AliasMap::new(
+        vec![
+            ("math/".to_string(), "add".to_string(), "sum".to_string()),
+            (
+                "text/".to_string(),
+                "upper".to_string(),
+                "uppercase".to_string(),
+            ),
+        ],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(proxy, aliases);
 
@@ -532,11 +767,10 @@ async fn e2e_full_stack_filter_alias_inject_validate() {
     let filtered = CapabilityFilterService::new(injected, filters);
 
     // Alias math/add -> math/sum
-    let aliases = AliasMap::new(vec![(
-        "math/".to_string(),
-        "add".to_string(),
-        "sum".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
     .unwrap();
     let aliased = AliasService::new(filtered, aliases);
 
@@ -728,7 +962,7 @@ async fn e2e_cache_uncached_namespace_is_not_cached() {
 
 #[tokio::test]
 async fn e2e_dynamic_add_backend_appears_in_tool_list() {
-    let mut proxy = build_proxy().await;
+    let mut proxy = build_bare_proxy().await;
 
     // Initially 4 tools
     let resp = call(&mut proxy, McpRequest::ListTools(Default::default())).await;
@@ -755,7 +989,7 @@ async fn e2e_dynamic_add_backend_appears_in_tool_list() {
 
 #[tokio::test]
 async fn e2e_dynamic_backend_is_callable() {
-    let mut proxy = build_proxy().await;
+    let mut proxy = build_bare_proxy().await;
 
     let extra_router = McpRouter::new().server_info("extra", "1.0.0").tool(
         ToolBuilder::new("ping")
@@ -943,6 +1177,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "primary"
@@ -966,6 +1201,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "primary"
@@ -1079,6 +1315,7 @@ mod config_tests {
         [proxy]
         name = "test"
         [proxy.listen]
+        port = 9090
 
         [[backends]]
         name = "api"
@@ -1334,11 +1571,14 @@ async fn e2e_alias_then_filter_uses_original_names_for_filter() {
     let filtered = CapabilityFilterService::new(proxy, filters);
 
     // Alias text/upper -> text/shout (filter is inner, alias is outer)
-    let aliases = AliasMap::new(vec![(
-        "text/".to_string(),
-        "upper".to_string(),
-        "shout".to_string(),
-    )])
+    let aliases = AliasMap::new(
+        vec![(
+            "text/".to_string(),
+            "upper".to_string(),
+            "shout".to_string(),
+        )],
+        vec![],
+    )
     .unwrap();
     let mut svc = AliasService::new(filtered, aliases);
 
@@ -1737,7 +1977,7 @@ mod tool_discovery {
     use tower_mcp::protocol::{CallToolParams, ListToolsParams, McpRequest, RequestId};
     use tower_mcp::router::{Extensions, RouterRequest, RouterResponse};
 
-    use super::{build_proxy, get_tool_names, get_tool_result_text};
+    use super::{build_bare_proxy, get_tool_names, get_tool_result_text};
     use std::convert::Infallible;
 
     async fn call<S>(svc: &mut S, request: McpRequest) -> RouterResponse
@@ -1754,7 +1994,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_index_and_search() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build the discovery index
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -1795,7 +2035,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_search_finds_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
         let discovery_tools = mcp_proxy::discovery::build_discovery_tools(index);
@@ -1833,7 +2073,7 @@ mod tool_discovery {
 
     #[tokio::test]
     async fn e2e_discovery_categories() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
         let discovery_tools = mcp_proxy::discovery::build_discovery_tools(index);
@@ -1878,7 +2118,7 @@ mod search_mode {
     use tower_mcp::protocol::{CallToolParams, ListToolsParams, McpRequest, RequestId};
     use tower_mcp::router::{Extensions, RouterRequest, RouterResponse};
 
-    use super::{build_proxy, get_tool_names, get_tool_result_text};
+    use super::{build_bare_proxy, build_proxy, get_tool_names, get_tool_result_text};
     use mcp_proxy::filter::SearchModeFilterService;
     use std::convert::Infallible;
     use tower::util::BoxCloneService;
@@ -1897,7 +2137,7 @@ mod search_mode {
 
     #[tokio::test]
     async fn e2e_search_mode_hides_backend_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build discovery index and register proxy/ namespace tools
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -1975,7 +2215,7 @@ mod search_mode {
 
     #[tokio::test]
     async fn e2e_search_mode_search_finds_hidden_tools() {
-        let mut proxy = build_proxy().await;
+        let mut proxy = build_bare_proxy().await;
 
         // Build discovery index (indexes math/add, text/echo, etc.)
         let index = mcp_proxy::discovery::build_index(&mut proxy, "/").await;
@@ -2014,4 +2254,842 @@ mod search_mode {
             "search should find hidden 'add' tool: {text}"
         );
     }
+}
+
+// ===========================================================================
+// Wave 5: MCP 2026-07-28 E2E Tests (T5.2, T5.5)
+// ===========================================================================
+
+/// Helper: build a proxy with DiscoverLayer using custom protocol support config.
+async fn build_proxy_with_protocol(
+    versions: Vec<&str>,
+    instructions: Option<String>,
+) -> BoxCloneService<RouterRequest, RouterResponse, Infallible> {
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig {
+        versions: versions.into_iter().map(String::from).collect(),
+        default_protocol_version: None,
+    };
+    let service = BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support,
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+    BoxCloneService::new(DiscoverLayer::new(&config).layer(service))
+}
+
+// --- T5.2: Full proxy pipeline with 2026-07-28 stateless requests ---
+
+#[tokio::test]
+async fn test_e2e_2026_list_tools_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/add".to_string()),
+        "should find math/add: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"text/echo".to_string()),
+        "should find text/echo: {:?}",
+        names
+    );
+    assert_eq!(names.len(), 4, "should have 4 tools total: {:?}", names);
+}
+
+#[tokio::test]
+async fn test_e2e_2026_call_tool_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "30");
+}
+
+#[tokio::test]
+async fn test_e2e_2026_ping_stateless() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+    let req = request_with_meta(McpRequest::Ping, Some(meta_2026()));
+    let resp = proxy.call(req).await.expect("infallible");
+    assert!(resp.inner.is_ok());
+}
+
+#[tokio::test]
+async fn test_e2e_2026_discover_returns_all_versions() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2026-07-28"),
+                "should include 2026-07-28"
+            );
+            assert!(
+                result.supported_versions.iter().any(|v| v == "2025-11-25"),
+                "should include 2025-11-25"
+            );
+            assert!(
+                result.capabilities.tools.is_some(),
+                "should have tools capability"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_2026_discover_with_instructions() {
+    let mut proxy = build_proxy_with_protocol(
+        vec!["2026-07-28"],
+        Some("Be helpful and concise.".to_string()),
+    )
+    .await;
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert_eq!(
+                result.instructions.as_deref(),
+                Some("Be helpful and concise."),
+                "should include instructions"
+            );
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_2026_no_session_required() {
+    // 2026-07-28 is stateless: multiple requests should work without session state
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28"], None).await;
+
+    // First request
+    let req1 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 1, "b": 2})),
+        Some(meta_2026()),
+    );
+    let resp1 = proxy.call(req1).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp1), "3");
+
+    // Second request (no session needed)
+    let req2 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 5, "b": 7})),
+        Some(meta_2026()),
+    );
+    let resp2 = proxy.call(req2).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp2), "12");
+
+    // Third request - list tools still works
+    let req3 = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp3 = proxy.call(req3).await.expect("infallible");
+    let names = get_tool_names(&resp3);
+    assert_eq!(names.len(), 4);
+}
+
+#[tokio::test]
+async fn test_e2e_2026_middleware_stack_works_stateless() {
+    // Verify the full middleware stack (Discover + alias) works
+    // with stateless 2026-07-28 requests
+    let mcp_proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("text", ChannelTransport::new(text_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let protocol_support = ProtocolSupportConfig {
+        versions: vec!["2026-07-28".into()],
+        default_protocol_version: None,
+    };
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(mcp_proxy);
+    let config = ProxyConfig {
+        proxy: mcp_proxy::config::ProxySettings {
+            name: "test-proxy".to_string(),
+            version: "1.0.0".to_string(),
+            separator: "/".to_string(),
+            listen: mcp_proxy::config::ListenConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            instructions: None,
+            shutdown_timeout_seconds: 30,
+            shutdown_kill_timeout_secs: 2,
+            force_kill: false,
+            hot_reload: false,
+            import_backends: None,
+            rate_limit: None,
+            client_rate_limit: None,
+            tool_discovery: false,
+            tool_exposure: mcp_proxy::config::ToolExposure::default(),
+            expose_grouped_in_default: false,
+            endpoint_groups: vec![],
+            tool_groups: vec![],
+            watchers: vec![],
+            backend_env: std::collections::HashMap::new(),
+            timeout: None,
+            circuit_breaker: None,
+            retry: None,
+            endpoint_group_list: vec![],
+            protocol_support,
+            default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
+            default_idle_timeout_secs: None,
+            init_timeout: None,
+        },
+        backends: vec![],
+        auth: None,
+        performance: PerformanceConfig::default(),
+        security: SecurityConfig::default(),
+        cache: CacheBackendConfig::default(),
+        composite_tools: vec![],
+        warm_cache: WarmCacheConfig::default(),
+        source_path: None,
+        observability: mcp_proxy::config::ObservabilityConfig::default(),
+    };
+
+    // Apply alias layer: rename math/add → math/sum
+    let aliases = AliasMap::new(
+        vec![("math/".to_string(), "add".to_string(), "sum".to_string())],
+        vec![],
+    )
+    .expect("alias map");
+    let svc = AliasService::new(service.clone(), aliases);
+    let svc = DiscoverLayer::new(&config).layer(svc);
+    let mut svc = BoxCloneService::new(svc);
+
+    // List tools with 2026-07-28 meta shows aliased name
+    let req = request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp = svc.call(req).await.expect("infallible");
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/sum".to_string()),
+        "aliased name: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"math/add".to_string()),
+        "original hidden: {:?}",
+        names
+    );
+
+    // Call tool via alias also works
+    let req = request_with_meta(
+        tool_call("math/sum", serde_json::json!({"a": 3, "b": 4})),
+        Some(meta_2026()),
+    );
+    let resp = svc.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "7");
+}
+
+// --- T5.5: Mixed protocol versions ---
+
+#[tokio::test]
+async fn test_e2e_mixed_2026_and_2025_requests() {
+    // Simulate a proxy that serves both 2026-07-28 and 2025-11-25 clients
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+
+    // 2026-07-28 client with meta
+    let req_2026 = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+        Some(meta_2026()),
+    );
+    let resp_2026 = proxy.call(req_2026).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp_2026), "30");
+
+    // 2025-11-25 client without meta
+    let req_2025 = request_with_meta(
+        tool_call("text/echo", serde_json::json!({"message": "hello"})),
+        None,
+    );
+    let resp_2025 = proxy.call(req_2025).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp_2025), "hello");
+
+    // Both should see the same tool list
+    let req_list_2026 =
+        request_with_meta(McpRequest::ListTools(Default::default()), Some(meta_2026()));
+    let resp_list_2026 = proxy.call(req_list_2026).await.expect("infallible");
+    let names_2026 = get_tool_names(&resp_list_2026);
+
+    let req_list_2025 = request_with_meta(McpRequest::ListTools(Default::default()), None);
+    let resp_list_2025 = proxy.call(req_list_2025).await.expect("infallible");
+    let names_2025 = get_tool_names(&resp_list_2025);
+
+    assert_eq!(
+        names_2026, names_2025,
+        "both protocol versions should see same tools"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_mixed_discover_returns_all_versions() {
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+
+    // Discover from a 2026-07-28 client
+    let req = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        Some(meta_2026()),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    match resp.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(result.supported_versions.iter().any(|v| v == "2026-07-28"));
+            assert!(result.supported_versions.iter().any(|v| v == "2025-11-25"));
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+
+    // Discover from a legacy client (no meta)
+    let req2 = request_with_meta(
+        McpRequest::Discover(tower_mcp::protocol::DiscoverParams { meta: None }),
+        None,
+    );
+    let resp2 = proxy.call(req2).await.expect("infallible");
+    match resp2.inner.unwrap() {
+        McpResponse::Discover(result) => {
+            assert!(result.supported_versions.iter().any(|v| v == "2026-07-28"));
+            assert!(result.supported_versions.iter().any(|v| v == "2025-11-25"));
+        }
+        other => panic!("expected Discover, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_mixed_partial_meta_on_2025_request() {
+    // A 2025-11-25 client might send _meta with only some fields
+    let mut proxy = build_proxy_with_protocol(vec!["2026-07-28", "2025-11-25"], None).await;
+    let meta = RequestMeta {
+        protocol_version: Some("2025-11-25".into()),
+        client_info: Some(Implementation {
+            name: "legacy-client".into(),
+            version: "0.9.0".into(),
+            title: None,
+            description: None,
+            icons: None,
+            website_url: None,
+            meta: None,
+        }),
+        client_capabilities: None, // Not required for 2025
+        progress_token: None,
+        log_level: None,
+    };
+    let req = request_with_meta(
+        tool_call("math/add", serde_json::json!({"a": 3, "b": 7})),
+        Some(meta),
+    );
+    let resp = proxy.call(req).await.expect("infallible");
+    assert_eq!(get_tool_result_text(&resp), "10");
+}
+
+// ===========================================================================
+// Tier 15: Unreachable / failing backend resilience
+// ===========================================================================
+
+/// Start an HTTP MCP server on a random port and return (addr, handle).
+/// This is a real HTTP MCP server that the proxy can connect to as a backend.
+async fn start_http_mcp_server(router: McpRouter) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(router);
+    let (axum_router, _session_handle) =
+        tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, axum_router).await.ok();
+    });
+    (addr, handle)
+}
+
+/// Start an HTTP proxy server (McpProxy wrapped in HTTP transport) and return
+/// (addr, handle).
+async fn start_http_proxy(proxy: McpProxy) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(proxy);
+    let (router, _session_handle) =
+        tower_mcp::transport::http::HttpTransport::from_service(service).into_router_with_handle();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    (addr, handle)
+}
+
+/// An MCP backend whose handler returns a JSON-RPC error on every call.
+fn always_fail_router() -> McpRouter {
+    let fail = ToolBuilder::new("fail")
+        .description("Always fails")
+        .handler(
+            |_: tower_mcp::NoParams| async move { Ok(CallToolResult::error("backend exploded")) },
+        )
+        .build();
+
+    McpRouter::new()
+        .server_info("fail-server", "1.0.0")
+        .tool(fail)
+}
+
+/// Test 1: When an HTTP backend goes down after proxy startup, requests to that
+/// backend's namespace return a JSON-RPC error (not a panic or crash).
+///
+/// This is the exact scenario from the user's reported error:
+/// proxy starts with reachable backend → backend goes down → client gets
+/// "connection refused" wrapped in a JSON-RPC error.
+#[tokio::test]
+async fn test_http_backend_unreachable_returns_error() {
+    // Step 1: Start a real HTTP MCP backend.
+    let (backend_addr, backend_handle) = start_http_mcp_server(math_router()).await;
+
+    // Step 2: Start a proxy with the HTTP backend pointing at the running server.
+    let backend_url = format!("http://{}", backend_addr);
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("remote", HttpClientTransport::new(&backend_url))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build with reachable backend");
+
+    let (proxy_addr, proxy_handle) = start_http_proxy(proxy).await;
+
+    // Step 3: Kill the backend — simulate it going down.
+    backend_handle.abort();
+    // Give the OS a moment to release the port.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 4: Send a request through the proxy to the now-dead backend.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "remote/add",
+                    "arguments": { "a": 1, "b": 2 }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("request should reach the proxy");
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    // MCP transport returns 200; errors go in the JSON-RPC error field.
+    assert_eq!(status, 200, "HTTP status should be 200: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("error").is_some(),
+        "response should contain JSON-RPC error when backend is unreachable: {body}"
+    );
+
+    let error_msg = json["error"]["message"].as_str().unwrap_or("");
+    assert!(!error_msg.is_empty(), "error message should not be empty");
+
+    proxy_handle.abort();
+}
+
+/// Test 2: When an HTTP backend goes down, the proxy stays alive and other
+/// backends continue to work.
+#[tokio::test]
+async fn test_http_backend_unreachable_does_not_crash_proxy() {
+    // Step 1: Start a real HTTP MCP backend (the "remote" one).
+    let (backend_addr, backend_handle) = start_http_mcp_server(math_router()).await;
+
+    // Step 2: Start a proxy with BOTH a channel backend AND the HTTP backend.
+    let backend_url = format!("http://{}", backend_addr);
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("local", ChannelTransport::new(text_router()))
+        .await
+        .backend("remote", HttpClientTransport::new(&backend_url))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let (proxy_addr, proxy_handle) = start_http_proxy(proxy).await;
+
+    // Verify both backends work while the HTTP backend is up.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Call local backend.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "hello" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("local backend request");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "hello");
+
+    // Step 3: Kill the HTTP backend.
+    backend_handle.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 4: Call the LOCAL backend again — it must still work.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "still alive" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("local backend should still work");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "still alive");
+
+    // Step 5: Call the DEAD backend — should return JSON-RPC error, not crash.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "remote/add",
+                    "arguments": { "a": 1, "b": 2 }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("dead backend request should reach proxy");
+    let body = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("error").is_some(),
+        "dead backend should return JSON-RPC error: {body}"
+    );
+
+    // Step 6: Call local one more time — proxy is still operational.
+    let resp = client
+        .post(format!("http://{}/", proxy_addr))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "local/echo",
+                    "arguments": { "message": "final check" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("final local backend check");
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["result"]["content"][0]["text"], "final check");
+
+    proxy_handle.abort();
+}
+
+/// Test 3: A stdio backend pointing at a non-existent binary must fail to
+/// start — the proxy either refuses to build or returns an error.
+#[tokio::test]
+async fn test_stdio_backend_spawn_failure_returns_error() {
+    let config = ProxyConfig::parse(
+        r#"
+        [proxy]
+        name = "test-proxy"
+        version = "1.0.0"
+        [proxy.listen]
+
+        [[backends]]
+        name = "bad"
+        transport = "stdio"
+        command = "/nonexistent/binary"
+        "#,
+    )
+    .expect("config should parse");
+
+    let result = mcp_proxy::Proxy::from_config(config).await;
+    assert!(
+        result.is_err(),
+        "Proxy::from_config should fail with a non-existent binary"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("nonexistent") || err_msg.contains("spawn") || err_msg.contains("backend"),
+        "error should mention the failed backend: {err_msg}"
+    );
+}
+
+/// Test 4: A backend that errors on request does not crash the proxy —
+/// subsequent requests still succeed.
+#[tokio::test]
+async fn test_proxy_survives_backend_failure_during_request() {
+    let proxy = McpProxy::builder("test-proxy", "1.0.0")
+        .separator("/")
+        .backend("math", ChannelTransport::new(math_router()))
+        .await
+        .backend("broken", ChannelTransport::new(always_fail_router()))
+        .await
+        .build_strict()
+        .await
+        .expect("proxy should build");
+
+    let service: BoxCloneService<RouterRequest, RouterResponse, Infallible> =
+        BoxCloneService::new(proxy);
+    let mut svc = service;
+
+    // First: call the broken backend — should return an error result.
+    let resp = call(&mut svc, tool_call("broken/fail", serde_json::json!({}))).await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => {
+            assert!(result.is_error, "broken backend should return error result");
+            assert!(
+                result.all_text().contains("backend exploded"),
+                "error text should be descriptive: {}",
+                result.all_text()
+            );
+        }
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+
+    // Second: call the GOOD backend — proxy must still be alive.
+    let resp = call(
+        &mut svc,
+        tool_call("math/add", serde_json::json!({"a": 10, "b": 20})),
+    )
+    .await;
+    assert_eq!(get_tool_result_text(&resp), "30");
+
+    // Third: call the broken backend again — still errors, no crash.
+    let resp = call(&mut svc, tool_call("broken/fail", serde_json::json!({}))).await;
+    match resp.inner.unwrap() {
+        McpResponse::CallTool(result) => {
+            assert!(result.is_error, "broken backend should error again");
+        }
+        other => panic!("expected CallTool, got: {:?}", other),
+    }
+
+    // Fourth: list tools — proxy still operational.
+    let resp = call(&mut svc, McpRequest::ListTools(Default::default())).await;
+    let names = get_tool_names(&resp);
+    assert!(
+        names.contains(&"math/add".to_string()),
+        "math/add should still be listed: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"broken/fail".to_string()),
+        "broken/fail should still be listed: {:?}",
+        names
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 16: Config validation — self-referencing HTTP backend rejection
+// ---------------------------------------------------------------------------
+
+/// A self-referencing HTTP backend (URL points to the proxy's own listen
+/// address) must be rejected at config validation time, NOT at runtime.
+/// This prevents the confusing "connection refused" error where the proxy
+/// tries to connect to itself as a backend.
+#[tokio::test]
+async fn test_self_referencing_http_backend_rejected_at_startup() {
+    // Proxy listens on 127.0.0.1:3300, backend points to the same address.
+    // ProxyConfig::parse() calls validate() which must catch this.
+    let toml = r#"
+        [proxy]
+        name = "test-self-ref"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "self_ref_backend"
+        transport = "http"
+        url = "http://127.0.0.1:3300/mcp"
+    "#;
+
+    let err = ProxyConfig::parse(toml).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("connection loop") || msg.contains("own listen address"),
+        "expected self-reference error, got: {msg}"
+    );
+}
+
+/// Verify that localhost ↔ 127.0.0.1 is normalized correctly.
+#[tokio::test]
+async fn test_localhost_self_reference_also_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-self-ref-localhost"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 8080
+
+        [[backends]]
+        name = "loopback"
+        transport = "http"
+        url = "http://localhost:8080/mcp"
+    "#;
+
+    let err = ProxyConfig::parse(toml).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("connection loop") || msg.contains("own listen address"),
+        "expected self-reference error for localhost, got: {msg}"
+    );
+}
+
+/// Different ports should NOT be rejected — only same host:port is a loop.
+#[tokio::test]
+async fn test_different_port_not_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-diff-port"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "remote"
+        transport = "http"
+        url = "http://127.0.0.1:9090/mcp"
+    "#;
+
+    let config = ProxyConfig::parse(toml).unwrap();
+    assert_eq!(config.backends[0].name, "remote");
+}
+
+/// External URLs must never be rejected.
+#[tokio::test]
+async fn test_external_url_not_rejected() {
+    let toml = r#"
+        [proxy]
+        name = "test-external"
+        version = "1.0.0"
+
+        [proxy.listen]
+        host = "127.0.0.1"
+        port = 3300
+
+        [[backends]]
+        name = "external"
+        transport = "http"
+        url = "https://api.example.com/mcp"
+    "#;
+
+    let config = ProxyConfig::parse(toml).unwrap();
+    assert_eq!(config.backends[0].name, "external");
 }

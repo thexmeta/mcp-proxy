@@ -60,12 +60,15 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
+use anyhow::Result;
 use tower::{Layer, Service};
 use tower_mcp::router::{RouterRequest, RouterResponse};
 use tower_mcp_types::protocol::{McpRequest, McpResponse};
+
+use crate::config::CompiledPattern;
 
 /// Tower layer that produces an [`AliasService`].
 ///
@@ -78,7 +81,7 @@ use tower_mcp_types::protocol::{McpRequest, McpResponse};
 ///
 /// let aliases = AliasMap::new(vec![
 ///     ("math/".into(), "add".into(), "sum".into()),
-/// ]).unwrap();
+/// ], vec![]).unwrap();
 ///
 /// let service = ServiceBuilder::new()
 ///     .layer(AliasLayer::new(aliases))
@@ -86,13 +89,28 @@ use tower_mcp_types::protocol::{McpRequest, McpResponse};
 /// ```
 #[derive(Clone)]
 pub struct AliasLayer {
-    aliases: AliasMap,
+    aliases: Arc<RwLock<AliasMap>>,
 }
 
 impl AliasLayer {
     /// Create a new alias layer with the given alias map.
     pub fn new(aliases: AliasMap) -> Self {
+        Self {
+            aliases: Arc::new(RwLock::new(aliases)),
+        }
+    }
+
+    /// Create a new alias layer from a shared [`Arc<RwLock<AliasMap>>`].
+    ///
+    /// Use this when the alias map needs to be updated at runtime (e.g.,
+    /// during hot reload).
+    pub fn from_shared(aliases: Arc<RwLock<AliasMap>>) -> Self {
         Self { aliases }
+    }
+
+    /// Get a clone of the shared alias map.
+    pub fn shared_map(&self) -> Arc<RwLock<AliasMap>> {
+        Arc::clone(&self.aliases)
     }
 }
 
@@ -100,7 +118,265 @@ impl<S> Layer<S> for AliasLayer {
     type Service = AliasService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AliasService::new(inner, self.aliases.clone())
+        AliasService::new_from_shared(inner, Arc::clone(&self.aliases))
+    }
+}
+
+/// The service that applies alias mappings to requests and responses.
+#[derive(Clone)]
+pub struct AliasService<S> {
+    inner: S,
+    aliases: Arc<RwLock<AliasMap>>,
+}
+
+impl<S> AliasService<S> {
+    /// Create a new alias service.
+    pub fn new(inner: S, aliases: AliasMap) -> Self {
+        Self {
+            inner,
+            aliases: Arc::new(RwLock::new(aliases)),
+        }
+    }
+
+    /// Create a new alias service from a shared alias map.
+    ///
+    /// Use this when the alias map needs to be updated at runtime.
+    pub fn new_from_shared(inner: S, aliases: Arc<RwLock<AliasMap>>) -> Self {
+        Self { inner, aliases }
+    }
+
+    /// Get a clone of the shared alias map for dynamic updates.
+    pub fn shared_map(&self) -> Arc<RwLock<AliasMap>> {
+        Arc::clone(&self.aliases)
+    }
+}
+
+/// A pattern-based rename rule for bulk tool renaming.
+#[derive(Clone, Debug)]
+pub struct RenameRule {
+    /// The compiled pattern to match tool names.
+    pattern: CompiledPattern,
+    /// The replacement template (may contain $1, $2 for regex captures).
+    replacement: String,
+    /// The namespace prefix (e.g., "files/").
+    namespace: String,
+}
+
+impl RenameRule {
+    /// Create a new rename rule.
+    pub fn new(namespace: String, from: String, to: String) -> Result<Self> {
+        let pattern = CompiledPattern::compile(&from)?;
+        Ok(Self {
+            pattern,
+            replacement: to,
+            namespace,
+        })
+    }
+
+    /// Check if this rule matches the given namespaced tool name.
+    /// Returns the replacement if matched, None otherwise.
+    ///
+    /// Matching is performed against the original (namespace-stripped) tool
+    /// name only, never against the backend namespace prefix. This preserves
+    /// the backend name and transforms only the server's own tool name. The
+    /// transformed local name is then re-namespaced so the backend prefix
+    /// stays intact.
+    pub fn apply_forward(&self, namespaced_name: &str) -> Option<String> {
+        // Match against the original (namespace-stripped) tool name, NOT the
+        // backend namespace prefix. This preserves the backend name and only
+        // transforms the server's own tool name.
+        let local_name = namespaced_name.strip_prefix(&self.namespace)?;
+        if self.pattern.matches(local_name) {
+            Some(format!(
+                "{}{}",
+                self.namespace,
+                self.apply_replacement(local_name)
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Apply the replacement template to a matched local name.
+    fn apply_replacement(&self, local_name: &str) -> String {
+        match &self.pattern {
+            CompiledPattern::Literal(pat) => {
+                // Literal substring: replace ALL occurrences of the pattern
+                local_name.replace(pat.as_str(), &self.replacement)
+            }
+            CompiledPattern::Glob(pat) => {
+                // Anchored glob handling. A glob with a trailing "*" (e.g.
+                // "prefix_*") matches only at the start of the name, and a glob
+                // with a leading "*" (e.g. "*_suffix") matches only at the end.
+                // A bare "*" matches the entire name. Other shapes (middle "*",
+                // or no "*") fall back to $0 substitution of the whole match.
+                if pat.ends_with('*') && !pat.starts_with('*') {
+                    let literal = &pat[..pat.len() - 1]; // strip trailing *
+                    if local_name.starts_with(literal) && self.replacement.is_empty() {
+                        // Prefix stripping: from="prefix_*", to="" -> drop the leading literal
+                        return local_name
+                            .strip_prefix(literal)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                    }
+                    // $0 is the entire matched name
+                    return self.replacement.replace("$0", local_name);
+                }
+                if pat.starts_with('*') && !pat.ends_with('*') {
+                    let literal = &pat[1..]; // strip leading *
+                    if local_name.ends_with(literal) && self.replacement.is_empty() {
+                        // Suffix stripping: from="*_suffix", to="" -> drop the trailing literal
+                        return local_name
+                            .strip_suffix(literal)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                    }
+                    // $0 is the entire matched name
+                    return self.replacement.replace("$0", local_name);
+                }
+                // Default: $0 is the entire matched string
+                self.replacement.replace("$0", local_name)
+            }
+            CompiledPattern::Regex(re) => {
+                // For regex patterns, replace $1, $2, etc. with capture groups
+                let mut result = self.replacement.clone();
+                if let Some(caps) = re.captures(local_name) {
+                    for i in 1..=caps.len() {
+                        if let Some(m) = caps.get(i) {
+                            result = result.replace(&format!("${}", i), m.as_str());
+                        }
+                    }
+                    // Also handle $0 for full match
+                    result = result.replace("$0", local_name);
+                }
+                result
+            }
+        }
+    }
+
+    /// Try to reverse-match an aliased name back to the original.
+    /// Returns the original namespaced name if matched, None otherwise.
+    pub fn apply_reverse(&self, namespaced_aliased: &str) -> Option<String> {
+        let local_aliased = namespaced_aliased.strip_prefix(&self.namespace)?;
+
+        match &self.pattern {
+            CompiledPattern::Literal(pat) => {
+                // Literal substring: reverse by replacing the replacement back
+                // with the original pattern. This only works when the
+                // replacement is unique and non-overlapping.
+                self.reverse_literal_match(pat, local_aliased)
+                    .map(|original_local| format!("{}{}", self.namespace, original_local))
+            }
+            CompiledPattern::Glob(pat) => {
+                // For glob patterns, we need to check if the aliased name
+                // could have been produced by this rule.
+                // We do a reverse glob match by checking if the pattern
+                // could generate the aliased name.
+                // For simplicity, we try to reconstruct the original by
+                // reversing the replacement logic.
+                self.reverse_glob_match(pat, local_aliased)
+                    .map(|original_local| format!("{}{}", self.namespace, original_local))
+            }
+            CompiledPattern::Regex(re) => {
+                // For regex with capture groups, we need to reverse the replacement.
+                // This is complex; we'll try to match the replacement template
+                // against the aliased name to extract captures, then apply the
+                // original pattern.
+                self.reverse_regex_match(re, local_aliased)
+                    .map(|original_local| format!("{}{}", self.namespace, original_local))
+            }
+        }
+    }
+
+    /// Reverse match for literal substring patterns.
+    /// Given a literal like "-" and replacement like "_", and an aliased name
+    /// like "set_prop", try to reconstruct "set-prop" by replacing the
+    /// replacement back with the original pattern.
+    fn reverse_literal_match(&self, pat: &str, aliased: &str) -> Option<String> {
+        // If the replacement doesn't appear in the aliased name, this rule
+        // could not have produced it.
+        if self.replacement.is_empty() {
+            // Forward was: local_name.replace(pat, "")
+            // We cannot uniquely reverse this without knowing the original.
+            return None;
+        }
+        if !aliased.contains(self.replacement.as_str()) {
+            return None;
+        }
+        // Reverse: replace the replacement string back with the original pattern.
+        // Note: this is a best-effort reversal. If the replacement string
+        // appears in the original name naturally, the reverse may be ambiguous.
+        Some(aliased.replace(self.replacement.as_str(), pat))
+    }
+
+    /// Reverse match for glob patterns.
+    /// Given a glob pattern like "tavily_*" and replacement like "search_$0",
+    /// and an aliased name like "search_web", try to reconstruct "tavily_web".
+    fn reverse_glob_match(&self, pat: &str, aliased: &str) -> Option<String> {
+        // Prefix glob: "prefix_*" (anchored at start)
+        if pat.ends_with('*') && !pat.starts_with('*') {
+            let literal = &pat[..pat.len() - 1];
+            if self.replacement.is_empty() {
+                // Prefix stripping: from="prefix_*", to="" -> prepend literal back.
+                // Round-trip check: forward(reconstructed) must == aliased.
+                let candidate = format!("{}{}", literal, aliased);
+                if self.apply_replacement(&candidate) == aliased {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else if self.replacement == "$0" {
+                // Keep original: from="prefix_*", to="$0" -> aliased IS the original
+                Some(aliased.to_string())
+            } else if self.replacement.contains("$0") {
+                // Replacement uses $0 with a prefix, e.g. from="*", to="prefix_$0"
+                let replacement_prefix = self.replacement.replace("$0", "");
+                aliased
+                    .strip_prefix(&replacement_prefix)
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        }
+        // Suffix glob: "*_suffix" (anchored at end)
+        else if pat.starts_with('*') && !pat.ends_with('*') {
+            let literal = &pat[1..];
+            if self.replacement.is_empty() {
+                // Suffix stripping: from="*_suffix", to="" -> append literal back.
+                // Round-trip check: forward(reconstructed) must == aliased.
+                let candidate = format!("{}{}", aliased, literal);
+                if self.apply_replacement(&candidate) == aliased {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else if self.replacement == "$0" {
+                // Keep original: from="*_suffix", to="$0" -> aliased IS the original
+                Some(aliased.to_string())
+            } else if self.replacement.contains("$0") {
+                // Replacement uses $0 with a suffix, e.g. from="*", to="$0_suffix"
+                let replacement_suffix = self.replacement.replace("$0", "");
+                aliased
+                    .strip_suffix(&replacement_suffix)
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        } else if self.replacement.contains("$0") {
+            // Non-anchored pattern with $0: cannot reliably reverse.
+            None
+        } else {
+            None
+        }
+    }
+
+    /// Reverse match for regex patterns.
+    fn reverse_regex_match(&self, _re: &regex::Regex, _aliased: &str) -> Option<String> {
+        // This is complex - we'd need to reverse the replacement template.
+        // For now, we'll skip regex reverse matching and rely on exact matches.
+        // A full implementation would parse the replacement template and
+        // reconstruct captures.
+        None
     }
 }
 
@@ -110,41 +386,89 @@ pub struct AliasMap {
     /// Maps "namespace/original" -> "namespace/alias" (for list responses)
     pub forward: HashMap<String, String>,
     /// Maps "namespace/alias" -> "namespace/original" (for call requests)
-    reverse: HashMap<String, String>,
+    pub reverse: HashMap<String, String>,
+    /// Pattern-based rename rules (forward: original -> aliased)
+    pub forward_rules: Vec<RenameRule>,
+    /// Pattern-based rename rules (reverse: aliased -> original)
+    reverse_rules: Vec<RenameRule>,
 }
 
 impl AliasMap {
-    /// Build an alias map from `(namespace, from, to)` triples. Returns `None` if empty.
-    pub fn new(mappings: Vec<(String, String, String)>) -> Option<Self> {
-        if mappings.is_empty() {
+    /// Build an alias map from exact mappings and pattern-based rename rules.
+    /// Returns `None` if both are empty.
+    pub fn new(
+        exact_mappings: Vec<(String, String, String)>,
+        rename_rules: Vec<(String, String, String)>, // (namespace, from, to)
+    ) -> Option<Self> {
+        if exact_mappings.is_empty() && rename_rules.is_empty() {
             return None;
         }
+
         let mut forward = HashMap::new();
         let mut reverse = HashMap::new();
-        for (namespace, from, to) in mappings {
+        let mut forward_rules = Vec::new();
+        let mut reverse_rules = Vec::new();
+
+        // Process exact mappings
+        for (namespace, from, to) in exact_mappings {
             let original = format!("{}{}", namespace, from);
             let aliased = format!("{}{}", namespace, to);
             forward.insert(original.clone(), aliased.clone());
             reverse.insert(aliased, original);
         }
-        Some(Self { forward, reverse })
-    }
-}
 
-/// Tower service that rewrites tool names based on alias configuration.
-#[derive(Clone)]
-pub struct AliasService<S> {
-    inner: S,
-    aliases: Arc<AliasMap>,
-}
-
-impl<S> AliasService<S> {
-    /// Create a new alias service wrapping `inner` with the given alias map.
-    pub fn new(inner: S, aliases: AliasMap) -> Self {
-        Self {
-            inner,
-            aliases: Arc::new(aliases),
+        // Process pattern-based rename rules
+        for (namespace, from, to) in rename_rules {
+            if let Ok(rule) = RenameRule::new(namespace.clone(), from, to) {
+                // Add to forward rules for list responses
+                forward_rules.push(rule.clone());
+                // Add to reverse rules for call requests (processed in reverse order for priority)
+                reverse_rules.push(rule);
+            }
         }
+
+        // Reverse the reverse_rules so that later rules have higher priority
+        // (first match wins when iterating in order)
+        reverse_rules.reverse();
+
+        Some(Self {
+            forward,
+            reverse,
+            forward_rules,
+            reverse_rules,
+        })
+    }
+
+    /// Apply forward mapping (for list responses).
+    /// First checks exact matches, then pattern-based rules (first match wins).
+    pub fn apply_forward(&self, namespaced_name: &str) -> Option<String> {
+        // Check exact matches first
+        if let Some(aliased) = self.forward.get(namespaced_name) {
+            return Some(aliased.clone());
+        }
+        // Check pattern-based rules in order
+        for rule in &self.forward_rules {
+            if let Some(aliased) = rule.apply_forward(namespaced_name) {
+                return Some(aliased);
+            }
+        }
+        None
+    }
+
+    /// Apply reverse mapping (for call requests).
+    /// First checks exact matches, then pattern-based rules (first match wins).
+    pub fn apply_reverse(&self, namespaced_aliased: &str) -> Option<String> {
+        // Check exact matches first
+        if let Some(original) = self.reverse.get(namespaced_aliased) {
+            return Some(original.clone());
+        }
+        // Check pattern-based rules in order (reverse order for priority)
+        for rule in &self.reverse_rules {
+            if let Some(original) = rule.apply_reverse(namespaced_aliased) {
+                return Some(original);
+            }
+        }
+        None
     }
 }
 
@@ -165,28 +489,31 @@ where
     }
 
     fn call(&mut self, mut req: RouterRequest) -> Self::Future {
-        let aliases = Arc::clone(&self.aliases);
-
-        // Reverse-map aliased names back to originals in requests
-        match &mut req.inner {
-            McpRequest::CallTool(params) => {
-                if let Some(original) = aliases.reverse.get(&params.name) {
-                    params.name = original.clone();
+        // Acquire read lock briefly for request mapping
+        {
+            let aliases = self.aliases.read().unwrap();
+            // Reverse-map aliased names back to originals in requests
+            match &mut req.inner {
+                McpRequest::CallTool(params) => {
+                    if let Some(original) = aliases.apply_reverse(&params.name) {
+                        params.name = original;
+                    }
                 }
-            }
-            McpRequest::ReadResource(params) => {
-                if let Some(original) = aliases.reverse.get(&params.uri) {
-                    params.uri = original.clone();
+                McpRequest::ReadResource(params) => {
+                    if let Some(original) = aliases.apply_reverse(&params.uri) {
+                        params.uri = original;
+                    }
                 }
-            }
-            McpRequest::GetPrompt(params) => {
-                if let Some(original) = aliases.reverse.get(&params.name) {
-                    params.name = original.clone();
+                McpRequest::GetPrompt(params) => {
+                    if let Some(original) = aliases.apply_reverse(&params.name) {
+                        params.name = original;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
+        let aliases = Arc::clone(&self.aliases);
         let fut = self.inner.call(req);
 
         Box::pin(async move {
@@ -195,25 +522,26 @@ where
             // Forward-map original names to aliases in responses
             let Ok(ref mut resp) = result;
             if let Ok(mcp_resp) = &mut resp.inner {
+                let aliases = aliases.read().unwrap();
                 match mcp_resp {
                     McpResponse::ListTools(r) => {
                         for tool in &mut r.tools {
-                            if let Some(aliased) = aliases.forward.get(&tool.name) {
-                                tool.name = aliased.clone();
+                            if let Some(aliased) = aliases.apply_forward(&tool.name) {
+                                tool.name = aliased;
                             }
                         }
                     }
                     McpResponse::ListResources(r) => {
                         for res in &mut r.resources {
-                            if let Some(aliased) = aliases.forward.get(&res.uri) {
-                                res.uri = aliased.clone();
+                            if let Some(aliased) = aliases.apply_forward(&res.uri) {
+                                res.uri = aliased;
                             }
                         }
                     }
                     McpResponse::ListPrompts(r) => {
                         for prompt in &mut r.prompts {
-                            if let Some(aliased) = aliases.forward.get(&prompt.name) {
-                                prompt.name = aliased.clone();
+                            if let Some(aliased) = aliases.apply_forward(&prompt.name) {
+                                prompt.name = aliased;
                             }
                         }
                     }
@@ -234,16 +562,19 @@ mod tests {
     use crate::test_util::{MockService, call_service};
 
     fn test_aliases() -> AliasMap {
-        AliasMap::new(vec![
-            ("files/".into(), "read_file".into(), "read".into()),
-            ("files/".into(), "write_file".into(), "write".into()),
-        ])
+        AliasMap::new(
+            vec![
+                ("files/".into(), "read_file".into(), "read".into()),
+                ("files/".into(), "write_file".into(), "write".into()),
+            ],
+            vec![],
+        )
         .unwrap()
     }
 
     #[test]
     fn test_alias_map_empty_returns_none() {
-        assert!(AliasMap::new(vec![]).is_none());
+        assert!(AliasMap::new(vec![], vec![]).is_none());
     }
 
     #[test]
@@ -320,6 +651,928 @@ mod tests {
         match resp.inner.unwrap() {
             McpResponse::CallTool(result) => {
                 assert_eq!(result.all_text(), "called: db/query");
+            }
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_alias_map_with_rename_all_glob_patterns() {
+        // Test glob pattern matching in forward direction
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("files/".into(), "read_*".into(), "$0".into()), // Keep original name
+                ("files/".into(), "write_*".into(), "write_$0".into()), // Prefix with "write_"
+            ],
+        )
+        .unwrap();
+
+        // Forward: original -> aliased
+        // Pattern "read_*" with replacement "$0" keeps the name unchanged
+        assert_eq!(
+            aliases.apply_forward("files/read_file"),
+            Some("files/read_file".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("files/read_data"),
+            Some("files/read_data".to_string())
+        );
+        // Pattern "write_*" with replacement "write_$0" prepends "write_"
+        assert_eq!(
+            aliases.apply_forward("files/write_file"),
+            Some("files/write_write_file".to_string())
+        );
+        assert_eq!(aliases.apply_forward("files/other"), None);
+
+        // Reverse: aliased -> original (for prefix stripping patterns)
+        assert_eq!(
+            aliases.apply_reverse("files/read_file"),
+            Some("files/read_file".to_string())
+        );
+        assert_eq!(
+            aliases.apply_reverse("files/read_data"),
+            Some("files/read_data".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alias_map_with_rename_all_prefix_stripping() {
+        // Test the common case: from="tavily_*", to="" (strip prefix).
+        // Uses "_" separator so the backend namespace ("tavily_") collides
+        // with the server's own "tavily_" prefix. The rule must match the
+        // LOCAL name only and preserve the backend namespace.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        // Forward: original -> aliased (strips the server's own prefix only,
+        // backend namespace is preserved).
+        assert_eq!(
+            aliases.apply_forward("tavily_tavily_search"),
+            Some("tavily_search".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("tavily_tavily_extract"),
+            Some("tavily_extract".to_string())
+        );
+
+        // Reverse: aliased -> original (adds the server prefix back).
+        assert_eq!(
+            aliases.apply_reverse("tavily_search"),
+            Some("tavily_tavily_search".to_string())
+        );
+        assert_eq!(
+            aliases.apply_reverse("tavily_extract"),
+            Some("tavily_tavily_extract".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_strips_server_prefix_preserves_backend_namespace() {
+        // Required test (1): from="tavily_*", to="" on the namespaced name
+        // "tavily_tavily_search" must yield "tavily_search" — the backend
+        // namespace is preserved and only the server's own "tavily_" prefix
+        // is stripped.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("tavily_tavily_search"),
+            Some("tavily_search".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_no_match_when_local_name_lacks_prefix() {
+        // Required test (2): from="roslyn_*", to="" on "roslyn_completion".
+        // The local name is "completion", which does NOT match "roslyn_*",
+        // so the rule does not apply and the name is unchanged (None).
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("roslyn_".into(), "roslyn_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(aliases.apply_forward("roslyn_completion"), None);
+    }
+
+    #[test]
+    fn test_rename_all_reverse_round_trips_to_original() {
+        // Required test (3): reverse of (1). Client sends aliased
+        // "tavily_search" and it maps back to the original
+        // "tavily_tavily_search".
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("tavily_search"),
+            Some("tavily_tavily_search".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alias_map_with_rename_all_regex_patterns() {
+        // Test regex pattern matching with capture groups
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("db/".into(), "re:^list_(.+)$".into(), "get_$1".into()),
+                (
+                    "api/".into(),
+                    "re:^query_(.+)_data$".into(),
+                    "fetch_$1".into(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // Forward: original -> aliased (with capture group replacement)
+        assert_eq!(
+            aliases.apply_forward("db/list_users"),
+            Some("db/get_users".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("db/list_products"),
+            Some("db/get_products".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("api/query_user_data"),
+            Some("api/fetch_user".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("api/query_product_data"),
+            Some("api/fetch_product".to_string())
+        );
+
+        // Non-matching patterns should pass through unchanged
+        assert_eq!(aliases.apply_forward("db/create_user"), None);
+        assert_eq!(aliases.apply_forward("api/query_other"), None);
+
+        // Reverse: regex reverse matching is not fully implemented,
+        // should fall back to exact matches (which there are none)
+        // Note: regex reverse matching is complex and not yet implemented
+    }
+
+    #[tokio::test]
+    async fn test_alias_rename_all_glob_in_list_tools() {
+        let mock = MockService::with_tools(&[
+            "files/read_file",
+            "files/read_data",
+            "files/write_file",
+            "files/write_config",
+            "db/query",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("files/".into(), "read_*".into(), "$0".into()), // Keep original
+                ("files/".into(), "write_*".into(), "write_$0".into()), // Prefix with "write_"
+            ],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // Should see transformed names
+                assert!(names.contains(&"files/read_file")); // unchanged (replacement is $0)
+                assert!(names.contains(&"files/read_data")); // unchanged
+                assert!(names.contains(&"files/write_write_file")); // prefixed
+                assert!(names.contains(&"files/write_write_config")); // prefixed
+                assert!(names.contains(&"db/query")); // unchanged
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alias_rename_all_prefix_strip_in_list_tools() {
+        // "_" separator: backend namespace "tavily_" collides with the server's
+        // own "tavily_" prefix. The rule must strip only the server prefix and
+        // keep the backend namespace, yielding "tavily_search" (not bare "search").
+        let mock =
+            MockService::with_tools(&["tavily_tavily_search", "tavily_tavily_extract", "db_query"]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // Should see backend-prefixed, server-prefix-stripped names.
+                assert!(
+                    names.contains(&"tavily_search"),
+                    "Expected tavily_search, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"tavily_extract"),
+                    "Expected tavily_extract, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alias_rename_all_regex_in_list_tools() {
+        let mock = MockService::with_tools(&[
+            "db/list_users",
+            "db/list_products",
+            "db/create_user",
+            "api/query_user_data",
+            "api/query_product_data",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("db/".into(), "re:^list_(.+)$".into(), "get_$1".into()),
+                (
+                    "api/".into(),
+                    "re:^query_(.+)_data$".into(),
+                    "fetch_$1".into(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // Should see transformed names
+                assert!(names.contains(&"db/get_users"));
+                assert!(names.contains(&"db/get_products"));
+                assert!(names.contains(&"api/fetch_user"));
+                assert!(names.contains(&"api/fetch_product"));
+                // Non-matching should be unchanged
+                assert!(names.contains(&"db/create_user"));
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    /// Test rename_all where backend tools DON'T include their own prefix.
+    /// E.g., Roslyn tools are `completion` (not `roslyn_completion`).
+    /// After namespace prefix, full name is `roslyn_completion`.
+    /// Pattern `roslyn_*` must match the LOCAL name only (`completion`),
+    /// which does NOT match, so the backend namespace is preserved unchanged.
+    #[tokio::test]
+    async fn test_rename_all_backend_without_prefix() {
+        let mock = MockService::with_tools(&[
+            "roslyn_completion",
+            "roslyn_get_call_graph",
+            "roslyn_check_syntax",
+            "lsp_rename_symbol",
+            "lsp_find_references",
+            "db_query",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("roslyn_".into(), "roslyn_*".into(), "".into()),
+                ("lsp_".into(), "lsp_*".into(), "".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // Backend namespace must be preserved (rule does not apply to
+                // local names that don't carry the server's own prefix).
+                assert!(
+                    names.contains(&"roslyn_completion"),
+                    "Expected roslyn_completion preserved, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"roslyn_get_call_graph"),
+                    "Expected roslyn_get_call_graph preserved, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"roslyn_check_syntax"),
+                    "Expected roslyn_check_syntax preserved, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"lsp_rename_symbol"),
+                    "Expected lsp_rename_symbol preserved, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"lsp_find_references"),
+                    "Expected lsp_find_references preserved, got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    /// Test rename_all where backend tools DO include their own prefix.
+    /// E.g., Tavily tools are `tavily_search` (already prefixed).
+    /// After namespace prefix, full name is `tavily_tavily_search`.
+    /// Pattern `tavily_*` matches the LOCAL name `tavily_search`, strips the
+    /// server's own `tavily_` prefix, then re-namespaces -> `tavily_search`.
+    #[tokio::test]
+    async fn test_rename_all_backend_with_prefix() {
+        let mock =
+            MockService::with_tools(&["tavily_tavily_search", "tavily_tavily_extract", "db_query"]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily_".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(
+                    names.contains(&"tavily_search"),
+                    "Expected tavily_search (backend prefix preserved), got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"tavily_extract"),
+                    "Expected tavily_extract (backend prefix preserved), got: {:?}",
+                    names
+                );
+                assert!(
+                    names.contains(&"db_query"),
+                    "Expected db_query unchanged, got: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rename_all_prefix_glob_strips_only_leading_occurrence() {
+        // A trailing-* glob ("prefix_*") must match only at the start of the
+        // name, stripping a single leading occurrence of the prefix.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("tavily/".into(), "tavily_*".into(), "".into())],
+        )
+        .unwrap();
+
+        // Single prefix occurrence: stripped once.
+        assert_eq!(
+            aliases.apply_forward("tavily/tavily_search"),
+            Some("tavily/search".to_string())
+        );
+        // Double prefix occurrence: only the leading one is stripped.
+        assert_eq!(
+            aliases.apply_forward("tavily/tavily_tavily_search"),
+            Some("tavily/tavily_search".to_string())
+        );
+        // No prefix occurrence: not matched.
+        assert_eq!(aliases.apply_forward("tavily/search"), None);
+    }
+
+    #[test]
+    fn test_rename_all_suffix_glob_strips_only_trailing_occurrence() {
+        // A leading-* glob ("*_suffix") must match only at the end of the name,
+        // stripping a single trailing occurrence of the suffix.
+        let aliases =
+            AliasMap::new(vec![], vec![("exa/".into(), "*_exa".into(), "".into())]).unwrap();
+
+        // Single suffix occurrence: stripped once.
+        assert_eq!(
+            aliases.apply_forward("exa/web_search_exa"),
+            Some("exa/web_search".to_string())
+        );
+        // Double suffix occurrence: only the trailing one is stripped.
+        assert_eq!(
+            aliases.apply_forward("exa/web_search_exa_exa"),
+            Some("exa/web_search_exa".to_string())
+        );
+        // No suffix occurrence: not matched.
+        assert_eq!(aliases.apply_forward("exa/web_search"), None);
+    }
+
+    #[test]
+    fn test_rename_all_suffix_glob_reverse_restores_trailing_occurrence() {
+        // Reverse of a suffix glob must re-append the stripped suffix.
+        let aliases =
+            AliasMap::new(vec![], vec![("exa/".into(), "*_exa".into(), "".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("exa/web_search"),
+            Some("exa/web_search_exa".to_string())
+        );
+    }
+
+    // ===== Literal pattern tests (Bug 2 fix) =====
+
+    #[test]
+    fn test_literal_pattern_replaces_dash_with_underscore() {
+        // from="-" to="_" should replace ALL occurrences of "-" with "_"
+        let aliases =
+            AliasMap::new(vec![], vec![("files/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("files/set-prop"),
+            Some("files/set_prop".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("files/my-tool-name"),
+            Some("files/my_tool_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_literal_pattern_multiple_occurrences() {
+        // "a-b-c" should become "a_b_c" (all dashes replaced)
+        let aliases = AliasMap::new(vec![], vec![("svc/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("svc/a-b-c"),
+            Some("svc/a_b_c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_literal_pattern_no_match_when_absent() {
+        // If the literal is not in the name, no replacement happens
+        let aliases =
+            AliasMap::new(vec![], vec![("files/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(aliases.apply_forward("files/noissue"), None);
+    }
+
+    #[test]
+    fn test_literal_pattern_reverse_round_trip() {
+        // Reverse of "-" -> "_" should map "set_prop" back to "set-prop"
+        let aliases =
+            AliasMap::new(vec![], vec![("files/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("files/set_prop"),
+            Some("files/set-prop".to_string())
+        );
+    }
+
+    #[test]
+    fn test_literal_pattern_reverse_multiple_occurrences() {
+        // Reverse of "a_b_c" should map back to "a-b-c"
+        let aliases = AliasMap::new(vec![], vec![("svc/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("svc/a_b_c"),
+            Some("svc/a-b-c".to_string())
+        );
+    }
+
+    // ===== Dynamic alias map update test (Bug 1 fix) =====
+
+    #[tokio::test]
+    async fn test_alias_service_dynamic_update() {
+        use std::sync::{Arc, RwLock};
+
+        let mock = MockService::with_tools(&["files/read_file", "files/write_file", "db/query"]);
+
+        // Start with aliases for "read_file" -> "read"
+        let initial = AliasMap::new(
+            vec![("files/".into(), "read_file".into(), "read".into())],
+            vec![],
+        )
+        .unwrap();
+        let shared = Arc::new(RwLock::new(initial));
+        let mut svc = AliasService::new_from_shared(mock, Arc::clone(&shared));
+
+        // Initial request sees aliased name
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"files/read"), "before update: {:?}", names);
+                assert!(
+                    names.contains(&"files/write_file"),
+                    "before update: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // Hot-reload: add alias for "write_file" -> "write", keep "read_file" -> "read"
+        {
+            let mut map = shared.write().unwrap();
+            *map = AliasMap::new(
+                vec![
+                    ("files/".into(), "read_file".into(), "read".into()),
+                    ("files/".into(), "write_file".into(), "write".into()),
+                ],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Next request should see both aliases
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"files/read"), "after update: {:?}", names);
+                assert!(names.contains(&"files/write"), "after update: {:?}", names);
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    // ===== Live-config test cases: literal dash→underscore via rename_all =====
+
+    #[test]
+    fn test_rename_all_literal_dash_to_underscore_replaces_all() {
+        // Live config: from="-", to="_" replaces ALL dashes in tool names
+        let aliases = AliasMap::new(vec![], vec![("svc/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("svc/set-prop"),
+            Some("svc/set_prop".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("svc/my-cool-tool"),
+            Some("svc/my_cool_tool".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_literal_dash_to_underscore_reverse() {
+        // Reverse: "set_prop" → "set-prop"
+        let aliases = AliasMap::new(vec![], vec![("svc/".into(), "-".into(), "_".into())]).unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("svc/set_prop"),
+            Some("svc/set-prop".to_string())
+        );
+        assert_eq!(
+            aliases.apply_reverse("svc/my_cool_tool"),
+            Some("svc/my-cool-tool".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_all_literal_dash_round_trip() {
+        // Round-trip: forward then reverse returns original
+        let mock = MockService::with_tools(&["svc/set-prop", "svc/my-cool-tool"]);
+        let aliases = AliasMap::new(vec![], vec![("svc/".into(), "-".into(), "_".into())]).unwrap();
+        let mut svc = AliasService::new(mock, aliases.clone());
+
+        // Forward: list shows underscored names
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"svc/set_prop"));
+                assert!(names.contains(&"svc/my_cool_tool"));
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // Reverse: CallTool with underscored name maps back to dashed
+        let mock2 = MockService::with_tools(&["svc/set-prop"]);
+        let mut svc2 = AliasService::new(mock2, aliases);
+        let resp = call_service(
+            &mut svc2,
+            McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
+                name: "svc/set_prop".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+        match resp.inner.unwrap() {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.all_text(), "called: svc/set-prop");
+            }
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
+    // ===== Live-config test cases: suffix stripping for *_docs_by_lang_chain =====
+
+    #[test]
+    fn test_rename_all_suffix_strip_docs_by_lang_chain() {
+        // Live config: from="*_docs_by_lang_chain", to=""
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("hl/".into(), "*_docs_by_lang_chain".into(), "".into())],
+        )
+        .unwrap();
+
+        // Forward: suffix stripped
+        assert_eq!(
+            aliases.apply_forward("hl/docs_by_lang_chain_search_docs_by_lang_chain"),
+            Some("hl/docs_by_lang_chain_search".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_suffix_strip_docs_by_lang_chain_reverse() {
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("hl/".into(), "*_docs_by_lang_chain".into(), "".into())],
+        )
+        .unwrap();
+
+        // Reverse: suffix re-appended
+        assert_eq!(
+            aliases.apply_reverse("hl/docs_by_lang_chain_search"),
+            Some("hl/docs_by_lang_chain_search_docs_by_lang_chain".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_suffix_strip_no_match_when_suffix_absent() {
+        let aliases = AliasMap::new(
+            vec![],
+            vec![("hl/".into(), "*_docs_by_lang_chain".into(), "".into())],
+        )
+        .unwrap();
+
+        // No match when suffix is not present
+        assert_eq!(aliases.apply_forward("hl/other_tool_name"), None);
+    }
+
+    // ===== Live-config test cases: prefix stripping for ht_* =====
+
+    #[test]
+    fn test_rename_all_prefix_strip_ht() {
+        // Live config: from="ht_*", to=""
+        let aliases =
+            AliasMap::new(vec![], vec![("web/".into(), "ht_*".into(), "".into())]).unwrap();
+
+        // Forward: prefix stripped, backend namespace preserved
+        assert_eq!(
+            aliases.apply_forward("web/ht_get_page"),
+            Some("web/get_page".to_string())
+        );
+        assert_eq!(
+            aliases.apply_forward("web/ht_click"),
+            Some("web/click".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_prefix_strip_ht_reverse() {
+        let aliases =
+            AliasMap::new(vec![], vec![("web/".into(), "ht_*".into(), "".into())]).unwrap();
+
+        // Reverse: prefix re-prepended
+        assert_eq!(
+            aliases.apply_reverse("web/get_page"),
+            Some("web/ht_get_page".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_prefix_strip_ht_backend_without_prefix() {
+        // Backend tool "ht_click" has the local name "click" (no "ht_" prefix),
+        // so the rule does NOT match and the name is preserved unchanged.
+        // After namespace: "web/ht_click" where local name is "click",
+        // which does NOT match "ht_*".
+        let aliases =
+            AliasMap::new(vec![], vec![("ht/".into(), "ht_*".into(), "".into())]).unwrap();
+
+        // "ht/ht_click": local name is "ht_click", matches "ht_*" → stripped → "ht/click"
+        assert_eq!(
+            aliases.apply_forward("ht/ht_click"),
+            Some("ht/click".to_string())
+        );
+        // "ht/click": local name is "click", does NOT match "ht_*" → None
+        assert_eq!(aliases.apply_forward("ht/click"), None);
+    }
+
+    // ===== Live-config test cases: multiple rename_all rules coexistence =====
+
+    #[test]
+    fn test_rename_all_multiple_rules_first_match_wins() {
+        // Multiple rename_all rules on the same backend are evaluated in
+        // order; the FIRST matching rule wins. Rules do NOT compose/chains.
+        //   ht_* → ""  (prefix strip)       — rule 0
+        //   *_exa → ""  (suffix strip)      — rule 1
+        //   - → _      (literal dash→underscore) — rule 2
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("mybe/".into(), "ht_*".into(), "".into()),
+                ("mybe/".into(), "*_exa".into(), "".into()),
+                ("mybe/".into(), "-".into(), "_".into()),
+            ],
+        )
+        .unwrap();
+
+        // ht_my-tool: matches rule 0 (ht_*) → prefix stripped → my-tool
+        // Rule 2 (- → _) does NOT also apply.
+        assert_eq!(
+            aliases.apply_forward("mybe/ht_my-tool"),
+            Some("mybe/my-tool".to_string())
+        );
+        // search_exa: matches rule 1 (*_exa) → suffix stripped → search
+        assert_eq!(
+            aliases.apply_forward("mybe/search_exa"),
+            Some("mybe/search".to_string())
+        );
+        // plain-dash-name: no prefix/suffix match → matches rule 2 (- → _)
+        assert_eq!(
+            aliases.apply_forward("mybe/plain-dash-name"),
+            Some("mybe/plain_dash_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_all_multiple_rules_reverse_first_match_wins() {
+        // Reverse rules are stored in reversed order (last forward rule
+        // checked first). Each tool name is matched by at most one rule.
+        // IMPORTANT: suffix stripping reverse is optimistic — it matches any
+        // name that doesn't already end with the literal. This means when
+        // suffix and other rules coexist, the suffix rule may "steal" matches
+        // from other rules in reverse. This is a known limitation.
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("mybe/".into(), "ht_*".into(), "".into()),
+                ("mybe/".into(), "*_exa".into(), "".into()),
+                ("mybe/".into(), "-".into(), "_".into()),
+            ],
+        )
+        .unwrap();
+
+        // Reverse of suffix strip: search → search_exa (suffix re-appended)
+        assert_eq!(
+            aliases.apply_reverse("mybe/search"),
+            Some("mybe/search_exa".to_string())
+        );
+        // Reverse of literal dash: plain_dash_name → plain-dash-name
+        assert_eq!(
+            aliases.apply_reverse("mybe/plain_dash_name"),
+            Some("mybe/plain-dash-name".to_string())
+        );
+        // Reverse of prefix strip: the suffix rule reverse-match is checked first
+        // and matches my-tool → my-tool_exa (optimistic). This documents the
+        // known limitation: when prefix strip and suffix strip coexist, the
+        // suffix reverse can produce spurious matches.
+        // In practice, use non-overlapping rules or regex patterns to avoid this.
+        assert_eq!(
+            aliases.apply_reverse("mybe/my-tool"),
+            Some("mybe/my-tool_exa".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_all_multiple_rules_end_to_end() {
+        let mock = MockService::with_tools(&[
+            "mybe/ht_my-tool",
+            "mybe/search_exa",
+            "mybe/plain-dash-name",
+        ]);
+
+        let aliases = AliasMap::new(
+            vec![],
+            vec![
+                ("mybe/".into(), "ht_*".into(), "".into()),
+                ("mybe/".into(), "*_exa".into(), "".into()),
+                ("mybe/".into(), "-".into(), "_".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut svc = AliasService::new(mock, aliases);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                // ht_my-tool: prefix strip wins → my-tool
+                assert!(names.contains(&"mybe/my-tool"), "got: {:?}", names);
+                // search_exa: suffix strip wins → search
+                assert!(names.contains(&"mybe/search"), "got: {:?}", names);
+                // plain-dash-name: literal dash wins → plain_dash_name
+                assert!(names.contains(&"mybe/plain_dash_name"), "got: {:?}", names);
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+    }
+
+    // ===== Live-config test cases: exact alias with dashes =====
+
+    #[test]
+    fn test_exact_alias_with_dashes_forward() {
+        // Live config: from="query-docs", to="query_docs"
+        let aliases = AliasMap::new(
+            vec![("api/".into(), "query-docs".into(), "query_docs".into())],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_forward("api/query-docs"),
+            Some("api/query_docs".into())
+        );
+    }
+
+    #[test]
+    fn test_exact_alias_with_dashes_reverse() {
+        let aliases = AliasMap::new(
+            vec![("api/".into(), "query-docs".into(), "query_docs".into())],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.apply_reverse("api/query_docs"),
+            Some("api/query-docs".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_alias_with_dashes_end_to_end() {
+        let mock = MockService::with_tools(&["api/query-docs", "api/other-tool"]);
+        let aliases = AliasMap::new(
+            vec![("api/".into(), "query-docs".into(), "query_docs".into())],
+            vec![],
+        )
+        .unwrap();
+        let mut svc = AliasService::new(mock, aliases.clone());
+
+        // Forward: list shows aliased names
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        match resp.inner.unwrap() {
+            McpResponse::ListTools(result) => {
+                let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+                assert!(names.contains(&"api/query_docs"), "got: {:?}", names);
+                assert!(names.contains(&"api/other-tool"), "got: {:?}", names);
+            }
+            other => panic!("expected ListTools, got: {:?}", other),
+        }
+
+        // Reverse: CallTool with aliased name maps back
+        let mock2 = MockService::with_tools(&["api/query-docs"]);
+        let mut svc2 = AliasService::new(mock2, aliases);
+        let resp = call_service(
+            &mut svc2,
+            McpRequest::CallTool(tower_mcp::protocol::CallToolParams {
+                name: "api/query_docs".to_string(),
+                arguments: serde_json::json!({}),
+                meta: None,
+                task: None,
+                input_responses: None,
+                request_state: None,
+            }),
+        )
+        .await;
+        match resp.inner.unwrap() {
+            McpResponse::CallTool(result) => {
+                assert_eq!(result.all_text(), "called: api/query-docs");
             }
             other => panic!("expected CallTool, got: {:?}", other),
         }

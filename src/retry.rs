@@ -95,6 +95,8 @@ mod tests {
     use crate::config::RetryConfig;
     use crate::test_util::{ErrorMockService, MockService, call_service};
     use tower::Layer;
+    use tower_mcp::protocol::RequestId;
+    use tower_mcp_types::JsonRpcError;
     use tower_mcp_types::protocol::McpRequest;
 
     fn make_config(max_retries: u32) -> RetryConfig {
@@ -207,10 +209,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retries_transport_error() {
+        // TransportErrorMockService returns -32000 "connection refused"
+        // which is a transport-level error and should be retriable.
+        use crate::test_util::TransportErrorMockService;
+
+        let svc = TransportErrorMockService;
+        let layer = build_retry_layer(&make_config(3), "test");
+        let mut svc = layer.layer(svc);
+
+        let resp = call_service(&mut svc, McpRequest::ListTools(Default::default())).await;
+        // All attempts fail, but it should have retried (not short-circuited)
+        assert!(resp.inner.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_response_predicate_matches_transport_errors() {
+        use tower_mcp::protocol::RequestId;
+        use tower_mcp_types::JsonRpcError;
+
+        // Transport error with connection keyword — should be retriable
+        let transport_err = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Err(JsonRpcError {
+                code: -32000,
+                message: "connection refused".to_string(),
+                data: None,
+            }),
+        };
+        assert!(is_retriable_response(&transport_err));
+
+        // Transport error with Transport keyword — should be retriable
+        let transport_closed = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Err(JsonRpcError {
+                code: -32000,
+                message: "Transport closed".to_string(),
+                data: None,
+            }),
+        };
+        assert!(is_retriable_response(&transport_closed));
+
+        // Non-transport -32000 error — should still be retriable (generic server error)
+        let generic_server_err = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Err(JsonRpcError {
+                code: -32000,
+                message: "something went wrong".to_string(),
+                data: None,
+            }),
+        };
+        assert!(is_retriable_response(&generic_server_err));
+    }
+
+    #[tokio::test]
     async fn test_no_budget_allows_all_retries() {
         let config = make_config(2); // No budget, 2 retries
         let _layer = build_retry_layer(&config, "test");
         // Just verify it builds without a budget
         assert!(config.budget_percent.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK005: Comprehensive transport error retry tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_transport_error_retriable_range() {
+        for code in [-32000i32, -32050, -32099] {
+            let resp = RouterResponse {
+                id: RequestId::Number(1),
+                inner: Err(JsonRpcError {
+                    code,
+                    message: "transport error".to_string(),
+                    data: None,
+                }),
+            };
+            assert!(
+                is_retriable_response(&resp),
+                "code {code} should be retriable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_out_of_range_not_retriable() {
+        let resp = RouterResponse {
+            id: RequestId::Number(1),
+            inner: Err(JsonRpcError {
+                code: -32100,
+                message: "out of range".to_string(),
+                data: None,
+            }),
+        };
+        assert!(!is_retriable_response(&resp));
+    }
+
+    #[tokio::test]
+    async fn test_retry_dispatches_after_transport_error() {
+        use crate::test_util::{TransportErrorMockService, call_service};
+
+        let config = make_config(2);
+        let layer = build_retry_layer(&config, "test");
+        let svc = TransportErrorMockService;
+        let mut svc = tower::Layer::layer(&layer, svc);
+
+        let request = McpRequest::ListTools(Default::default());
+        let resp = call_service(&mut svc, request).await;
+        match &resp.inner {
+            Err(e) => assert_eq!(e.code, -32000),
+            Ok(_) => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_success_after_transport_error() {
+        use crate::test_util::{MockService, call_service};
+
+        let config = make_config(2);
+        let layer = build_retry_layer(&config, "test");
+        let inner = MockService::with_tools(&["tool1"]);
+        let mut svc = tower::Layer::layer(&layer, inner);
+
+        let request = McpRequest::ListTools(Default::default());
+        let resp = call_service(&mut svc, request).await;
+        match &resp.inner {
+            Ok(tower_mcp_types::protocol::McpResponse::ListTools(result)) => {
+                assert_eq!(result.tools.len(), 1);
+            }
+            other => panic!("expected ListTools result, got: {:?}", other),
+        }
     }
 }
