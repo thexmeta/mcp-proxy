@@ -71,7 +71,7 @@ jobs:
       - run: cargo test ${{ matrix.flags }}
 
   msrv:
-    name: MSRV (1.90, ${{ matrix.features }})
+    name: MSRV (1.97, ${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.90"
+          toolchain: "1.97"
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-${{ matrix.features }}

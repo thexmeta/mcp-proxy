@@ -1,9 +1,9 @@
 [package]
 name = "mcp-proxy"
-version = "0.6.0"
+version = "1.4.2-b3"
 edition = "2024"
-rust-version = "1.90"
-description = "Tower-native MCP gateway for aggregating backends with auth, resilience, and observability"
+rust-version = "1.97"
+description = "Standalone MCP proxy -- config-driven reverse proxy with auth, rate limiting, and observability"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joshrotenberg/mcp-proxy"
 homepage = "https://github.com/joshrotenberg/mcp-proxy"
@@ -26,9 +26,9 @@ path = "src/main.rs"
 default = ["otel", "metrics", "oauth", "openapi", "websocket", "discovery", "yaml", "skills"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
-oauth = ["tower-mcp/oauth", "tower-mcp/jwks", "dep:reqwest"]
+oauth = ["tower-mcp/oauth", "tower-mcp/jwks"]
 openapi = ["dep:utoipa", "dep:utoipa-axum"]
-websocket = ["dep:tokio-tungstenite", "dep:async-trait", "dep:futures-util"]
+websocket = ["dep:tokio-tungstenite"]
 discovery = ["dep:jpx-engine"]
 yaml = ["dep:yaml_serde"]
 skills = []
@@ -37,10 +37,11 @@ sqlite-cache = ["dep:rusqlite"]
 protocol-2026-07-28 = ["tower-mcp/protocol-2026-07-28"]
 
 [dependencies]
-tower-mcp = { version = "0.23.2", features = ["http", "http-client", "proxy"] }
+tower-mcp = { version = "0.23.2", features = ["http", "http-client", "proxy", "websocket", "protocol-2026-07-28", "stateless"] }
 tower-mcp-types = "0.23.2"
 axum = "0.8"
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tower-resilience = { version = "0.13.0", default-features = false, features = ["circuitbreaker", "ratelimiter", "hedge", "retry"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +51,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+thiserror = "1"
 metrics = { version = "0.24.3", optional = true }
 metrics-exporter-prometheus = { version = "0.18.1", optional = true }
 opentelemetry = { version = "0.33", optional = true }
@@ -66,19 +68,26 @@ notify-debouncer-mini = "0.7"
 utoipa = { version = "6", features = ["chrono"], optional = true }
 utoipa-axum = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["connect", "rustls-tls-webpki-roots"], optional = true }
-async-trait = { version = "0.1", optional = true }
-futures-util = { version = "0.3", optional = true }
+async-trait = "0.1"
+futures-util = "0.3"
 jpx-engine = { version = "0.4.0", optional = true }
-reqwest = { version = "0.13", features = ["json", "form"], optional = true }
+reqwest = { version = "0.13", features = ["json", "form"] }
 yaml_serde = { version = "0.10.7", optional = true }
 redis = { version = "1", features = ["tokio-comp"], optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+dashmap = "6"
+tokio-stream = "0.1"
+http-body-util = "0.1.5"
+sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
+indexmap = "2"
 reqwest = { version = "0.13", features = ["json"] }
 tokio-stream = "0.1"
 tower-resilience-chaos = "0.14"
-tower-mcp = { version = "0.23.2", features = ["http", "http-client", "proxy", "websocket"] }
+tower-mcp = { version = "0.23.2", features = ["http", "http-client", "proxy", "websocket", "protocol-2026-07-28", "stateless"] }
 futures-util = "0.3"
 docker-wrapper = { version = "0.11.1", features = ["testing", "templates"] }
 uuid = { version = "1", features = ["v4"] }
@@ -90,8 +99,18 @@ proptest = "1.11.0"
 name = "proxy_overhead"
 harness = false
 
+# tower-mcp 0.23.2 plus this project's patches (kill-on-drop, SIGTERM shutdown,
+# init timeouts, empty proxy, HTTP reconnect), one commit each:
+# https://github.com/thexmeta/tower-mcp/commits/mcp-proxy-patches
+# Pinned to a commit so every build resolves the same source.
+[patch.crates-io]
+tower-mcp = { git = "https://github.com/thexmeta/tower-mcp", rev = "816bdf29d04eefe1f11b1fae5d0c75b76c16fbd9" }
+tower-mcp-types = { git = "https://github.com/thexmeta/tower-mcp", rev = "816bdf29d04eefe1f11b1fae5d0c75b76c16fbd9" }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "fat"
 strip = true
+
+
