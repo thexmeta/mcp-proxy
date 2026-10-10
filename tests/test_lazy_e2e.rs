@@ -67,6 +67,7 @@ fn lazy_config(dir: &Path, server: &Path) -> ProxyConfig {
             endpoint_group_list: vec![],
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
@@ -539,6 +540,7 @@ async fn g1_global_default_spawn_mode_registers_lazy() {
             endpoint_group_list: vec![],
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
@@ -659,6 +661,7 @@ async fn g2_all_lazy_proxy_builds_with_zero_eager_backends() {
             endpoint_group_list: vec![],
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
@@ -777,6 +780,7 @@ async fn g3_http_backends_not_excluded_by_lazy_default() {
             endpoint_group_list: vec![],
             default_spawn_mode: SpawnMode::Lazy,
             default_idle_timeout_secs: Some(600),
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
@@ -1386,6 +1390,7 @@ async fn e9_lazy_spawn_failure_returns_jsonrpc_error_with_request_id() {
             endpoint_group_list: vec![],
             default_spawn_mode: SpawnMode::Eager,
             default_idle_timeout_secs: None,
+            default_idle_teardown: Default::default(),
             protocol_support: mcp_proxy::config::ProtocolSupportConfig::default(),
             init_timeout: None,
         },
@@ -1577,7 +1582,7 @@ async fn e9_lazy_spawn_failure_returns_jsonrpc_error_with_request_id() {
 }
 
 // ---------------------------------------------------------------------------
-// I3: 2024-11-05 backends
+// I1-I3: idle teardown opt-in (ADR-0007) and 2024-11-05 backends
 // ---------------------------------------------------------------------------
 
 /// Write `body` to a fresh temp script for `tag`.
@@ -1589,6 +1594,68 @@ fn write_server(tag: &str, body: &str) -> std::path::PathBuf {
     ));
     std::fs::write(&server, body).expect("write server script");
     server
+}
+
+/// A session-based (2025-11-25) lazy backend that opted into
+/// `idle_teardown = "always"` is stopped once its idle timer expires.
+#[tokio::test]
+async fn i1_always_policy_idles_out_session_backend() {
+    let dir = test_dir("i1");
+    let server = write_server("i1", MIN_MCP_SERVER);
+    let mut cfg = lazy_config(&dir, &server);
+    cfg.backends[1].idle_timeout_secs = Some(1);
+    cfg.backends[1].idle_teardown = Some(mcp_proxy::config::IdleTeardown::Always);
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds");
+    let reg = proxy.lazy_registry();
+
+    reg.ensure_spawned("files").await.expect("spawn");
+    assert_eq!(
+        reg.protocol_version("files").as_deref(),
+        Some("2025-11-25"),
+        "precondition: a session-based backend"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    assert!(
+        reg.idle_out("files").await.expect("idle_out runs"),
+        "an opted-in session backend must idle out (I1)"
+    );
+    assert_eq!(reg.spawn_state("files"), SpawnState::Down);
+    assert!(
+        !reg.proxy_has_namespace("files"),
+        "the child must be removed from the proxy (I1)"
+    );
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The default policy keeps the same session-based backend alive.
+#[tokio::test]
+async fn i2_default_policy_keeps_session_backend_alive() {
+    let dir = test_dir("i2");
+    let server = write_server("i2", MIN_MCP_SERVER);
+    let mut cfg = lazy_config(&dir, &server);
+    cfg.backends[1].idle_timeout_secs = Some(1);
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds");
+    let reg = proxy.lazy_registry();
+
+    reg.ensure_spawned("files").await.expect("spawn");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    assert!(
+        !reg.idle_out("files").await.expect("idle_out runs"),
+        "a session backend must stay up by default (I2)"
+    );
+    assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    assert!(reg.proxy_has_namespace("files"));
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Regression: a backend that answers `initialize` with 2024-11-05 (as

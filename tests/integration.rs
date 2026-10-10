@@ -1366,6 +1366,7 @@ fn make_proxy_config(protocol_versions: Vec<&str>) -> ProxyConfig {
             endpoint_group_list: vec![],
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
+            default_idle_teardown: Default::default(),
             protocol_support: ProtocolSupportConfig {
                 versions: protocol_versions.into_iter().map(String::from).collect(),
                 default_protocol_version: None,
@@ -1973,6 +1974,7 @@ async fn lazy_backend_registered_down_and_not_in_proxy_namespaces() {
             endpoint_group_list: vec![],
             default_spawn_mode: mcp_proxy::config::SpawnMode::Eager,
             default_idle_timeout_secs: None,
+            default_idle_teardown: Default::default(),
             protocol_support: ProtocolSupportConfig::default(),
             init_timeout: None,
         },
