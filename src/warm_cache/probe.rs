@@ -92,7 +92,11 @@ impl ProbeRunner {
             .await
             .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
 
-        let client = McpClient::connect_with_handler(transport, ())
+        // Same acceptance as the proxy itself, so a 2024-11-05 backend gets a
+        // warm catalog instead of a failed probe.
+        let client = McpClient::builder()
+            .accept_protocol_2024_11_05(true)
+            .connect(transport, ())
             .await
             .map_err(|e| ProbeError::Spawn(backend.name.clone(), e.into()))?;
 
