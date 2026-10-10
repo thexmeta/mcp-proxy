@@ -1,6 +1,7 @@
 //! Live proxy integration tests.
 //!
-//! These tests load the real config file at `/home/mxadm/.mcp-proxy/config.toml`,
+//! These tests load a real config file (`MCP_PROXY_LIVE_CONFIG`, default
+//! `~/.mcp-proxy/config.toml`); the config checks skip when it does not exist,
 //! start the full proxy on a random port, and exercise it over HTTP.
 //!
 //! Run with: `cargo test --test live_proxy -- --ignored` (most tests need live
@@ -92,10 +93,31 @@ fn shared_proxy_addr() -> SocketAddr {
 // Config
 // ---------------------------------------------------------------------------
 
-const LIVE_CONFIG: &str = "/home/mxadm/.mcp-proxy/config.toml";
+/// The live config: `MCP_PROXY_LIVE_CONFIG`, else `~/.mcp-proxy/config.toml`.
+/// `None` when the file does not exist.
+fn live_config_path() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("MCP_PROXY_LIVE_CONFIG")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".mcp-proxy/config.toml"))
+        })?;
+    path.exists().then_some(path)
+}
+
+/// Skip a config check when no live config exists (CI, fresh clones).
+macro_rules! require_live_config {
+    () => {
+        if live_config_path().is_none() {
+            eprintln!("skipped: no live config (set MCP_PROXY_LIVE_CONFIG)");
+            return;
+        }
+    };
+}
 
 fn load_live_config() -> ProxyConfig {
-    let mut config = ProxyConfig::load(Path::new(LIVE_CONFIG)).expect("failed to load live config");
+    let path = live_config_path().expect("no live config: set MCP_PROXY_LIVE_CONFIG");
+    let mut config = ProxyConfig::load(&path).expect("failed to load live config");
     config.resolve_env_vars();
     config
 }
@@ -188,6 +210,7 @@ async fn list_all_tools(client: &reqwest::Client, addr: SocketAddr) -> Vec<Value
 
 #[test]
 fn live_config_disabled_backends_excluded() {
+    require_live_config!();
     let config = load_live_config();
     let disabled: Vec<&str> = config
         .backends
@@ -203,6 +226,7 @@ fn live_config_disabled_backends_excluded() {
 
 #[test]
 fn live_config_hide_tools_populated() {
+    require_live_config!();
     let config = load_live_config();
     let roslyn = config.backends.iter().find(|b| b.name == "roslyn").unwrap();
     assert!(roslyn.hide_tools.len() >= 5, "roslyn should hide ≥5 tools");
@@ -217,6 +241,7 @@ fn live_config_hide_tools_populated() {
 
 #[test]
 fn live_config_rename_all_populated() {
+    require_live_config!();
     let config = load_live_config();
     let roslyn = config.backends.iter().find(|b| b.name == "roslyn").unwrap();
     assert!(
@@ -236,6 +261,7 @@ fn live_config_rename_all_populated() {
 
 #[test]
 fn live_config_aliases_populated() {
+    require_live_config!();
     let config = load_live_config();
     let avalonia_spy = config
         .backends
@@ -254,6 +280,7 @@ fn live_config_aliases_populated() {
 
 #[test]
 fn live_config_endpoint_group_list() {
+    require_live_config!();
     let config = load_live_config();
     // `endpoint_group_list` is expanded into `endpoint_groups` during load,
     // so verify the expanded route entries exist.
@@ -283,6 +310,7 @@ fn live_config_endpoint_group_list() {
 
 #[test]
 fn live_config_global_middleware() {
+    require_live_config!();
     let config = load_live_config();
     assert!(
         config.proxy.timeout.is_some(),
@@ -304,6 +332,7 @@ fn live_config_global_middleware() {
 
 #[test]
 fn live_config_parses() {
+    require_live_config!();
     let config = load_live_config();
     assert_eq!(config.proxy.name, "srv");
     assert!(!config.backends.is_empty());
@@ -311,6 +340,7 @@ fn live_config_parses() {
 
 #[test]
 fn live_config_has_endpoint_groups() {
+    require_live_config!();
     let config = load_live_config();
     // The live config tags backends with endpoint_groups = ["lsp", "code", etc.].
     // There may or may not be explicit [[proxy.endpoint_groups]] route entries.
@@ -346,6 +376,7 @@ fn live_config_has_endpoint_groups() {
 
 #[test]
 fn live_config_backends_have_groups() {
+    require_live_config!();
     let config = load_live_config();
     let with_groups: Vec<&str> = config
         .backends
@@ -1458,7 +1489,7 @@ async fn os_endpoint_group_scopes_tools() {
 /// silently failed. After the fix, each group exposes its lazy backends' cached
 /// tools.
 ///
-/// Runs against the live config at `/home/mxadm/.mcp-proxy/config.toml`.
+/// Runs against the live config (`MCP_PROXY_LIVE_CONFIG`).
 #[tokio::test]
 #[ignore]
 async fn all_endpoint_groups_expose_tools() {
@@ -1576,7 +1607,7 @@ async fn default_endpoint_exposes_full_tool_set() {
 // they only run with `cargo test --test live_proxy -- --ignored`.
 //
 // They build their OWN proxy from an in-code config (NOT the shared live proxy)
-// because the live config at `/home/mxadm/.mcp-proxy/config.toml` is unrelated
+// because the live config (`MCP_PROXY_LIVE_CONFIG`) is unrelated
 // to the lazy feature under test.
 
 /// Minimal MCP stdio server (Python stdlib only). Exposes one tool `ping`.

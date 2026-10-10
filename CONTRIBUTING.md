@@ -8,7 +8,7 @@ belongs in the proxy rather than in a reusable tower-mcp layer.
 
 ## Development
 
-The project uses Rust 2024 and has a minimum supported Rust version of 1.90.
+The project uses Rust 2024 and has a minimum supported Rust version of 1.97.
 Use conventional commit prefixes such as `fix:`, `feat:`, `docs:`, `test:`, and
 `chore:`.
 
@@ -37,12 +37,12 @@ normal suite and takes approximately 1.2 seconds.
 
 ## Coverage and minimum Rust version
 
-CI checks all targets with default, all, and no default features on Rust 1.90:
+CI checks all targets with default, all, and no default features on Rust 1.97:
 
 ```sh
-cargo +1.90 check --locked --all-targets
-cargo +1.90 check --locked --all-targets --all-features
-cargo +1.90 check --locked --all-targets --no-default-features
+cargo +1.97 check --locked --all-targets
+cargo +1.97 check --locked --all-targets --all-features
+cargo +1.97 check --locked --all-targets --no-default-features
 ```
 
 To reproduce the coverage report, prepare Docker/Redis as above, then run:

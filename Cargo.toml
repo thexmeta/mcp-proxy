@@ -5,9 +5,9 @@ edition = "2024"
 rust-version = "1.97"
 description = "Standalone MCP proxy -- config-driven reverse proxy with auth, rate limiting, and observability"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/joshrotenberg/mcp-proxy"
-homepage = "https://github.com/joshrotenberg/mcp-proxy"
-documentation = "https://docs.rs/mcp-proxy"
+repository = "https://github.com/thexmeta/mcp-proxy"
+homepage = "https://github.com/thexmeta/mcp-proxy"
+publish = false
 readme = "README.md"
 keywords = ["mcp", "proxy", "tower", "json-rpc", "gateway"]
 categories = ["network-programming", "command-line-utilities"]
@@ -99,8 +99,10 @@ proptest = "1.11.0"
 name = "proxy_overhead"
 harness = false
 
-# tower-mcp 0.23.2 plus this project's patches (kill-on-drop, SIGTERM shutdown,
-# init timeouts, empty proxy, HTTP reconnect), one commit each:
+# tower-mcp 0.23.2 plus this project's patches (kill on drop, SIGTERM then
+# SIGKILL, initialize timeouts, empty proxy, with_client_and_config, reconnect
+# hook, HTTP survives transient errors, drop sends shutdown, opt-in 2024-11-05),
+# one commit each:
 # https://github.com/thexmeta/tower-mcp/commits/mcp-proxy-patches
 # Pinned to a commit so every build resolves the same source.
 [patch.crates-io]

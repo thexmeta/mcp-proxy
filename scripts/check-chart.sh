@@ -34,7 +34,7 @@ repo, rendered = map(pathlib.Path, sys.argv[1:])
 version = tomllib.loads((repo / 'Cargo.toml').read_text())['package']['version']
 for name in ('default', 'auth'):
     text = (rendered / f'{name}.yaml').read_text()
-    assert f'image: "ghcr.io/joshrotenberg/mcp-proxy:{version}"' in text
+    assert f'image: "ghcr.io/thexmeta/mcp-proxy:{version}"' in text
     assert 'path: /livez' in text and 'path: /readyz' in text
     assert '/admin/health' not in text
 assert 'name: ADMIN_TOKEN' in (rendered / 'auth.yaml').read_text()

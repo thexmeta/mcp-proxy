@@ -13,7 +13,10 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut config = ProxyConfig::load(Path::new("/home/mxadm/.mcp-proxy/config.toml"))?;
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_string());
+    let mut config = ProxyConfig::load(Path::new(&path))?;
     config.resolve_env_vars();
 
     println!("Config loaded, building proxy...");
