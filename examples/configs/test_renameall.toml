@@ -1,0 +1,22 @@
+[proxy]
+name = "test-gateway"
+version = "0.1.0"
+separator = "/"
+
+[proxy.listen]
+host = "127.0.0.1"
+port = 8080
+
+[[backends]]
+name = "files"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+
+[[backends.aliases]]
+from = "read_file"
+to = "read"
+
+[[backends.aliases]]
+from = "write_file"
+to = "write"

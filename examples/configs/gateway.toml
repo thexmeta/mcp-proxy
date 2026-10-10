@@ -1,0 +1,44 @@
+# Gateway config for local development
+#
+# Demonstrates protocol version configuration for MCP 2026-07-28.
+# Both 2026-07-28 (stateless) and 2025-11-25 (session-based) are enabled
+# by default for backward compatibility.
+#
+# Usage: mcp-proxy --config examples/gateway.toml
+
+[proxy]
+name = "test-gateway"
+version = "0.1.0"
+separator = "/"
+
+# Protocol version support
+# By default, both 2026-07-28 and 2025-11-25 are enabled.
+# Clients connecting via HTTP header "MCP-Protocol-Version" select the version.
+# For WebSocket, the Sec-WebSocket-Protocol header negotiates the version.
+[proxy.protocol_support]
+versions = ["2026-07-28", "2025-11-25"]
+# default_protocol_version = "2026-07-28"  # Uncomment to prefer 2026-07-28
+
+[proxy.listen]
+host = "127.0.0.1"
+port = 8080
+
+[[backends]]
+name = "files"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# Per-backend protocol version (for HTTP/WebSocket backends only)
+# If not set, the proxy negotiates the highest supported version.
+# protocol_version = "2026-07-28"
+
+[backends.timeout]
+seconds = 30
+
+[backends.concurrency]
+max_concurrent = 5
+
+[observability]
+audit = true
+log_level = "debug"
+json_logs = false

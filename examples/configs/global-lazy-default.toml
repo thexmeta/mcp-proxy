@@ -1,0 +1,49 @@
+# Global lazy-spawn defaults.
+#
+# Instead of repeating `spawn_mode = "lazy"` and `idle_timeout_secs = 600` on
+# every backend, set them once at the `[proxy]` level. Every backend that does
+# not declare its own `spawn_mode` / `idle_timeout_secs` inherits these globals.
+# A backend can still override the global per-backend (e.g. an eager one below).
+#
+# Usage: mcp-proxy --config examples/configs/global-lazy-default.toml
+
+[proxy]
+name = "lazy-gateway"
+version = "0.1.0"
+separator = "/"
+
+# Global defaults: every backend without an explicit spawn_mode/idle_timeout_secs
+# inherits these.
+default_spawn_mode = "lazy"
+default_idle_timeout_secs = 600
+
+[proxy.listen]
+host = "127.0.0.1"
+port = 8080
+
+# Warm tool cache: persisted catalog JSON files on disk.
+[warm_cache]
+enabled = true
+dir = "/tmp/mcp-proxy-warm"
+ttl_secs = 3600
+
+# Inherits the global `spawn_mode = "lazy"` and `idle_timeout_secs = 600`
+# (no per-backend override needed).
+[[backends]]
+name = "filesystem"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-filesystem", "/tmp"]
+cache_key_suffix = "v1"
+
+# Overrides the global default: this backend stays eager (always running).
+[[backends]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+spawn_mode = "eager"
+
+[observability]
+audit = true
+log_level = "info"

@@ -1,0 +1,62 @@
+# Example configuration demonstrating the rename_all feature
+# This configuration shows how to use glob patterns and regex patterns
+# to bulk rename tools from backends
+
+[proxy]
+name = "rename-all-demo"
+version = "1.0.0"
+
+[proxy.listen]
+host = "127.0.0.1"
+port = 8080
+
+# Example: A backend with tools that have a common prefix
+# The rename_all config will strip the prefix from all tools
+[[backends]]
+name = "api-v1"
+transport = "stdio"
+command = "echo"
+args = ["mock"]
+# Rename all tools from "api_v1_get_users" -> "get_users", "api_v1_create_user" -> "create_user"
+rename_all = [
+  { from = "api_v1_*", to = "*" }  # Glob pattern: strip "api_v1_" prefix
+]
+
+# Example: Another backend with different naming convention
+[[backends]]
+name = "legacy"
+transport = "stdio"
+command = "echo"
+args = ["mock"]
+# Rename legacy tools: "LEGACY_TOOL_GET_DATA" -> "get_data"
+rename_all = [
+  { from = "LEGACY_TOOL_*", to = "*" }  
+]
+# Strip "LEGACY_TOOL_" prefix
+
+# Example: Using regex patterns with capture groups
+# Rename "tool_v2_operation" -> "v2_operation"
+[[backends]]
+name = "versioned"
+transport = "stdio"
+command = "echo"
+args = ["mock"]
+rename_all = [
+  { from = "tool_v(\\d+)_(.+)", to = "v$1_$2" }  # Regex with capture groups
+]
+
+# Example: Multiple rename_all rules applied in order
+[[backends]]
+name = "multi-rule"
+transport = "stdio"
+command = "echo"
+args = ["mock"]
+rename_all = [
+  { from = "prefix_*", to = "*" },           # First: strip "prefix_"
+  { from = "*_suffix", to = "*" },           # Then: strip "_suffix"
+  { from = "(.+)_(.+)", to = "$2_$1" },      # Finally: swap parts with regex
+]
+
+# Global aliases can still be used alongside rename_all
+[aliases]
+"old_tool_name" = "new_tool_name"

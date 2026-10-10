@@ -3,6 +3,10 @@
 # Lightweight config for individual developers. Consolidates personal
 # MCP servers behind a single endpoint. No auth needed for local use.
 #
+# Supports both MCP 2026-07-28 (stateless) and 2025-11-25 (session-based)
+# protocols simultaneously. Clients auto-negotiate via HTTP headers or
+# WebSocket subprotocol negotiation.
+#
 # Usage: mcp-proxy --config examples/developer-local.toml
 #
 # See: docs/architectures.md #3
@@ -11,6 +15,13 @@
 name = "dev-local"
 version = "1.0.0"
 separator = "/"
+
+# Protocol version support
+# Both versions enabled by default for maximum client compatibility.
+# Claude Desktop, Cursor, and VS Code Copilot all support 2025-11-25.
+# Newer clients may use 2026-07-28 for stateless operation.
+[proxy.protocol_support]
+versions = ["2026-07-28", "2025-11-25"]
 
 [proxy.listen]
 host = "127.0.0.1"
