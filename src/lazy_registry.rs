@@ -278,6 +278,18 @@ impl LazyBackendRegistry {
     /// stale cache is harmless until overwritten by a fresh probe.
     pub async fn reconcile_config_change(&self, backend: &BackendConfig) -> anyhow::Result<String> {
         let new_hash = BinaryHasher::hash(backend);
+        // A running child was spawned from the OLD config. Stop it before the
+        // entry is replaced and reset to Down; otherwise the proxy keeps routing
+        // to the stale child while the registry says Down, and the next call's
+        // spawn collides with the still-registered namespace.
+        if self.spawn_state(&backend.name) == SpawnState::Up {
+            let removed = self.stop_child(&backend.name, "reconcile").await?;
+            tracing::info!(
+                backend = %backend.name,
+                removed,
+                "Stopped running lazy backend before applying its config change"
+            );
+        }
         // Update stored config (replaces entry, resets to Down).
         self.register_lazy(backend.clone());
         // If a cached catalog exists for the new hash, it is still valid; the
@@ -675,17 +687,7 @@ impl LazyBackendRegistry {
             return Ok(false);
         }
         // Perform idle-out: terminate the child and mark Down (catalog preserved).
-        let removed = match &self.idle_out_fn {
-            Some(f) => f(name).await,
-            None => match &self.proxy {
-                Some(proxy) => proxy.remove_backend(name).await,
-                None => {
-                    anyhow::bail!(
-                        "lazy registry runtime (proxy) not configured; cannot idle-out '{name}'"
-                    )
-                }
-            },
-        };
+        let removed = self.stop_child(name, "idle-out").await?;
         if removed {
             self.set_state_down(name);
             tracing::info!(
@@ -698,6 +700,24 @@ impl LazyBackendRegistry {
         } else {
             Ok(false)
         }
+    }
+
+    /// Terminate a backend's child through the shared proxy (or the test hook).
+    ///
+    /// Returns whether the proxy had the backend registered. `action` names
+    /// the caller in the error raised when no proxy is wired.
+    async fn stop_child(&self, name: &str, action: &str) -> anyhow::Result<bool> {
+        Ok(match &self.idle_out_fn {
+            Some(f) => f(name).await,
+            None => match &self.proxy {
+                Some(proxy) => proxy.remove_backend(name).await,
+                None => {
+                    anyhow::bail!(
+                        "lazy registry runtime (proxy) not configured; cannot {action} '{name}'"
+                    )
+                }
+            },
+        })
     }
 
     /// Spawn the background idle sweeper.
@@ -1278,6 +1298,36 @@ mod tests {
         assert!(!out, "session-based backend must be kept alive (C3)");
         assert_eq!(removed.load(Ordering::SeqCst), 0, "no removal performed");
         assert_eq!(reg.spawn_state("files"), SpawnState::Up, "stays Up");
+    }
+
+    /// Regression: reconcile resets a backend to Down, so a running child must
+    /// be stopped first. A Down backend has no child and nothing is stopped.
+    #[tokio::test]
+    async fn reconcile_stops_a_running_child_before_resetting_to_down() {
+        let (reg, removed) = idle_registry(Some(30));
+        reg.mark_up_for_test("files");
+        let changed = BackendConfig {
+            name: "files".to_string(),
+            transport: TransportType::Stdio,
+            idle_timeout_secs: Some(31),
+            ..Default::default()
+        };
+
+        reg.reconcile_config_change(&changed).await.unwrap();
+        assert_eq!(
+            removed.load(Ordering::SeqCst),
+            1,
+            "old child must be stopped"
+        );
+        assert_eq!(reg.spawn_state("files"), SpawnState::Down);
+        assert_eq!(reg.idle_timeout("files"), Some(31));
+
+        reg.reconcile_config_change(&changed).await.unwrap();
+        assert_eq!(
+            removed.load(Ordering::SeqCst),
+            1,
+            "a Down backend has no child to stop"
+        );
     }
 
     #[tokio::test]
