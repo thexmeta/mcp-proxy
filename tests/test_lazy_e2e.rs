@@ -1730,3 +1730,199 @@ async fn i4_config_change_on_running_lazy_backend_replaces_the_child() {
     let _ = std::fs::remove_file(&server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// I5-I6: config change while a real lazy spawn is still initializing
+// ---------------------------------------------------------------------------
+
+/// `MIN_MCP_SERVER` that logs "<MARKER> <pid>" to `$MARKER_FILE` at start
+/// and sleeps `$INIT_DELAY` seconds before answering `initialize`.
+fn slow_marked_server() -> String {
+    let body = MIN_MCP_SERVER
+        .replace(
+            "import sys, json\n",
+            "import sys, json, os, time\nif os.environ.get(\"MARKER_FILE\"):\n    open(os.environ[\"MARKER_FILE\"], \"a\").write(os.environ.get(\"MARKER\", \"\") + \" \" + str(os.getpid()) + \"\\n\")\n",
+        )
+        .replace(
+            "    if method == \"initialize\":\n",
+            "    if method == \"initialize\":\n        time.sleep(float(os.environ.get(\"INIT_DELAY\", \"0\")))\n",
+        );
+    assert!(body.contains("MARKER_FILE") && body.contains("INIT_DELAY"));
+    body
+}
+
+/// Children started for `files`, as (marker, pid, alive).
+fn started_children(markers: &Path) -> Vec<(String, u32, bool)> {
+    std::fs::read_to_string(markers)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (marker, pid) = line.split_once(' ')?;
+            let pid: u32 = pid.trim().parse().ok()?;
+            // Alive = present in /proc and not a zombie.
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| {
+                    stat.rsplit_once(')')
+                        .map(|(_, rest)| !rest.trim_start().starts_with('Z'))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            Some((marker.to_string(), pid, alive))
+        })
+        .collect()
+}
+
+async fn wait_for_marker(markers: &Path, marker: &str) {
+    for _ in 0..100 {
+        if started_children(markers)
+            .iter()
+            .any(|(m, _, _)| m == marker)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("child {marker} never started");
+}
+
+/// Lazy `files` (config A, 0.8 s initialize) plus the changed config B.
+fn slow_lazy_setup(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    ProxyConfig,
+    BackendConfig,
+) {
+    let dir = test_dir(tag);
+    let server = write_server(tag, &slow_marked_server());
+    let markers = std::env::temp_dir().join(format!(
+        "mcp-markers-{tag}-{}-{}.txt",
+        std::process::id(),
+        TEST_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&markers);
+    let mut cfg = lazy_config(&dir, &server);
+    let files = &mut cfg.backends[1];
+    files.env.insert("MARKER".to_string(), "A".to_string());
+    files.env.insert(
+        "MARKER_FILE".to_string(),
+        markers.to_string_lossy().to_string(),
+    );
+    files
+        .env
+        .insert("INIT_DELAY".to_string(), "0.8".to_string());
+    let mut changed = files.clone();
+    // Seed the warm catalog so startup does not probe `files`: the only
+    // child with marker A is then the one the first call spawns.
+    let seeded = files.clone();
+    seed_warm_catalog(&dir, &seeded, "2025-11-25");
+    changed.env.insert("MARKER".to_string(), "B".to_string());
+    changed.idle_timeout_secs = Some(31);
+    (dir, server, markers, cfg, changed)
+}
+
+/// After the dust settles: Up means exactly one live `files` child and it
+/// runs config B; any other state means no live child.
+fn assert_one_current_child(
+    reg: &mcp_proxy::lazy_registry::LazyBackendRegistry,
+    markers: &Path,
+    context: &str,
+) {
+    let started = started_children(markers);
+    let alive: Vec<&(String, u32, bool)> = started.iter().filter(|c| c.2).collect();
+    let state = reg.spawn_state("files");
+    eprintln!("{context}: state {state:?}, children {started:?}");
+    if state == SpawnState::Up {
+        assert!(
+            alive.len() == 1 && alive[0].0 == "B",
+            "{context}: registry is Up on config B, but live children are {alive:?} (all started: {started:?})"
+        );
+    } else {
+        assert!(
+            alive.is_empty(),
+            "{context}: registry is {state:?}, but live children are {alive:?}"
+        );
+    }
+}
+
+/// Integration: a config change lands while the first call's child is still
+/// in `initialize`. The registry must not end Up on config B with the
+/// config-A child serving it.
+#[tokio::test]
+async fn i5_reconcile_during_in_flight_spawn_leaves_no_stale_child() {
+    let (dir, server, markers, cfg, changed) = slow_lazy_setup("i5");
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds");
+    let reg = proxy.lazy_registry();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        started_children(&markers).is_empty(),
+        "precondition: no files child before the first call, got {:?}",
+        started_children(&markers)
+    );
+
+    let t1 = tokio::spawn({
+        let reg = reg.clone();
+        async move { reg.ensure_spawned("files").await }
+    });
+    wait_for_marker(&markers, "A").await;
+    reg.reconcile_config_change(&changed)
+        .await
+        .expect("reconcile");
+    let r1 = t1.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert_one_current_child(&reg, &markers, &format!("I5 (first call: {r1:?})"));
+
+    drop(proxy);
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_file(&markers);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Integration: the same race plus a second call after the change. Both
+/// calls must succeed and exactly one current child must remain.
+#[tokio::test]
+async fn i6_call_after_reconcile_during_spawn_yields_one_current_child() {
+    let (dir, server, markers, cfg, changed) = slow_lazy_setup("i6");
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds");
+    let reg = proxy.lazy_registry();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        started_children(&markers).is_empty(),
+        "precondition: no files child before the first call, got {:?}",
+        started_children(&markers)
+    );
+
+    let t1 = tokio::spawn({
+        let reg = reg.clone();
+        async move { reg.ensure_spawned("files").await }
+    });
+    wait_for_marker(&markers, "A").await;
+    reg.reconcile_config_change(&changed)
+        .await
+        .expect("reconcile");
+    let t2 = tokio::spawn({
+        let reg = reg.clone();
+        async move { reg.ensure_spawned("files").await }
+    });
+    let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "I6: both calls must succeed: first {r1:?}, second {r2:?}, children {:?}",
+        started_children(&markers)
+    );
+    assert_one_current_child(&reg, &markers, "I6");
+
+    drop(proxy);
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_file(&markers);
+    let _ = std::fs::remove_dir_all(&dir);
+}

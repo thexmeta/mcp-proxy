@@ -243,6 +243,17 @@ impl LazyBackendRegistry {
     /// hot-reload fingerprint loop removes the old entry first for replaces, so
     /// this is only a defensive overwrite for the add path.
     pub fn register_lazy(&self, backend: BackendConfig) {
+        // Keep the spawn guard of an entry being replaced: a spawn in flight,
+        // every caller queued behind it, and callers of the new entry must
+        // share one lock, or two children can start for one backend.
+        let spawn_guard = OnceLock::new();
+        if let Some(guard) = self
+            .backends
+            .get(&backend.name)
+            .and_then(|e| e.spawn_guard.get().cloned())
+        {
+            let _ = spawn_guard.set(guard);
+        }
         let entry = LazyBackendEntry {
             config: backend.clone(),
             catalog: None, // loaded lazily on first spawn / from cache
@@ -251,7 +262,7 @@ impl LazyBackendRegistry {
             refcount: AtomicUsize::new(0),
             last_touch: Mutex::new(Instant::now()),
             idle_timeout_secs: backend.idle_timeout_secs,
-            spawn_guard: OnceLock::new(),
+            spawn_guard,
         };
         self.backends.insert(backend.name.clone(), entry);
         tracing::info!(backend = %backend.name, "Registered lazy backend (not spawned)");
@@ -278,6 +289,19 @@ impl LazyBackendRegistry {
     /// stale cache is harmless until overwritten by a fresh probe.
     pub async fn reconcile_config_change(&self, backend: &BackendConfig) -> anyhow::Result<String> {
         let new_hash = BinaryHasher::hash(backend);
+        // Serialize with a spawn in flight for this backend. `ensure_spawned`
+        // holds the guard from spawn through its post-spawn probe, so after
+        // this lock the backend is either fully Up or Down, never half-spawned
+        // from the old config. Waits at most the spawn's init and probe timeouts.
+        let guard = self.backends.get(&backend.name).map(|e| {
+            e.spawn_guard
+                .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        });
+        let _spawn_lock = match &guard {
+            Some(guard) => Some(guard.lock().await),
+            None => None,
+        };
         // A running child was spawned from the OLD config. Stop it before the
         // entry is replaced and reset to Down; otherwise the proxy keeps routing
         // to the stale child while the registry says Down, and the next call's
@@ -2001,6 +2025,413 @@ mod tests {
         assert!(
             store.load("codebase", &hash).is_some(),
             "transient errors must not delete the on-disk catalog"
+        );
+    }
+
+    // =====================================================================
+    // Reconcile vs in-flight spawn races.
+    //
+    // Invariant under test: when the registry says Up, exactly one child is
+    // registered and it was started from the config the registry now holds;
+    // when it says anything else, no child is registered. The spawn hook
+    // records the idle_timeout_secs of each child it registers, so a child
+    // started from a stale config is visible.
+    // =====================================================================
+
+    /// Instrumented hooks shared by the race tests.
+    struct RaceHooks {
+        /// idle_timeout_secs of every child the spawn hook registered, in order.
+        registered: Arc<Mutex<Vec<Option<u64>>>>,
+        /// Children stopped through the removal hook.
+        stopped: Arc<AtomicUsize>,
+        /// Highest number of spawns in flight at the same time.
+        max_in_flight: Arc<AtomicUsize>,
+        /// Permits the test releases to let a gated spawn or probe finish.
+        spawn_gate: Arc<tokio::sync::Semaphore>,
+        probe_gate: Arc<tokio::sync::Semaphore>,
+        /// One message per spawn or probe that has started.
+        spawn_started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        probe_started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        /// Artificial latency (microseconds) for the stress test.
+        spawn_delay_us: Arc<std::sync::atomic::AtomicU64>,
+        probe_delay_us: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    fn race_cfg(idle: u64) -> BackendConfig {
+        BackendConfig {
+            name: "files".to_string(),
+            transport: TransportType::Stdio,
+            spawn_mode: SpawnMode::Lazy,
+            idle_timeout_secs: Some(idle),
+            ..Default::default()
+        }
+    }
+
+    /// Registry for `files` (idle_timeout_secs = 10) with instrumented hooks.
+    /// A gated hook waits for one permit per call.
+    fn race_registry(gate_spawn: bool, gate_probe: bool) -> (Arc<LazyBackendRegistry>, RaceHooks) {
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let spawn_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let probe_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (spawn_tx, spawn_started) = tokio::sync::mpsc::unbounded_channel();
+        let (probe_tx, probe_started) = tokio::sync::mpsc::unbounded_channel();
+        let spawn_delay_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_delay_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let spawn_fn: SpawnBackendFn = {
+            let (registered, in_flight, max_in_flight, gate, delay) = (
+                registered.clone(),
+                in_flight.clone(),
+                max_in_flight.clone(),
+                spawn_gate.clone(),
+                spawn_delay_us.clone(),
+            );
+            Arc::new(move |cfg: &BackendConfig| {
+                let idle = cfg.idle_timeout_secs;
+                let (registered, in_flight, max_in_flight, gate, delay, tx) = (
+                    registered.clone(),
+                    in_flight.clone(),
+                    max_in_flight.clone(),
+                    gate.clone(),
+                    delay.clone(),
+                    spawn_tx.clone(),
+                );
+                Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    let _ = tx.send(());
+                    if gate_spawn {
+                        gate.acquire().await.expect("spawn gate open").forget();
+                    }
+                    let us = delay.load(Ordering::SeqCst);
+                    if us > 0 {
+                        tokio::time::sleep(Duration::from_micros(us)).await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    registered.lock().unwrap().push(idle);
+                    Ok(())
+                })
+            })
+        };
+        let probe_fn: ProbeBackendFn = {
+            let (gate, delay) = (probe_gate.clone(), probe_delay_us.clone());
+            Arc::new(move |cfg: &BackendConfig, _sep: &str| {
+                let name = cfg.name.clone();
+                let idle = cfg.idle_timeout_secs;
+                let (gate, delay, tx) = (gate.clone(), delay.clone(), probe_tx.clone());
+                Box::pin(async move {
+                    let _ = tx.send(());
+                    if gate_probe {
+                        gate.acquire().await.expect("probe gate open").forget();
+                    }
+                    let us = delay.load(Ordering::SeqCst);
+                    if us > 0 {
+                        tokio::time::sleep(Duration::from_micros(us)).await;
+                    }
+                    let tool = ToolDefinition {
+                        name: format!("tool_from_idle_{}", idle.unwrap_or(0)),
+                        title: None,
+                        description: None,
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: None,
+                        icons: None,
+                        annotations: None,
+                        execution: None,
+                        meta: None,
+                    };
+                    Ok(WarmCatalog::from_probe_result(
+                        &name,
+                        "/",
+                        vec![tool],
+                        vec![],
+                        vec![],
+                        vec![],
+                        Some("2025-11-25".to_string()),
+                        "racehash".to_string(),
+                    ))
+                })
+            })
+        };
+        let stop_fn: IdleOutFn = {
+            let stopped = stopped.clone();
+            Arc::new(move |_name: &str| {
+                let stopped = stopped.clone();
+                Box::pin(async move {
+                    stopped.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            })
+        };
+        let reg = LazyBackendRegistry::from_backends(vec![LazyBackend {
+            config: race_cfg(10),
+            catalog: None,
+            protocol_version: None,
+        }])
+        .with_test_hooks(spawn_fn, probe_fn)
+        .with_idle_out_hook(stop_fn);
+        (
+            Arc::new(reg),
+            RaceHooks {
+                registered,
+                stopped,
+                max_in_flight,
+                spawn_gate,
+                probe_gate,
+                spawn_started,
+                probe_started,
+                spawn_delay_us,
+                probe_delay_us,
+            },
+        )
+    }
+
+    /// Check the invariant described above. `Err` explains the violation.
+    fn child_matches_config(reg: &LazyBackendRegistry, h: &RaceHooks) -> Result<(), String> {
+        let registered = h.registered.lock().unwrap().clone();
+        let stopped = h.stopped.load(Ordering::SeqCst);
+        let alive = registered.len().saturating_sub(stopped);
+        let state = reg.spawn_state("files");
+        let current = reg.idle_timeout("files");
+        if state == SpawnState::Up {
+            if alive != 1 {
+                return Err(format!(
+                    "Up with {alive} live children (registered {registered:?}, stopped {stopped})"
+                ));
+            }
+            let last = *registered.last().expect("one registered child");
+            if last != current {
+                return Err(format!(
+                    "Up, but the live child was started with idle_timeout_secs {last:?} while the registry holds {current:?}"
+                ));
+            }
+        } else if alive != 0 {
+            return Err(format!(
+                "{state:?}, but {alive} child(ren) still registered (registered {registered:?}, stopped {stopped})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Unit: a config change that lands while the first spawn is still
+    /// initializing must not end with the registry Up on the new config and
+    /// the old-config child serving it.
+    #[tokio::test]
+    async fn race_reconcile_during_in_flight_spawn_keeps_child_and_config_in_step() {
+        let (reg, mut h) = race_registry(true, false);
+        let t1 = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.ensure_spawned("files").await }
+        });
+        h.spawn_started.recv().await.expect("spawn started");
+
+        let change = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.reconcile_config_change(&race_cfg(20)).await }
+        });
+        // Let the change queue behind the in-flight spawn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.spawn_gate.add_permits(1);
+        t1.await.unwrap().expect("first call");
+        change.await.unwrap().unwrap();
+
+        if let Err(violation) = child_matches_config(&reg, &h) {
+            panic!("reconcile raced an in-flight spawn: {violation}");
+        }
+    }
+
+    /// Unit: a call that arrives after the config change, while the first
+    /// spawn is still in flight, must not start a second child concurrently
+    /// (the spawn guard is meant to allow one spawn per backend).
+    #[tokio::test]
+    async fn race_call_after_reconcile_does_not_start_a_concurrent_second_child() {
+        let (reg, mut h) = race_registry(true, false);
+        let t1 = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.ensure_spawned("files").await }
+        });
+        h.spawn_started.recv().await.expect("first spawn started");
+        let change = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.reconcile_config_change(&race_cfg(20)).await }
+        });
+        // Let the change queue behind the in-flight spawn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let t2 = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.ensure_spawned("files").await }
+        });
+        let second_started =
+            tokio::time::timeout(Duration::from_millis(300), h.spawn_started.recv()).await;
+        h.spawn_gate.add_permits(2);
+        t1.await.unwrap().expect("first call");
+        change.await.unwrap().unwrap();
+        t2.await.unwrap().expect("second call");
+
+        assert!(
+            second_started.is_err(),
+            "a second spawn started while the first was in flight (max in flight {}, registered {:?})",
+            h.max_in_flight.load(Ordering::SeqCst),
+            h.registered.lock().unwrap()
+        );
+        if let Err(violation) = child_matches_config(&reg, &h) {
+            panic!("after the race: {violation}");
+        }
+    }
+
+    /// Unit: reconcile can land after the spawn marked the backend Up but
+    /// before its post-spawn probe returns. The child is stopped and the new
+    /// entry is Down; the stopped child's probe must not write its protocol
+    /// version or catalog into the new entry.
+    #[tokio::test]
+    async fn race_probe_of_stopped_child_does_not_write_into_the_new_entry() {
+        let (reg, mut h) = race_registry(false, true);
+        let t1 = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.ensure_spawned("files").await }
+        });
+        h.probe_started.recv().await.expect("probe started");
+        assert_eq!(reg.spawn_state("files"), SpawnState::Up, "precondition");
+
+        let change = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.reconcile_config_change(&race_cfg(20)).await }
+        });
+        // Let the change queue behind the in-flight spawn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.probe_gate.add_permits(1);
+        t1.await.unwrap().expect("first call");
+        change.await.unwrap().unwrap();
+
+        assert_eq!(h.stopped.load(Ordering::SeqCst), 1, "old child stopped");
+        assert_eq!(reg.spawn_state("files"), SpawnState::Down);
+        assert_eq!(
+            reg.protocol_version("files"),
+            None,
+            "the stopped child's probe wrote its protocol version into the new entry"
+        );
+        let leaked: Vec<String> = reg
+            .get("files")
+            .and_then(|b| b.catalog)
+            .map(|c| c.tools.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
+        assert!(
+            leaked.is_empty(),
+            "the stopped child's probe wrote an old-config catalog into the new entry: {leaked:?}"
+        );
+    }
+
+    /// Unit: a caller queued on the old entry's spawn lock and a caller that
+    /// arrives after the entry was replaced must share one lock, so the
+    /// second waits for the first instead of starting a parallel child.
+    #[tokio::test]
+    async fn race_callers_across_a_config_change_share_one_spawn_lock() {
+        let (reg, mut h) = race_registry(true, false);
+        let call = |reg: Arc<LazyBackendRegistry>| {
+            tokio::spawn(async move { reg.ensure_spawned("files").await })
+        };
+        let t1 = call(reg.clone());
+        h.spawn_started.recv().await.expect("first spawn started");
+        let change = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.reconcile_config_change(&race_cfg(20)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Queued on the old entry's lock, behind the first spawn and the change.
+        let t2 = call(reg.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Let the first spawn finish; the change then replaces the entry and
+        // t2 starts the new-config child.
+        h.spawn_gate.add_permits(1);
+        t1.await.unwrap().expect("first call");
+        change.await.unwrap().unwrap();
+        h.spawn_started.recv().await.expect("second spawn started");
+
+        // Arrives on the replaced entry while t2's spawn is in flight.
+        let t3 = call(reg.clone());
+        let third_started =
+            tokio::time::timeout(Duration::from_millis(300), h.spawn_started.recv()).await;
+        h.spawn_gate.add_permits(2);
+        t2.await.unwrap().expect("second call");
+        t3.await.unwrap().expect("third call");
+
+        assert!(
+            third_started.is_err(),
+            "a third spawn started in parallel (max in flight {}, registered {:?})",
+            h.max_in_flight.load(Ordering::SeqCst),
+            h.registered.lock().unwrap()
+        );
+        assert_eq!(h.max_in_flight.load(Ordering::SeqCst), 1);
+        if let Err(violation) = child_matches_config(&reg, &h) {
+            panic!("after the race: {violation}");
+        }
+    }
+
+    /// Regression (stress): random interleavings of a first call, a config
+    /// change and a later call on a multi-threaded runtime. Every round must
+    /// keep the invariant and must not leave a probe result on a Down entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_stress_reconcile_and_calls_keep_the_invariant() {
+        const ROUNDS: u64 = 300;
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rand_us = move |max: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % max
+        };
+        let mut violations = Vec::new();
+        for round in 0..ROUNDS {
+            let (reg, h) = race_registry(false, false);
+            let (spawn_us, probe_us, change_us, call_us) =
+                (rand_us(2000), rand_us(2000), rand_us(3000), rand_us(3000));
+            h.spawn_delay_us.store(spawn_us, Ordering::SeqCst);
+            h.probe_delay_us.store(probe_us, Ordering::SeqCst);
+
+            let t1 = tokio::spawn({
+                let reg = reg.clone();
+                async move { reg.ensure_spawned("files").await }
+            });
+            tokio::time::sleep(Duration::from_micros(change_us)).await;
+            reg.reconcile_config_change(&race_cfg(20)).await.unwrap();
+            tokio::time::sleep(Duration::from_micros(call_us)).await;
+            let t2 = tokio::spawn({
+                let reg = reg.clone();
+                async move { reg.ensure_spawned("files").await }
+            });
+            let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
+
+            let delays = format!(
+                "spawn {spawn_us}us probe {probe_us}us change@{change_us}us call@+{call_us}us"
+            );
+            if let Err(e) = r1.as_ref().and(r2.as_ref()) {
+                violations.push(format!("round {round} ({delays}): call failed: {e}"));
+            } else if let Err(v) = child_matches_config(&reg, &h) {
+                violations.push(format!("round {round} ({delays}): {v}"));
+            } else if h.max_in_flight.load(Ordering::SeqCst) > 1 {
+                violations.push(format!("round {round} ({delays}): two spawns in flight"));
+            } else if reg.spawn_state("files") != SpawnState::Up
+                && reg.protocol_version("files").is_some()
+            {
+                violations.push(format!(
+                    "round {round} ({delays}): probe result left on a {:?} entry",
+                    reg.spawn_state("files")
+                ));
+            }
+        }
+        eprintln!(
+            "race stress: {} of {ROUNDS} rounds broke an invariant",
+            violations.len()
+        );
+        assert!(
+            violations.is_empty(),
+            "{} of {ROUNDS} rounds broke an invariant; first 5: {:#?}",
+            violations.len(),
+            &violations[..violations.len().min(5)]
         );
     }
 }
