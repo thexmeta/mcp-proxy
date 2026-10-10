@@ -258,10 +258,9 @@ where
                             ),
                             _ if conflict => {
                                 let hint = format!(
-                                    "Backend '{target_owned}' exited immediately during initialize \
-                                     (possible singleton conflict). The proxy never kills foreign \
-                                     processes; if another instance holds the singleton, stop it \
-                                     before retrying."
+                                    "Backend '{target_owned}' exited immediately during initialize. \
+                                     Check its stderr in the proxy log. The proxy never kills \
+                                     foreign processes."
                                 );
                                 let data = serde_json::json!({
                                     "backend": target_owned,
