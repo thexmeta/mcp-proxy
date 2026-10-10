@@ -1687,3 +1687,46 @@ async fn i3_2024_11_05_backend_builds_and_spawns_lazily() {
     let _ = std::fs::remove_file(&server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression: a hot-reload config change on a running lazy backend must stop
+/// the old child before the registry marks the backend Down. Otherwise the old
+/// child stays registered in the proxy (with the old config) while the
+/// registry says Down, and the next call's spawn collides with it.
+#[tokio::test]
+async fn i4_config_change_on_running_lazy_backend_replaces_the_child() {
+    let dir = test_dir("i4");
+    let server = write_server("i4", MIN_MCP_SERVER);
+    let cfg = lazy_config(&dir, &server);
+    let mut changed = cfg.backends[1].clone();
+    changed.idle_timeout_secs = Some(31);
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("proxy builds");
+    let reg = proxy.lazy_registry();
+
+    reg.ensure_spawned("files").await.expect("first spawn");
+    assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    assert!(
+        reg.proxy_has_namespace("files"),
+        "precondition: child registered"
+    );
+
+    reg.reconcile_config_change(&changed)
+        .await
+        .expect("reconcile");
+    assert_eq!(reg.spawn_state("files"), SpawnState::Down);
+    assert!(
+        !reg.proxy_has_namespace("files"),
+        "the old child must be removed once the registry says Down (I4)"
+    );
+
+    reg.ensure_spawned("files")
+        .await
+        .expect("the next call must respawn with the new config (I4)");
+    assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    assert!(reg.proxy_has_namespace("files"));
+    assert_eq!(reg.idle_timeout("files"), Some(31));
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
