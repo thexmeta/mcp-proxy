@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.2-b3] - Unreleased
+
+This repository is a standalone continuation of
+[joshrotenberg/mcp-proxy](https://github.com/joshrotenberg/mcp-proxy), rebased on
+its v0.6.0 release. Version numbers here are this repository's own and do not
+track upstream releases. Upstream history is kept unchanged as the base.
+
+### Added
+
+- Lazy stdio backends (`spawn_mode = "lazy"`): not started until the first call,
+  tool list served from a persisted warm catalog meanwhile, concurrent first
+  calls share one spawn.
+- Idle teardown policy per backend: `idle_teardown = "stateless" | "always"`,
+  with `[proxy] default_idle_teardown` (default `stateless`). `always` also stops
+  session-based backends after `idle_timeout_secs`; their session state is lost.
+  See ADR-0007.
+- Opt-in acceptance of backends that answer MCP 2024-11-05. The proxy turns it
+  on for every connection path (startup, hot reload, lazy spawn, admin add,
+  warm-catalog probe).
+- Endpoint groups with a shared backend pool: each backend starts once however
+  many groups reference it. Shorthand `endpoint_group_list`, reverse references,
+  group-aware capability filtering.
+- Global defaults: `[proxy.backend_env]`, `[proxy.timeout]`,
+  `[proxy.circuit_breaker]`, `[proxy.retry]`.
+- Alias engine: `rename_all` on full namespaced names, literal patterns,
+  dynamic updates.
+- MCP 2026-07-28 support next to 2025-11-25: stateless requests, per-request
+  `_meta` validation, `server/discover`, `subscriptions/listen`,
+  `[proxy.protocol_support]`, per-backend `protocol_version`.
+- Per-client rate limiting by `_meta.clientInfo.name`; `proxy/protocol_info`
+  admin tool; MRTR stubs for sampling and elicitation.
+- Backend initialize timeouts and HTTP client settings; CORS configuration;
+  systemd sandbox detection; refusal of self-referencing HTTP backends.
+- Debian packaging (nfpm) with a generic system unit; site settings go in a
+  systemd drop-in.
+- ADR-0003 to ADR-0007.
+
+### Fixed
+
+- A backend that answers the handshake with an unsupported protocol version
+  is no longer reported as a "spawn conflict", and its warm catalog is kept.
+  The error now says "protocol version not supported". The singleton hint
+  appears only for backends flagged `singleton_externally_managed`.
+- A config change on a running lazy backend now stops the old child before
+  resetting it. Previously the old child kept running untracked.
+- A config change during an in-flight spawn can no longer leave two children
+  running, or mark the new config as up while the old child serves it.
+- Endpoint groups made only of lazy stdio backends exposed 0 tools.
+- Lazy backends without `resources/list` got no warm catalog.
+- Lazy calls failed with "Unknown tool" when the backend name contains the
+  separator (longest-prefix match).
+- Hot reload false positives from spurious watcher events.
+- stdio children are killed when dropped, get SIGTERM then SIGKILL, and an
+  initialize timeout leaves no orphan process.
+
+### Changed
+
+- tower-mcp comes from the fork `thexmeta/tower-mcp` (0.23.2 plus 9 patches:
+  kill on drop, SIGTERM then SIGKILL, initialize timeouts, empty proxy allowed,
+  `with_client_and_config`, reconnect hook, HTTP survives transient errors,
+  client drop sends shutdown, 2024-11-05 opt-in) through `[patch.crates-io]`.
+  The crate is not published (`publish = false`).
+- Minimum Rust version 1.97.
+- Example configs moved to `examples/configs/`.
+- A config change on a backend that is mid-spawn now waits for that spawn to
+  finish (up to the initialize timeout plus the 5 second probe).
+- Releases no longer publish to crates.io or a Homebrew tap.
+
+### Known limitations
+
+- Child stderr goes to the journal, not into error messages.
+- Removing a backend while it is mid-spawn is not covered by a race test.
+- 2024-11-05 backends are accepted on the basis that later protocol changes
+  are additive; there is no per-feature downgrade.
+- The two Redis cache tests need Docker.
+
 ## [0.6.0] - 2026-10-03
 
 ### Migration

@@ -1,0 +1,16 @@
+mcp-proxy
+https://github.com/thexmeta/mcp-proxy
+
+This project is a continuation of mcp-proxy by Josh Rotenberg
+(https://github.com/joshrotenberg/mcp-proxy). Everything up to and
+including its v0.6.0 release is the work of Josh Rotenberg and the
+mcp-proxy contributors; that history is kept unchanged in this repository.
+
+Changes after v0.6.0, and the patches in the tower-mcp fork
+(https://github.com/thexmeta/tower-mcp, branch mcp-proxy-patches), are by
+Eser Kelleci.
+
+tower-mcp is by Josh Rotenberg (https://github.com/joshrotenberg/tower-mcp).
+
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE)
+or the MIT license (LICENSE-MIT), at your option.
