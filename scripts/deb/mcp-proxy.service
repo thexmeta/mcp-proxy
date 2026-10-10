@@ -1,0 +1,34 @@
+[Unit]
+Description=mcp-proxy - MCP reverse proxy
+Documentation=https://github.com/thexmeta/mcp-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a transient system user. Site-specific settings (another user,
+# secret loading, extra paths) belong in a drop-in, for example
+# /etc/systemd/system/mcp-proxy.service.d/40-local.conf, which survives
+# package upgrades.
+DynamicUser=yes
+ConfigurationDirectory=mcp-proxy
+StateDirectory=mcp-proxy
+CacheDirectory=mcp-proxy
+ExecStart=/usr/bin/mcp-proxy --config /etc/mcp-proxy/config.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-proxy
+Environment=RUST_LOG=warn,mcp_proxy=info
+
+# Hardening. stdio backends run as children of the proxy and inherit these
+# limits; relax them per site in a drop-in.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
