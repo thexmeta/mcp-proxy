@@ -87,7 +87,12 @@ pub(crate) async fn build_mcp_proxy_for_backends(
     kill_timeout_secs: u64,
     global_force_kill: bool,
 ) -> Result<(McpProxy, HashMap<String, CbHandle>)> {
-    let mut builder = McpProxy::builder(proxy_name, proxy_version).separator(separator);
+    // Many stdio servers still answer `initialize` with 2024-11-05. Accept it
+    // for startup backends and for every backend added later (hot reload,
+    // lazy spawn, admin add), which inherit the setting from this proxy.
+    let mut builder = McpProxy::builder(proxy_name, proxy_version)
+        .separator(separator)
+        .accept_protocol_2024_11_05(true);
     let mut cb_handles: HashMap<String, CbHandle> = HashMap::new();
 
     if let Some(instructions) = proxy_instructions {

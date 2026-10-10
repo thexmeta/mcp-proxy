@@ -1575,3 +1575,48 @@ async fn e9_lazy_spawn_failure_returns_jsonrpc_error_with_request_id() {
     let _ = std::fs::remove_file(&server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// I3: 2024-11-05 backends
+// ---------------------------------------------------------------------------
+
+/// Write `body` to a fresh temp script for `tag`.
+fn write_server(tag: &str, body: &str) -> std::path::PathBuf {
+    let server = std::env::temp_dir().join(format!(
+        "mcp-min-srv-{tag}-{}-{}.py",
+        std::process::id(),
+        TEST_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::write(&server, body).expect("write server script");
+    server
+}
+
+/// Regression: a backend that answers `initialize` with 2024-11-05 (as
+/// ht-mcp, codegraph and other deployed servers do) builds as an eager
+/// backend and spawns as a lazy one.
+#[tokio::test]
+async fn i3_2024_11_05_backend_builds_and_spawns_lazily() {
+    let body = MIN_MCP_SERVER.replace(
+        r#"(req.get("params") or {}).get("protocolVersion","2025-11-25")"#,
+        r#""2024-11-05""#,
+    );
+    assert_ne!(body, MIN_MCP_SERVER, "fixture must answer 2024-11-05");
+    let dir = test_dir("i3");
+    let server = write_server("i3", &body);
+    // Both the eager dummy and the lazy backend run this server.
+    let cfg = lazy_config(&dir, &server);
+    let proxy = mcp_proxy::Proxy::from_config(cfg)
+        .await
+        .expect("a proxy whose only eager backend answers 2024-11-05 must build");
+    let reg = proxy.lazy_registry();
+
+    reg.ensure_spawned("files")
+        .await
+        .expect("a 2024-11-05 lazy backend must spawn");
+    assert_eq!(reg.spawn_state("files"), SpawnState::Up);
+    assert_eq!(reg.protocol_version("files").as_deref(), Some("2024-11-05"));
+    assert!(reg.proxy_has_namespace("files"));
+
+    let _ = std::fs::remove_file(&server);
+    let _ = std::fs::remove_dir_all(&dir);
+}

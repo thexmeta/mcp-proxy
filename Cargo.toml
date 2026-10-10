@@ -104,8 +104,8 @@ harness = false
 # https://github.com/thexmeta/tower-mcp/commits/mcp-proxy-patches
 # Pinned to a commit so every build resolves the same source.
 [patch.crates-io]
-tower-mcp = { git = "https://github.com/thexmeta/tower-mcp", rev = "816bdf29d04eefe1f11b1fae5d0c75b76c16fbd9" }
-tower-mcp-types = { git = "https://github.com/thexmeta/tower-mcp", rev = "816bdf29d04eefe1f11b1fae5d0c75b76c16fbd9" }
+tower-mcp = { git = "https://github.com/thexmeta/tower-mcp", rev = "679523389d4544c97bae5c9e5468a9e9e5fd71f7" }
+tower-mcp-types = { git = "https://github.com/thexmeta/tower-mcp", rev = "679523389d4544c97bae5c9e5468a9e9e5fd71f7" }
 
 # The profile that 'dist' will build with
 [profile.dist]
