@@ -561,6 +561,79 @@ dependency with `into_router()` for axum integration.
 
 ---
 
+## 16. Shared Backend Pool with Endpoint Groups
+
+**Scenario:** An organization has multiple AI teams (search, coding, data)
+that share the same set of MCP backends but need separate endpoints with
+different middleware and capability filters. Each backend process should
+spawn exactly once, regardless of how many groups reference it.
+
+**Architecture:**
+```
+Search Agent --> /search/mcp --> GroupFilter(search) --> shared McpProxy
+Coding Agent --> /coding/mcp --> GroupFilter(coding) -->     |
+Direct Client --> /mcp     --> McpProxy                    |
+                                              +--> context7 (1 process)
+                                              +--> tavily   (1 process)
+                                              +--> github   (1 process)
+```
+
+**How it works:**
+1. A single `McpProxy` is built with ALL backends. Each backend process
+   spawns exactly once.
+2. Each endpoint group wraps the shared proxy with its own middleware stack
+   and a `GroupFilterService` that restricts visibility to that group's
+   member backends.
+3. The default `/mcp` endpoint also uses the shared proxy, seeing all backends.
+
+**Config:**
+```toml
+# Global defaults reduce per-backend boilerplate
+[proxy.backend_env]
+LOG_LEVEL = "ERROR"
+
+[proxy.timeout]
+seconds = 30
+
+# Endpoint groups via shorthand (auto-creates /os, /web)
+proxy.endpoint_group_list = ["os", "web"]
+
+# Or detailed groups
+[[proxy.endpoint_groups]]
+name = "search"
+path = "/search"
+backends = ["context7", "tavily"]
+
+# Backends reference groups via reverse reference
+[[backends]]
+name = "context7"
+transport = "http"
+url = "http://localhost:3001/mcp"
+endpoint_groups = ["search", "coding"]
+```
+
+**Middleware flow:**
+```
+Per-endpoint-group (outermost to innermost):
+  Auth -> Audit -> Metrics -> [GroupFilter] -> Alias -> Filter -> Cache -> McpProxy
+
+Per-backend (inside the shared McpProxy):
+  Retry -> Timeout -> Circuit Breaker -> Backend
+```
+
+**Benefits:**
+- Resource efficiency: one process per backend, not per group
+- Consistent behavior: global middleware (auth, metrics) applies once
+- Flexible isolation: GroupFilter restricts tool visibility per endpoint
+- Hot reload: groups can be added/removed without restarting backends
+
+**Industry precedent:** This is analogous to Envoy's "shared listener" pattern
+where a single upstream connection pool serves multiple virtual hosts.
+The GroupFilterService is similar to Envoy's per-route filter chain
+that restricts which upstream clusters a route can access.
+
+---
+
 ## Cross-Cutting Observations
 
 ### Patterns from Traditional API Gateways That Map to MCP

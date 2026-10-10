@@ -1,0 +1,92 @@
+# Example configuration for endpoint groups
+# 
+# This config demonstrates how to group multiple MCP backends under
+# separate HTTP endpoints (e.g., /search/mcp, /coding/mcp, etc.)
+
+[proxy]
+name = "mcp-proxy"
+version = "0.4.3"
+separator = "."
+listen = { host = "127.0.0.1", port = 8080 }
+# expose_grouped_in_default = false  # Uncomment to hide grouped backends from default /mcp endpoint
+# tool_discovery = true
+
+[[backends]]
+name = "context7"
+transport = "http"
+url = "http://localhost:3001/mcp"
+enabled = true
+# This backend belongs to the "search" and "coding" endpoint groups
+endpoint_groups = ["search", "coding"]
+
+[[backends]]
+name = "deepwiki"
+transport = "http"
+url = "http://localhost:3002/mcp"
+enabled = true
+# This backend belongs to the "search" and "coding" endpoint groups
+endpoint_groups = ["search", "coding"]
+
+[[backends]]
+name = "tavily"
+transport = "http"
+url = "http://localhost:3003/mcp"
+enabled = true
+# This backend belongs to the "search" endpoint group
+endpoint_groups = ["search"]
+
+[[backends]]
+name = "exa"
+transport = "http"
+url = "http://localhost:3004/mcp"
+enabled = true
+# This backend belongs to the "search" endpoint group
+endpoint_groups = ["search"]
+
+[[backends]]
+name = "github"
+transport = "http"
+url = "http://localhost:3005/mcp"
+enabled = true
+# This backend belongs to the "coding" endpoint group
+endpoint_groups = ["coding"]
+
+[[backends]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+enabled = true
+# This backend is NOT in any endpoint group, so it's only available at the default /mcp endpoint
+
+# Endpoint groups create separate MCP endpoints at {path}/mcp
+# Each group gets its own tool namespace with the grouped backends
+[[endpoint_groups]]
+name = "search"
+path = "/search"
+backends = ["context7", "deepwiki", "tavily", "exa"]
+description = "Unified search across knowledge sources and web"
+tool_discovery = true
+# Optional: expose only specific tools
+# tools = ["context7/*", "deepwiki/*", "tavily/web_search", "exa/web_search_exa"]
+
+[[endpoint_groups]]
+name = "coding"
+path = "/coding"
+backends = ["context7", "deepwiki", "github"]
+description = "Code search and GitHub tools"
+tool_discovery = true
+
+# Tool groups organize tools under a common prefix in ListTools responses
+# without creating separate HTTP endpoints
+[[tool_groups]]
+name = "web_search"
+tools = ["tavily/web_search", "exa/web_search_exa"]
+description = "All web search tools"
+mirror_to_original = true
+
+[[tool_groups]]
+name = "code_search"
+tools = ["context7/*", "deepwiki/*", "github/*"]
+description = "All code search tools"
+mirror_to_original = true
