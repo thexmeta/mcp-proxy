@@ -3,7 +3,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/joshrotenberg/mcp-proxy
+  repository: ghcr.io/thexmeta/mcp-proxy
   tag: ""  # Defaults to Chart.appVersion
   pullPolicy: IfNotPresent
 

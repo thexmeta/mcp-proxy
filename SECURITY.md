@@ -8,7 +8,7 @@ releases are not maintained separately.
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities through a
-[private GitHub security advisory](https://github.com/joshrotenberg/mcp-proxy/security/advisories/new).
+[private GitHub security advisory](https://github.com/thexmeta/mcp-proxy/security/advisories/new).
 Do not open a public issue for a vulnerability that has not been disclosed.
 
 Include the affected version, a minimal reproduction, the expected impact, and
