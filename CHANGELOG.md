@@ -56,6 +56,11 @@ track upstream releases. Upstream history is kept unchanged as the base.
 - Hot reload false positives from spurious watcher events.
 - stdio children are killed when dropped, get SIGTERM then SIGKILL, and an
   initialize timeout leaves no orphan process.
+- Debian package upgrades no longer leave the service stopped and disabled.
+  preremove acts only on remove/deconfigure; postinstall restarts a running
+  service on upgrade and enables only on first install. Package release is
+  now 2. Upgrading from release 1 still runs the old preremove once, so the
+  service must be started (and re-enabled) by hand after that upgrade.
 
 ### Changed
 

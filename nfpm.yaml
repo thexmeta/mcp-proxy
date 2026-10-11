@@ -1,6 +1,6 @@
 name: 'mcp-proxy'
 version: '${VERSION}'
-release: '1'
+release: '2'
 epoch: '0'
 arch: 'amd64'
 section: 'utils'
