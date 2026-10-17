@@ -38,6 +38,16 @@ struct BackendInfo {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport: Option<String>,
+    /// Recovery attempts since the backend was last healthy.
+    #[serde(skip_serializing_if = "is_zero")]
+    recovery_attempts: u32,
+    /// Why the last recovery attempt failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_last_error: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize)]
@@ -144,6 +154,8 @@ fn build_admin_router(
                         consecutive_failures: b.consecutive_failures,
                         error: b.error.clone(),
                         transport: b.transport.clone(),
+                        recovery_attempts: b.recovery_attempts,
+                        recovery_last_error: b.recovery_last_error.clone(),
                     })
                     .collect();
 
@@ -203,6 +215,8 @@ fn build_admin_router(
                         consecutive_failures: b.consecutive_failures,
                         error: b.error.clone(),
                         transport: b.transport.clone(),
+                        recovery_attempts: b.recovery_attempts,
+                        recovery_last_error: b.recovery_last_error.clone(),
                     })
                     .collect();
                 let healthy_count = backends.iter().filter(|b| b.healthy).count();
@@ -666,5 +680,61 @@ mod tests {
             }
             other => panic!("expected CallTool, got: {other:?}"),
         }
+    }
+
+    /// `proxy/list_backends` shows how far recovery got and why it failed, and
+    /// says nothing about recovery for a backend that never needed it.
+    #[tokio::test]
+    async fn list_backends_reports_recovery_progress() {
+        let status = |namespace: &str, attempts, error: Option<&str>| crate::admin::BackendStatus {
+            namespace: namespace.to_string(),
+            healthy: false,
+            last_checked_at: None,
+            consecutive_failures: 7,
+            error: Some("ping failed".to_string()),
+            transport: Some("http".to_string()),
+            recovery_attempts: attempts,
+            recovery_last_error: error.map(str::to_string),
+        };
+        let admin_state = crate::admin::test_admin_state(
+            "test-proxy",
+            "0.1.0",
+            2,
+            vec![
+                status("hive", 4, Some("fresh connection failed: dns error")),
+                status("plain", 0, None),
+            ],
+        );
+        let state = AdminToolState {
+            admin_state,
+            session_handle: make_session_handle(),
+            config_snapshot: Arc::new(String::new()),
+            config_path: None,
+            proxy: make_test_proxy().await,
+        };
+        let client = tower_mcp::client::McpClient::connect(ChannelTransport::new(
+            build_admin_router(state, None, false, vec![]),
+        ))
+        .await
+        .unwrap();
+        client.initialize("test", "1.0.0").await.unwrap();
+
+        let result = client
+            .call_tool("list_backends", serde_json::json!({}))
+            .await
+            .unwrap();
+        let text = result.first_text().unwrap();
+        let listing: serde_json::Value = serde_json::from_str(text).unwrap();
+        let backends = listing["backends"].as_array().unwrap();
+        let hive = backends.iter().find(|b| b["namespace"] == "hive").unwrap();
+        let plain = backends.iter().find(|b| b["namespace"] == "plain").unwrap();
+
+        assert_eq!(hive["recovery_attempts"], 4);
+        assert_eq!(
+            hive["recovery_last_error"],
+            "fresh connection failed: dns error"
+        );
+        assert!(plain.get("recovery_attempts").is_none());
+        assert!(plain.get("recovery_last_error").is_none());
     }
 }

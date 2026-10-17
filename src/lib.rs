@@ -397,6 +397,7 @@ pub mod outlier;
 pub mod param_override;
 #[cfg(feature = "oauth")]
 pub mod rbac;
+pub mod recovery;
 pub mod reload;
 mod reload_policy;
 pub mod retry;

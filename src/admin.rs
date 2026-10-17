@@ -171,6 +171,16 @@ pub struct BackendStatus {
     pub error: Option<String>,
     /// Transport type (e.g. "stdio", "http").
     pub transport: Option<String>,
+    /// Recovery attempts since the backend was last healthy (0 when none).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub recovery_attempts: u32,
+    /// Why the last recovery attempt failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_last_error: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize)]
@@ -280,12 +290,38 @@ impl Drop for HealthChecker {
 /// the handle (a change from the previous detached-worker API). [`crate::Proxy`]
 /// owns it for configured applications. Cancellation interrupts even a pending
 /// health check; ordinary health checks keep their existing timeout policy.
+/// How often backends are health-checked.
+pub(crate) const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spawn a background task that periodically health-checks backends.
+/// Returns the AdminState that admin endpoints read from.
 pub fn spawn_health_checker(
     proxy: McpProxy,
     proxy_name: String,
     proxy_version: String,
     backend_count: usize,
     backend_meta: HashMap<String, BackendMeta>,
+) -> (AdminState, HealthChecker) {
+    spawn_health_checker_with(
+        proxy,
+        proxy_name,
+        proxy_version,
+        backend_count,
+        backend_meta,
+        None,
+        HEALTH_CHECK_INTERVAL,
+    )
+}
+
+/// [`spawn_health_checker`] that also reports each result to `recovery`.
+pub(crate) fn spawn_health_checker_with(
+    proxy: McpProxy,
+    proxy_name: String,
+    proxy_version: String,
+    backend_count: usize,
+    backend_meta: HashMap<String, BackendMeta>,
+    recovery: Option<crate::recovery::RecoveryManager>,
+    interval: Duration,
 ) -> (AdminState, HealthChecker) {
     let health: Arc<RwLock<Vec<BackendStatus>>> = Arc::new(RwLock::new(Vec::new()));
     let health_writer = Arc::clone(&health);
@@ -335,6 +371,10 @@ pub fn spawn_health_checker(
                             prev_healthy.insert(h.namespace.clone(), h.healthy);
                         }
 
+                        let recovery_status = recovery.as_ref().map(|r| {
+                            r.observe(&h.namespace, h.healthy, *count);
+                            r.status(&h.namespace)
+                        });
                         let meta = backend_meta.get(&h.namespace);
                         BackendStatus {
                             namespace: h.namespace,
@@ -347,6 +387,8 @@ pub fn spawn_health_checker(
                                 Some("ping failed".to_string())
                             },
                             transport: meta.map(|m| m.transport.clone()),
+                            recovery_attempts: recovery_status.as_ref().map_or(0, |r| r.attempts),
+                            recovery_last_error: recovery_status.and_then(|r| r.last_error),
                         }
                     })
                     .collect();
@@ -364,7 +406,7 @@ pub fn spawn_health_checker(
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(interval).await;
             }} => {},
             }
         });
@@ -1699,6 +1741,8 @@ mod tests {
             consecutive_failures: 0,
             error: None,
             transport: Some("http".to_string()),
+            recovery_attempts: 0,
+            recovery_last_error: None,
         }
     }
 
@@ -1710,6 +1754,8 @@ mod tests {
             consecutive_failures: 3,
             error: Some("ping failed".to_string()),
             transport: Some("stdio".to_string()),
+            recovery_attempts: 0,
+            recovery_last_error: None,
         }
     }
 

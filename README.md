@@ -156,6 +156,29 @@ tool_ttl_seconds = 60
 resource_ttl_seconds = 300
 ```
 
+### Self-healing HTTP backends
+
+An HTTP backend whose health checks fail three times in a row is reconnected
+automatically; no proxy restart needed. The proxy first connects to the backend
+with a fresh client (`initialize` and `ping`). If that works, the backend's
+client is torn down and rebuilt (`initialize` and `tools/list` run again); if
+not, the backend is left alone. Attempts back off exponentially per backend, a
+backend that is still unhealthy after three rebuilds is not rebuilt again until
+a health check passes, and other backends are never affected. Stdio and
+WebSocket backends are not supervised.
+
+This is on by default. Each attempt logs one `INFO` line, and the attempt
+count and last error appear in `proxy_list_backends` and `/admin/backends`
+as `recovery_attempts` and `recovery_last_error`.
+
+```toml
+[backends.recovery]
+consecutive_failures = 3     # failed health checks before the first attempt
+initial_backoff_ms = 5000    # doubles after every attempt
+max_backoff_ms = 300000
+# enabled = false            # opt out
+```
+
 ### Argument injection
 
 <!-- config-fragment -->
