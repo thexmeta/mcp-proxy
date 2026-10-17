@@ -115,6 +115,7 @@ fn server_to_backend(name: String, server: McpJsonServer) -> Result<BackendConfi
         concurrency: None,
         retry: None,
         outlier_detection: None,
+        recovery: None,
         hedging: None,
         cache: None,
         working_dir: None,

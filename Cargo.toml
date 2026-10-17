@@ -101,13 +101,17 @@ harness = false
 
 # tower-mcp 0.23.2 plus this project's patches (kill on drop, SIGTERM then
 # SIGKILL, initialize timeouts, empty proxy, with_client_and_config, reconnect
-# hook, HTTP survives transient errors, drop sends shutdown, opt-in 2024-11-05),
-# one commit each:
+# hook, HTTP survives transient errors, drop sends shutdown, opt-in 2024-11-05,
+# HTTP reconnect after a transient send failure), one commit each:
 # https://github.com/thexmeta/tower-mcp/commits/mcp-proxy-patches
 # Pinned to a commit so every build resolves the same source.
+#
+# TODO: the last commit is not merged upstream yet; once
+# https://github.com/thexmeta/tower-mcp/pulls is, point both lines back at
+# thexmeta/tower-mcp with the merged commit.
 [patch.crates-io]
-tower-mcp = { git = "https://github.com/thexmeta/tower-mcp", rev = "679523389d4544c97bae5c9e5468a9e9e5fd71f7" }
-tower-mcp-types = { git = "https://github.com/thexmeta/tower-mcp", rev = "679523389d4544c97bae5c9e5468a9e9e5fd71f7" }
+tower-mcp = { git = "https://github.com/jpg0/tower-mcp", rev = "076c72fb359e1b19c7d09e32364389ec57e74f51" }
+tower-mcp-types = { git = "https://github.com/jpg0/tower-mcp", rev = "076c72fb359e1b19c7d09e32364389ec57e74f51" }
 
 # The profile that 'dist' will build with
 [profile.dist]

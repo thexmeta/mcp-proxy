@@ -156,6 +156,7 @@ pub fn spawn_config_watcher(
     watchers: Vec<WatcherConfig>,
     alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
     lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
+    recovery: crate::recovery::RecoveryManager,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         crate::discovery::SchemaStore,
@@ -171,6 +172,7 @@ pub fn spawn_config_watcher(
             watchers,
             alias_map,
             lazy_registry,
+            recovery,
             #[cfg(feature = "discovery")]
             discovery_index,
         )
@@ -187,6 +189,7 @@ async fn watch_loop(
     watchers: Vec<WatcherConfig>,
     alias_map: Option<std::sync::Arc<std::sync::RwLock<crate::alias::AliasMap>>>,
     lazy_registry: Arc<crate::lazy_registry::LazyBackendRegistry>,
+    recovery: crate::recovery::RecoveryManager,
     #[cfg(feature = "discovery")] discovery_index: Option<(
         crate::discovery::SharedDiscoveryIndex,
         crate::discovery::SchemaStore,
@@ -662,6 +665,7 @@ async fn watch_loop(
         old_kill_timeout_secs = kill_timeout_secs;
         old_global_force_kill = global_force_kill;
         endpoint_group_fingerprints = new_eg_fingerprints;
+        recovery.sync(&new_config);
 
         // Rebuild the alias map when backends change.
         // The global AliasService holds a shared Arc<RwLock<AliasMap>>,

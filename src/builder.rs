@@ -566,6 +566,7 @@ fn default_backend() -> BackendConfig {
         concurrency: None,
         retry: None,
         outlier_detection: None,
+        recovery: None,
         hedging: None,
         cache: None,
         working_dir: None,
