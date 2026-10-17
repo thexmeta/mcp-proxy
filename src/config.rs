@@ -105,6 +105,12 @@
 //! max_backoff_ms = 5000
 //! budget_percent = 20.0              # Max 20% of requests can be retries
 //!
+//! # Self-healing for HTTP backends (on by default)
+//! [backends.recovery]
+//! consecutive_failures = 3           # Failed health checks before recovery starts
+//! initial_backoff_ms = 5000          # Doubles after each attempt
+//! max_backoff_ms = 300000
+//!
 //! # Request hedging (tail latency)
 //! [backends.hedging]
 //! delay_ms = 200
@@ -844,6 +850,10 @@ pub struct BackendConfig {
     pub retry: Option<RetryConfig>,
     /// Per-backend outlier detection (passive health checks)
     pub outlier_detection: Option<OutlierDetectionConfig>,
+    /// Self-healing for an HTTP backend whose health checks keep failing.
+    /// On by default for HTTP backends; see [`RecoveryConfig`].
+    #[serde(default)]
+    pub recovery: Option<RecoveryConfig>,
     /// Per-backend request hedging (parallel redundant requests)
     pub hedging: Option<HedgingConfig>,
     /// Mirror traffic from another backend (fire-and-forget).
@@ -1233,6 +1243,69 @@ pub struct RetryConfig {
     /// Ensures low-traffic backends can still retry.
     #[serde(default = "default_min_retries_per_sec")]
     pub min_retries_per_sec: u32,
+}
+
+/// Self-healing for an HTTP backend whose health checks keep failing.
+///
+/// After `consecutive_failures` failed health checks in a row the proxy
+/// connects to the backend with a fresh client. If that works the backend's
+/// client is torn down and rebuilt (initialize and `tools/list` run again);
+/// if it does not, the existing client is left alone. Attempts back off
+/// exponentially. Only HTTP backends are supervised; stdio and WebSocket
+/// backends are never touched.
+///
+/// Recovery is on by default for HTTP backends. To change the numbers or turn
+/// it off:
+///
+/// ```toml
+/// [backends.recovery]
+/// consecutive_failures = 3
+/// initial_backoff_ms = 5000
+/// max_backoff_ms = 300000
+/// # enabled = false
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RecoveryConfig {
+    /// Set to `false` to disable recovery for this backend (default: true).
+    #[serde(default = "default_recovery_enabled")]
+    pub enabled: bool,
+    /// Failed health checks in a row before recovery starts (default: 3).
+    #[serde(default = "default_recovery_consecutive_failures")]
+    pub consecutive_failures: u32,
+    /// Wait after the first attempt, doubled after each further one
+    /// (default: 5000).
+    #[serde(default = "default_recovery_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Upper bound for the wait between attempts (default: 300000).
+    #[serde(default = "default_recovery_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recovery_enabled(),
+            consecutive_failures: default_recovery_consecutive_failures(),
+            initial_backoff_ms: default_recovery_initial_backoff_ms(),
+            max_backoff_ms: default_recovery_max_backoff_ms(),
+        }
+    }
+}
+
+fn default_recovery_enabled() -> bool {
+    true
+}
+
+fn default_recovery_consecutive_failures() -> u32 {
+    3
+}
+
+fn default_recovery_initial_backoff_ms() -> u64 {
+    5_000
+}
+
+fn default_recovery_max_backoff_ms() -> u64 {
+    300_000
 }
 
 /// Passive health check / outlier detection configuration.
@@ -1948,6 +2021,17 @@ impl NameFilter {
 }
 
 impl BackendConfig {
+    /// The recovery settings in force for this backend, or `None` when it is
+    /// not supervised: only HTTP backends are, unless `recovery.enabled` is
+    /// `false`.
+    pub fn effective_recovery(&self) -> Option<RecoveryConfig> {
+        if self.transport != TransportType::Http {
+            return None;
+        }
+        let recovery = self.recovery.clone().unwrap_or_default();
+        recovery.enabled.then_some(recovery)
+    }
+
     /// Effective force-kill mode for this backend.
     ///
     /// OR semantics: the global `proxy.force_kill` forces immediate kill for
@@ -2460,6 +2544,29 @@ impl ProxyConfig {
                         name
                     )
                 })?;
+            }
+            if let Some(recovery) = &backend.recovery {
+                if backend.transport != TransportType::Http {
+                    anyhow::bail!(
+                        "backend '{}': recovery is only supported for http backends",
+                        backend.name
+                    );
+                }
+                if recovery.consecutive_failures == 0 {
+                    anyhow::bail!(
+                        "backend '{}': recovery.consecutive_failures must be > 0",
+                        backend.name
+                    );
+                }
+                if recovery.initial_backoff_ms == 0
+                    || recovery.max_backoff_ms < recovery.initial_backoff_ms
+                {
+                    anyhow::bail!(
+                        "backend '{}': recovery.initial_backoff_ms must be > 0 and \
+                         <= recovery.max_backoff_ms",
+                        backend.name
+                    );
+                }
             }
             match backend.transport {
                 TransportType::Stdio => {
@@ -6178,5 +6285,68 @@ backends:
         assert_eq!(hc.request_timeout, Duration::from_secs(45));
         assert!(hc.auto_sse);
         assert!(hc.session_recovery);
+    }
+
+    const HTTP_BACKEND: &str = "[proxy]\nname = 'test'\n[proxy.listen]\n\
+        [[backends]]\nname = 'api'\ntransport = 'http'\nurl = 'http://localhost:1'\n";
+
+    #[test]
+    fn http_backends_get_recovery_by_default() {
+        let config = ProxyConfig::parse(HTTP_BACKEND).unwrap();
+        assert!(config.backends[0].recovery.is_none());
+        assert_eq!(
+            config.backends[0].effective_recovery(),
+            Some(RecoveryConfig {
+                enabled: true,
+                consecutive_failures: 3,
+                initial_backoff_ms: 5_000,
+                max_backoff_ms: 300_000,
+            })
+        );
+    }
+
+    #[test]
+    fn recovery_settings_are_read_and_can_be_turned_off() {
+        let tuned = format!(
+            "{HTTP_BACKEND}[backends.recovery]\nconsecutive_failures = 5\n\
+             initial_backoff_ms = 250\nmax_backoff_ms = 4000\n"
+        );
+        let recovery = ProxyConfig::parse(&tuned).unwrap().backends[0]
+            .effective_recovery()
+            .unwrap();
+        assert_eq!(
+            (
+                recovery.consecutive_failures,
+                recovery.initial_backoff_ms,
+                recovery.max_backoff_ms
+            ),
+            (5, 250, 4_000)
+        );
+
+        let off = format!("{HTTP_BACKEND}[backends.recovery]\nenabled = false\n");
+        let config = ProxyConfig::parse(&off).unwrap();
+        assert_eq!(config.backends[0].effective_recovery(), None);
+    }
+
+    #[test]
+    fn stdio_backends_are_never_supervised() {
+        let config = ProxyConfig::parse(minimal_config()).unwrap();
+        assert_eq!(config.backends[0].effective_recovery(), None);
+
+        let with_table = format!("{}[backends.recovery]\n", minimal_config());
+        let error = ProxyConfig::parse(&with_table).unwrap_err();
+        assert!(format!("{error:#}").contains("only supported for http"));
+    }
+
+    #[test]
+    fn reject_invalid_recovery_settings() {
+        for extra in [
+            "consecutive_failures = 0",
+            "initial_backoff_ms = 0",
+            "initial_backoff_ms = 500\nmax_backoff_ms = 100",
+        ] {
+            let config = format!("{HTTP_BACKEND}[backends.recovery]\n{extra}\n");
+            assert!(ProxyConfig::parse(&config).is_err(), "{extra}");
+        }
     }
 }

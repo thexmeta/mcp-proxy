@@ -63,6 +63,8 @@ pub struct Proxy {
     /// left `None` when hot reload is off) so [`serve`] can stop the watcher
     /// before drain/snapshot and avoid racing teardown.
     hot_reload_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Rebuilds HTTP backends that stay unhealthy; told about config reloads.
+    recovery: crate::recovery::RecoveryManager,
     #[cfg(feature = "discovery")]
     discovery_index: Option<crate::discovery::SharedDiscoveryIndex>,
     #[cfg(feature = "discovery")]
@@ -847,12 +849,15 @@ impl Proxy {
             .collect();
 
         // Admin API
-        let admin_state = crate::admin::spawn_health_checker(
+        let recovery = crate::recovery::RecoveryManager::new(shared_proxy.clone(), &config);
+        let admin_state = crate::admin::spawn_health_checker_with(
             proxy_for_admin,
             config.proxy.name.clone(),
             config.proxy.version.clone(),
             config.backends.len(),
             backend_meta,
+            Some(recovery.clone()),
+            crate::admin::HEALTH_CHECK_INTERVAL,
         );
         let router = router.nest(
             "/admin",
@@ -923,6 +928,7 @@ impl Proxy {
             lazy_registry,
             alias_map,
             hot_reload_handle: None,
+            recovery,
             #[cfg(feature = "discovery")]
             discovery_index,
             #[cfg(feature = "discovery")]
@@ -980,6 +986,7 @@ impl Proxy {
             watchers,
             self.alias_map.clone(),
             self.lazy_registry.clone(),
+            self.recovery.clone(),
             #[cfg(feature = "discovery")]
             self.discovery_index
                 .as_ref()
