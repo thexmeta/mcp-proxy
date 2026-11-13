@@ -288,7 +288,7 @@ fn init_logging(config: &ProxyConfig) -> Result<Logging> {
     let env_filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::try_from_default_env().expect("valid RUST_LOG")
     } else {
-        tracing_subscriber::EnvFilter::new(&config_filter)
+        tracing_subscriber::EnvFilter::new(&env_filter)
     };
 
     #[cfg(feature = "otel")]

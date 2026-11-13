@@ -49,23 +49,10 @@ pub async fn spawn_stdio_transport(
         cmd.current_dir(working_dir);
     }
 
-    let mut transport = StdioClientTransport::spawn_command(&mut cmd)
+    let transport = StdioClientTransport::spawn_command(&mut cmd)
         .await
-        .with_context(|| format!("spawning backend '{}'", backend.name))?;
-
-    // Configure shutdown behavior: sigterm_timeout is 1s when kill_timeout > 0,
-    // otherwise skip SIGTERM entirely.
-    #[cfg(unix)]
-    {
-        let sigterm_timeout = sigterm_timeout_for(kill_timeout);
-        transport = transport
-            .kill_timeout(kill_timeout)
-            .sigterm_timeout(sigterm_timeout);
-    }
-    #[cfg(not(unix))]
-    {
-        transport = transport.kill_timeout(kill_timeout);
-    }
+        .with_context(|| format!("spawning backend '{}'", backend.name))?
+        .close_timeout(kill_timeout);
 
     Ok(transport)
 }

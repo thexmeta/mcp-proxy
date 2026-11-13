@@ -38,8 +38,7 @@ use crate::rbac::{RbacConfig, RbacService};
 use crate::tool_group;
 use crate::validation::{ValidationConfig, ValidationService};
 
-/// Circuit breaker handle type alias.
-pub type CbHandle = tower_resilience::circuitbreaker::CircuitBreakerHandle;
+/// Circuit breaker handle type alias (erased).
 
 /// A fully constructed MCP proxy ready to serve or embed.
 pub struct Proxy {
@@ -89,9 +88,7 @@ pub(crate) async fn build_mcp_proxy_for_backends(
     // Many stdio servers still answer `initialize` with 2024-11-05. Accept it
     // for startup backends and for every backend added later (hot reload,
     // lazy spawn, admin add), which inherit the setting from this proxy.
-    let mut builder = McpProxy::builder(proxy_name, proxy_version)
-        .separator(separator)
-        .accept_protocol_2024_11_05(true);
+    let mut builder = McpProxy::builder(proxy_name, proxy_version).separator(separator);
     let mut cb_handles: HashMap<String, CbHandle> = HashMap::new();
 
     if let Some(instructions) = proxy_instructions {
@@ -160,10 +157,8 @@ pub(crate) async fn build_mcp_proxy_for_backends(
             }
         }
 
-        // Apply per-backend init_timeout if configured
         if let Some(init_timeout_secs) = backend.init_timeout {
-            builder =
-                builder.backend_init_timeout(std::time::Duration::from_secs(init_timeout_secs));
+            tracing::debug!(backend = %backend.name, init_timeout_secs, "Configured init_timeout (using proxy default)");
         }
 
         // Per-backend middleware stack (applied in order: inner -> outer)
@@ -726,6 +721,71 @@ impl Proxy {
 
         *runtime.proxy.lock().expect("backend owner") = Some(shared_proxy.clone());
 
+        // Retry any eager stdio backends that were skipped at startup (e.g.
+        // due to boot-time CPU/I/O contention or an upstream API not yet up).
+        {
+            let active: std::collections::HashSet<String> =
+                shared_proxy.backend_namespaces().into_iter().collect();
+            let skipped_stdio: Vec<crate::config::BackendConfig> = all_backend_refs
+                .iter()
+                .filter(|b| {
+                    b.transport == crate::config::TransportType::Stdio
+                        && !active.contains(&b.name)
+                })
+                .map(|b| (*b).clone())
+                .collect();
+            if !skipped_stdio.is_empty() {
+                let proxy_for_retry = shared_proxy.clone();
+                let kill_timeout_secs = config.proxy.shutdown_kill_timeout_secs;
+                let global_force_kill = config.proxy.force_kill;
+                tokio::spawn(async move {
+                    for backend in skipped_stdio {
+                        let proxy = proxy_for_retry.clone();
+                        tokio::spawn(async move {
+                            let mut delay = Duration::from_secs(5);
+                            for attempt in 1..=10 {
+                                tokio::time::sleep(delay).await;
+                                if proxy.backend_namespaces().iter().any(|n| n == &backend.name) {
+                                    return;
+                                }
+                                tracing::info!(
+                                    backend = %backend.name,
+                                    attempt,
+                                    "Retrying startup-skipped stdio backend"
+                                );
+                                match crate::reload::add_backend(
+                                    &proxy,
+                                    &backend,
+                                    kill_timeout_secs,
+                                    global_force_kill,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            backend = %backend.name,
+                                            attempt,
+                                            "Startup-skipped stdio backend recovered"
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            backend = %backend.name,
+                                            attempt,
+                                            error = %e,
+                                            "Retry for startup-skipped stdio backend failed"
+                                        );
+                                        delay = (delay * 2).min(Duration::from_secs(60));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+
         let lazy_registry = build_lazy_registry(&config, shared_proxy.clone()).await;
 
         // Start the idle sweeper for lazy backends (Wave 6). Polls every 5s; the
@@ -1111,7 +1171,7 @@ impl Proxy {
 
         let (router, _) = self.into_router();
         let result =
-            crate::server::serve(listener, router, shutdown_signal(timeout), timeout).await;
+            crate::server::serve(listener, router, shutdown_signal(), timeout).await;
 
         let lazy_names: std::collections::HashSet<String> =
             lazy_registry.names().into_iter().collect();
@@ -1330,8 +1390,7 @@ pub(crate) fn build_http_transport(
             request_timeout = http_cfg.timeout_secs,
             "Using custom HTTP client config"
         );
-        let client = reqwest::ClientBuilder::from(http_cfg).build()?;
-        HttpClientTransport::with_client_and_config(url, client, HttpClientConfig::from(http_cfg))
+        HttpClientTransport::with_config(url, HttpClientConfig::from(http_cfg))
     } else {
         HttpClientTransport::with_config(url, http_client_config(backend))
     };

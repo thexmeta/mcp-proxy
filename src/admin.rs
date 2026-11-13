@@ -350,7 +350,7 @@ pub(crate) fn spawn_health_checker_with(
                 let now = Utc::now();
                 let mut transitions = Vec::new();
 
-                let statuses: Vec<BackendStatus> = results
+                let mut statuses: Vec<BackendStatus> = results
                     .into_iter()
                     .map(|h| {
                         let count = failure_counts.entry(h.namespace.clone()).or_insert(0);
@@ -392,6 +392,32 @@ pub(crate) fn spawn_health_checker_with(
                         }
                     })
                     .collect();
+
+                // Any supervised HTTP backend missing from `proxy.health_check()`
+                // (e.g. skipped at startup because it was unreachable) still needs
+                // recovery ticks so RecoveryManager can probe and add it once up.
+                if let Some(ref r) = recovery {
+                    for name in r.planned_names() {
+                        if statuses.iter().any(|s| s.namespace == name) {
+                            continue;
+                        }
+                        let count = failure_counts.entry(name.clone()).or_insert(0);
+                        *count += 1;
+                        r.observe(&name, false, *count);
+                        let recovery_status = r.status(&name);
+                        let meta = backend_meta.get(&name);
+                        statuses.push(BackendStatus {
+                            namespace: name,
+                            healthy: false,
+                            last_checked_at: Some(now),
+                            consecutive_failures: *count,
+                            error: Some("backend not registered (skipped at startup)".to_string()),
+                            transport: meta.map(|m| m.transport.clone()),
+                            recovery_attempts: recovery_status.attempts,
+                            recovery_last_error: recovery_status.last_error,
+                        });
+                    }
+                }
 
                 *health_writer.write().await = statuses;
 
@@ -1639,8 +1665,8 @@ pub(crate) fn admin_router_with_policy(
         .route("/tool-groups", get(handle_tool_groups))
         .route("/tool-groups/{name}", get(handle_tool_group))
         // Management enable/disable endpoints
-        .route("/backends/{name}/enable", post(handle_enable_backend))
-        .route("/backends/{name}/disable", post(handle_disable_backend))
+        .route("/backends/{name}/enable", axum::routing::post(handle_enable_backend))
+        .route("/backends/{name}/disable", axum::routing::post(handle_disable_backend))
         .layer(Extension(state))
         .layer(Extension(session_handle))
         .layer(Extension(cache_handle))

@@ -486,7 +486,7 @@ fn build_endpoint_group_middleware_stack(
                     "Enabling RBAC (endpoint group: {})",
                     group.name
                 );
-                Some(crate::rbac::RbacConfig::new(roles, mapping))
+                Some(crate::rbac::RbacConfig::new(roles, mapping)?)
             }
             _ => None,
         };

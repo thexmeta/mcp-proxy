@@ -142,6 +142,17 @@ impl RecoveryManager {
             .retain(|name, _| plans.contains_key(name));
     }
 
+    /// Names of all backends currently supervised by this manager.
+    pub fn planned_names(&self) -> Vec<String> {
+        self.inner
+            .plans
+            .lock()
+            .expect("recovery plans poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Recovery progress of `namespace` (all zero for an unsupervised or
     /// healthy backend).
     pub fn status(&self, namespace: &str) -> RecoveryStatus {

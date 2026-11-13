@@ -782,7 +782,6 @@ async fn watch_loop(
 
         policy.record(if failed { "failed" } else { "applied" }, !failed, false);
         // Transactional replacement/failure retry is tracked separately in #277.
-        backend_fingerprints = new_fingerprints;
     }
 }
 
@@ -1296,6 +1295,7 @@ pub(crate) async fn add_backend(
 
     // Per-backend init_timeout (already resolved by apply_global_defaults)
     let init_timeout = backend.init_timeout.map(std::time::Duration::from_secs);
+    let init_timeout_dur = init_timeout.unwrap_or(Duration::from_secs(120));
 
     match backend.transport {
         TransportType::Stdio => {
@@ -1308,19 +1308,29 @@ pub(crate) async fn add_backend(
             let init_start = std::time::Instant::now();
             if has_middleware {
                 let layer = build_backend_layer(backend)?;
-                proxy
-                    .add_backend_with_layer_and_timeout(
-                        &backend.name,
-                        transport,
-                        layer,
-                        init_timeout,
+                tokio::time::timeout(
+                    init_timeout_dur,
+                    proxy.add_backend_with_layer(&backend.name, transport, layer),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Backend '{}' initialization timed out after {}s",
+                        backend.name,
+                        init_timeout_dur.as_secs()
                     )
-                    .await
-                    .map_err(|e| map_init_error(backend, e, init_start.elapsed(), init_timeout))?;
+                })?
+                .map_err(|e| map_init_error(backend, e, init_start.elapsed(), init_timeout))?;
             } else {
-                proxy
-                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
+                tokio::time::timeout(init_timeout_dur, proxy.add_backend(&backend.name, transport))
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Backend '{}' initialization timed out after {}s",
+                            backend.name,
+                            init_timeout_dur.as_secs()
+                        )
+                    })?
                     .map_err(|e| map_init_error(backend, e, init_start.elapsed(), init_timeout))?;
             }
         }
@@ -1333,19 +1343,29 @@ pub(crate) async fn add_backend(
 
             if has_middleware {
                 let layer = build_backend_layer(backend)?;
-                proxy
-                    .add_backend_with_layer_and_timeout(
-                        &backend.name,
-                        transport,
-                        layer,
-                        init_timeout,
+                tokio::time::timeout(
+                    init_timeout_dur,
+                    proxy.add_backend_with_layer(&backend.name, transport, layer),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Backend '{}' initialization timed out after {}s",
+                        backend.name,
+                        init_timeout_dur.as_secs()
                     )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                })?
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             } else {
-                proxy
-                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
+                tokio::time::timeout(init_timeout_dur, proxy.add_backend(&backend.name, transport))
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Backend '{}' initialization timed out after {}s",
+                            backend.name,
+                            init_timeout_dur.as_secs()
+                        )
+                    })?
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
         }
@@ -1365,19 +1385,29 @@ pub(crate) async fn add_backend(
 
             if has_middleware {
                 let layer = build_backend_layer(backend)?;
-                proxy
-                    .add_backend_with_layer_and_timeout(
-                        &backend.name,
-                        transport,
-                        layer,
-                        init_timeout,
+                tokio::time::timeout(
+                    init_timeout_dur,
+                    proxy.add_backend_with_layer(&backend.name, transport, layer),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Backend '{}' initialization timed out after {}s",
+                        backend.name,
+                        init_timeout_dur.as_secs()
                     )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                })?
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             } else {
-                proxy
-                    .add_backend_with_timeout(&backend.name, transport, init_timeout)
+                tokio::time::timeout(init_timeout_dur, proxy.add_backend(&backend.name, transport))
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Backend '{}' initialization timed out after {}s",
+                            backend.name,
+                            init_timeout_dur.as_secs()
+                        )
+                    })?
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
         }
